@@ -35,6 +35,14 @@ async fn main() -> Result<()> {
     }
 
     match args[1].as_str() {
+        "run" => {
+            if args.len() < 4 {
+                bail!("Usage: agent-orchestrator run <dir> <task...>");
+            }
+            let working_dir = &args[2];
+            let task = args[3..].join(" ");
+            run_task(working_dir, &task).await
+        }
         "agent" => {
             if args.len() < 3 {
                 bail!("Usage: agent-orchestrator agent <role> [working_dir]");
@@ -71,24 +79,23 @@ USAGE:
     agent-orchestrator <COMMAND>
 
 COMMANDS:
-    agent <role> [dir]      Run a single agent
-                            Roles: manager, architect, developer, scorer
+    run <dir> <task...>     Run agents on a task (non-interactive)
 
-    orchestrate [dir]       Run all four agents
+    orchestrate [dir]       Start agents and wait for messages
 
-    send <role> <message>   Send a message to an agent
+    send <role> <message>   Send a message to a running agent
+
+    agent <role> [dir]      Run a single agent standalone
 
     status                  Show socket status
 
 EXAMPLES:
-    # Run developer agent in current directory
-    agent-orchestrator agent developer .
+    # Run a task non-interactively
+    agent-orchestrator run ~/my-project "Add a login button to the homepage"
 
-    # Run full orchestration
+    # Start agents, then send tasks separately
     agent-orchestrator orchestrate ~/my-project
-
-    # Send a task to the manager
-    agent-orchestrator send manager "Add a login button to the homepage"
+    agent-orchestrator send manager "Add a login button"
 "#
     );
 }
@@ -131,6 +138,17 @@ async fn run_agent(role: AgentRole, working_dir: &str) -> Result<()> {
 
     let agent = Agent::new(config, backend, &base_path, command_tx).await?;
     agent.run().await
+}
+
+async fn run_task(working_dir: &str, task: &str) -> Result<()> {
+    info!("Running task in {}: {}", working_dir, task);
+
+    let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
+    std::fs::create_dir_all(&base_path)?;
+
+    let backend = Arc::new(ClaudeBackend::new());
+    let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string());
+    runtime.run_with_task(task.to_string()).await
 }
 
 async fn run_orchestrator(working_dir: &str) -> Result<()> {

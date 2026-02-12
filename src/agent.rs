@@ -95,7 +95,7 @@ impl Agent {
             let cmd_tx = self.command_tx.clone();
             while let Some(output) = output_rx.recv().await {
                 if let Some(text) = output.text() {
-                    tracing::debug!("[{}] {}", from_id, text);
+                    tracing::info!("[{}] {}", from_id, text);
                     match parse_agent_output(&from_id, text) {
                         ParsedOutput::Message(msg) => {
                             if outgoing_tx.send(msg).await.is_err() {

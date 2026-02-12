@@ -18,6 +18,7 @@ const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 
 use crate::agent::{Agent, AgentConfig};
 use crate::backend::AgentBackend;
+use crate::transport::{AgentConnection, AgentMessage, MessageKind};
 use crate::types::{AgentId, AgentRole};
 
 /// Commands sent from agents to the runtime (not over the wire)
@@ -97,31 +98,111 @@ impl OrchestratorRuntime {
     /// Run the orchestrator: spawn initial agents, then process commands
     pub async fn run(mut self) -> Result<()> {
         self.spawn_initial_agents().await?;
+        self.command_loop().await
+    }
 
-        while let Some(cmd) = self.command_rx.recv().await {
-            tracing::info!("Runtime command: {:?}", cmd);
-            match cmd {
-                RuntimeCommand::SetCrewSize { count } => {
-                    self.handle_crew_size(count).await;
+    /// Run with an initial task: spawn agents, inject task, process commands
+    pub async fn run_with_task(mut self, task: String) -> Result<()> {
+        self.spawn_initial_agents().await?;
+
+        // Give sockets a moment to be ready, then inject the task
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.inject_task(&task).await?;
+
+        self.command_loop().await
+    }
+
+    /// Send a task to the manager via its socket
+    async fn inject_task(&self, task: &str) -> Result<()> {
+        let manager_id = AgentId::new_singleton(AgentRole::Manager);
+        let msg = AgentMessage::new(
+            AgentId::new_singleton(AgentRole::Manager),
+            manager_id.clone(),
+            MessageKind::Info,
+            task.to_string(),
+        );
+        let mut conn = AgentConnection::connect(&manager_id, &self.base_path).await?;
+        conn.send(&msg).await?;
+        tracing::info!("Injected task to manager: {}", task);
+        Ok(())
+    }
+
+    /// Process runtime commands until shutdown signal or all senders drop
+    async fn command_loop(&mut self) -> Result<()> {
+        let mut sigint = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        )?;
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )?;
+
+        loop {
+            tokio::select! {
+                cmd = self.command_rx.recv() => {
+                    match cmd {
+                        Some(cmd) => self.dispatch_command(cmd).await,
+                        None => break,
+                    }
                 }
-                RuntimeCommand::RelieveManager { reason } => {
-                    self.handle_relieve_manager(&reason).await;
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT, shutting down");
+                    break;
                 }
-                RuntimeCommand::TaskUpdate {
-                    agent,
-                    status,
-                    summary,
-                } => {
-                    self.state.task_log.push(TaskRecord {
-                        agent,
-                        status,
-                        summary,
-                    });
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, shutting down");
+                    break;
                 }
             }
         }
 
+        self.shutdown();
         Ok(())
+    }
+
+    async fn dispatch_command(&mut self, cmd: RuntimeCommand) {
+        tracing::info!("Runtime command: {:?}", cmd);
+        match cmd {
+            RuntimeCommand::SetCrewSize { count } => {
+                self.handle_crew_size(count).await;
+            }
+            RuntimeCommand::RelieveManager { reason } => {
+                self.handle_relieve_manager(&reason).await;
+            }
+            RuntimeCommand::TaskUpdate {
+                agent,
+                status,
+                summary,
+            } => {
+                self.state.task_log.push(TaskRecord {
+                    agent,
+                    status,
+                    summary,
+                });
+            }
+        }
+    }
+
+    /// Clean shutdown: abort all agents, remove socket files
+    fn shutdown(&mut self) {
+        tracing::info!("Shutting down {} agents", self.agent_handles.len());
+        for (id, handle) in self.agent_handles.drain() {
+            tracing::info!("Stopping {}", id);
+            handle.abort();
+        }
+        self.cleanup_sockets();
+    }
+
+    /// Remove all socket files from the base path
+    fn cleanup_sockets(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.base_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "sock") {
+                    let _ = std::fs::remove_file(&path);
+                    tracing::debug!("Removed {}", path.display());
+                }
+            }
+        }
     }
 
     /// Spawn the four initial agents: manager, architect, scorer, developer-0

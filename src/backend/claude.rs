@@ -68,79 +68,95 @@ impl AgentBackend for ClaudeBackend {
         working_dir: &str,
         session_id: Option<String>,
     ) -> Result<(Box<dyn AgentHandle>, mpsc::Receiver<AgentOutput>)> {
-        let mut cmd = Command::new("claude");
+        let mut child = spawn_claude_process(&self.extra_args, working_dir, session_id)?;
 
-        cmd.args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-        ]);
-
-        // Add extra args
-        for arg in &self.extra_args {
-            cmd.arg(arg);
-        }
-
-        if let Some(id) = session_id {
-            cmd.args(["--session-id", &id]);
-        }
-
-        cmd.current_dir(working_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .with_context(|| "Failed to spawn claude process. Is 'claude' in PATH?")?;
-
-        let mut stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = child.stdout.take().context("Failed to get stdout")?;
+        let stderr = child.stderr.take().context("Failed to get stderr")?;
 
-        // Send the prompt
-        let input = ClaudeInput::user(prompt);
-        let json = serde_json::to_string(&input)?;
-        stdin.write_all(json.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        drop(stdin); // Close stdin to signal end of input
+        send_prompt(&mut child, prompt).await?;
 
-        // Channel for streaming responses
         let (tx, rx) = mpsc::channel::<AgentOutput>(256);
-
-        // Spawn reader task
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.is_empty() {
-                    continue;
-                }
-
-                match serde_json::from_str::<ClaudeOutput>(&line) {
-                    Ok(output) => {
-                        let agent_output = convert_output(output);
-                        let is_final = agent_output.is_final();
-                        if tx.send(agent_output).await.is_err() {
-                            break;
-                        }
-                        if is_final {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse Claude output: {} - line: {}", e, line);
-                    }
-                }
-            }
-        });
+        spawn_stderr_logger(stderr);
+        spawn_stdout_reader(stdout, tx);
 
         Ok((Box::new(ClaudeHandle { child }), rx))
     }
+}
+
+fn spawn_claude_process(
+    extra_args: &[String],
+    working_dir: &str,
+    session_id: Option<String>,
+) -> Result<Child> {
+    let mut cmd = Command::new("claude");
+
+    cmd.args([
+        "-p",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+    ]);
+
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    if let Some(id) = session_id {
+        cmd.args(["--session-id", &id]);
+    }
+
+    cmd.current_dir(working_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    cmd.spawn()
+        .with_context(|| "Failed to spawn claude process. Is 'claude' in PATH?")
+}
+
+async fn send_prompt(child: &mut Child, prompt: &str) -> Result<()> {
+    let mut stdin = child.stdin.take().context("Failed to get stdin")?;
+    let input = ClaudeInput::user(prompt);
+    let json = serde_json::to_string(&input)?;
+    stdin.write_all(json.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    drop(stdin);
+    Ok(())
+}
+
+fn spawn_stderr_logger(stderr: tokio::process::ChildStderr) {
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!("[claude stderr] {}", line);
+        }
+    });
+}
+
+fn spawn_stdout_reader(stdout: tokio::process::ChildStdout, tx: mpsc::Sender<AgentOutput>) {
+    tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ClaudeOutput>(&line) {
+                Ok(output) => {
+                    let agent_output = convert_output(output);
+                    let is_final = agent_output.is_final();
+                    if tx.send(agent_output).await.is_err() || is_final {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse Claude output: {} - line: {}", e, line);
+                }
+            }
+        }
+    });
 }
 
 /// Convert Claude-specific output to generic AgentOutput
