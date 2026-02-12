@@ -3,17 +3,17 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::AgentRole;
+use crate::types::AgentId;
 
 /// Message sent between agents
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMessage {
     /// Unique message ID
     pub id: Uuid,
-    /// Sender role
-    pub from: AgentRole,
-    /// Recipient role
-    pub to: AgentRole,
+    /// Sender
+    pub from: AgentId,
+    /// Recipient
+    pub to: AgentId,
     /// Message type
     pub kind: MessageKind,
     /// Message content
@@ -24,7 +24,7 @@ pub struct AgentMessage {
 }
 
 impl AgentMessage {
-    pub fn new(from: AgentRole, to: AgentRole, kind: MessageKind, content: String) -> Self {
+    pub fn new(from: AgentId, to: AgentId, kind: MessageKind, content: String) -> Self {
         Self {
             id: Uuid::new_v4(),
             from,

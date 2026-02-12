@@ -18,17 +18,19 @@ This is a multi-agent orchestration system that coordinates AI coding assistants
 ### Agent Roles and Message Flow
 
 ```
-User → Manager → Architect → Developer
-           ↑          ↓           ↓
-           ←──────────←───────────←
+User → Manager → Architect → Developer-0..2
+           ↑          ↓            ↓
+           ←──────────←────────────←
 
-       Scorer (observes all, no decision power)
+       Scorer (observes all, can RELIEVE manager)
+       Runtime (spawns/kills agents, maintains state)
 ```
 
-- **Manager**: Receives user requests, breaks into tasks, tracks progress
-- **Architect**: Reviews task approaches for simplicity/safety, approves or rejects
-- **Developer**: Implements approved tasks, reports completion or blockers
-- **Scorer**: Observes progress, evaluates direction (no decision power)
+- **Manager**: Receives user requests, breaks into tasks, decides crew size (1-3 devs)
+- **Architect**: Reviews task approaches for simplicity/safety, approves with developer target
+- **Developer-N**: Implements approved tasks, reports completion or blockers (N = 0-2)
+- **Scorer**: Observes progress, evaluates direction, can fire manager via RELIEVE
+- **Runtime**: Spawns/kills agents, handles CREW/RELIEVE commands, maintains task log
 
 ### Communication Protocol
 
@@ -37,11 +39,13 @@ Agents communicate via structured output lines that get parsed and routed:
 | Prefix | From | To | Purpose |
 |--------|------|-----|---------|
 | `TASK:` | Manager | Architect | New task for review |
-| `APPROVED:` | Architect | Developer | Task approved, start work |
+| `APPROVED: developer-N` | Architect | Developer-N | Task approved, start work |
 | `REJECTED:` | Architect | Manager | Approach rejected |
 | `COMPLETE:` | Developer | Manager | Task finished |
 | `BLOCKED:` | Developer | Manager | Task stuck, needs help |
 | `INTERRUPT:` | Architect | Developer | Stop current work |
+| `CREW: N` | Manager | Runtime | Set developer count (1-3) |
+| `RELIEVE:` | Scorer | Runtime | Fire manager, spawn replacement |
 | `EVALUATION:` | Scorer | (logged) | Progress assessment |
 | `OBSERVATION:` | Scorer | (logged) | Issue noticed |
 
@@ -57,8 +61,9 @@ src/
 │   ├── message.rs      # Wire protocol (length-prefixed JSON)
 │   └── unix.rs         # Unix sockets + SO_PEERCRED
 ├── types/
-│   └── agent.rs        # AgentRole enum
-├── agent.rs            # Agent runtime (backend + transport)
+│   └── agent.rs        # AgentRole, AgentId (role + index)
+├── agent.rs            # Agent runtime, ParsedOutput, output parsing
+├── runtime.rs          # OrchestratorRuntime, RuntimeCommand, state management
 └── main.rs             # CLI entrypoint
 ```
 
@@ -70,9 +75,18 @@ src/
 - Converts provider-specific output to generic `AgentOutput`
 
 **Transport** (`transport/`):
-- Unix sockets at `/tmp/claude/orchestrator/{role}.sock`
+- Unix sockets at `/tmp/claude/orchestrator/{agent_id}.sock`
+- Singletons: `manager.sock`, `architect.sock`, `scorer.sock`
+- Developers: `developer-0.sock`, `developer-1.sock`, `developer-2.sock`
 - `SO_PEERCRED` for same-user verification
 - Length-prefixed JSON messages
+
+**OrchestratorRuntime** (`runtime.rs`):
+- Spawns/tracks agent processes via `HashMap<AgentId, JoinHandle>`
+- Processes `RuntimeCommand`s from agents via mpsc channel
+- `CREW:` commands dynamically spawn/kill developer agents (1-3)
+- `RELIEVE:` fires manager, spawns replacement with state briefing (60s cooldown)
+- Maintains `task_log` for manager briefings on replacement
 
 ### Adding a New Backend
 
@@ -133,6 +147,8 @@ agent-orchestrator status
 /tmp/claude/orchestrator/
 ├── manager.sock
 ├── architect.sock
-├── developer.sock
-└── scorer.sock
+├── scorer.sock
+├── developer-0.sock      # Always present
+├── developer-1.sock      # When CREW >= 2
+└── developer-2.sock      # When CREW == 3
 ```

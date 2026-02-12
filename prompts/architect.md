@@ -29,11 +29,16 @@ For each task, evaluate:
 - You can interrupt Developer if you observe drift from approved approach
 
 ## Output Format
-When approving:
+When approving, include the target developer from the task's ASSIGN field:
 ```
-APPROVED: <brief reason>
+APPROVED: developer-<N> <brief reason>
 APPROACH: <recommended implementation approach>
 RISKS: <any risks to watch for>
+```
+
+If the task has no ASSIGN field, default to developer-0:
+```
+APPROVED: developer-0 <brief reason>
 ```
 
 When rejecting:

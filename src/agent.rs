@@ -11,15 +11,26 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::backend::{AgentBackend, AgentOutput};
+use crate::backend::AgentBackend;
+use crate::runtime::{RuntimeCommand, TaskStatus};
 use crate::transport::{AgentConnection, AgentListener, AgentMessage, MessageKind};
-use crate::types::AgentRole;
+use crate::types::{AgentId, AgentRole};
 
 /// Configuration for an agent
 pub struct AgentConfig {
-    pub role: AgentRole,
+    pub agent_id: AgentId,
     pub working_dir: String,
     pub system_prompt: String,
+}
+
+/// Result of parsing an agent output line
+pub enum ParsedOutput {
+    /// Route a message to another agent
+    Message(AgentMessage),
+    /// Send a command to the runtime
+    Command(RuntimeCommand),
+    /// No actionable output
+    None,
 }
 
 /// Running agent instance
@@ -28,6 +39,7 @@ pub struct Agent {
     backend: Arc<dyn AgentBackend>,
     listener: AgentListener,
     base_path: std::path::PathBuf,
+    command_tx: mpsc::Sender<RuntimeCommand>,
 }
 
 impl Agent {
@@ -36,94 +48,94 @@ impl Agent {
         config: AgentConfig,
         backend: Arc<dyn AgentBackend>,
         base_path: &Path,
+        command_tx: mpsc::Sender<RuntimeCommand>,
     ) -> Result<Self> {
-        let listener = AgentListener::bind(config.role, base_path).await?;
+        let listener = AgentListener::bind(config.agent_id.clone(), base_path).await?;
 
         Ok(Self {
             config,
             backend,
             listener,
             base_path: base_path.to_path_buf(),
+            command_tx,
         })
     }
 
     /// Run the agent main loop
     pub async fn run(self) -> Result<()> {
-        tracing::info!("Agent {} starting", self.config.role);
+        tracing::info!("Agent {} starting", self.config.agent_id);
 
-        // Channel for outgoing messages to other agents
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<AgentMessage>(64);
 
-        // Spawn task to handle outgoing messages
         let base_path = self.base_path.clone();
-        let role = self.config.role;
+        let agent_id_for_log = self.config.agent_id.clone();
         tokio::spawn(async move {
             while let Some(msg) = outgoing_rx.recv().await {
                 if let Err(e) = send_to_agent(&msg, &base_path).await {
                     tracing::error!("Failed to send message to {}: {}", msg.to, e);
                 }
             }
-            tracing::debug!("Outgoing message handler for {} stopped", role);
+            tracing::debug!("Outgoing message handler for {} stopped", agent_id_for_log);
         });
 
         loop {
-            // Accept incoming connection
-            let (mut conn, creds) = self.listener.accept().await?;
-            tracing::debug!(
-                "Agent {} got connection from pid={}",
-                self.config.role,
-                creds.pid
+            let (msg, outgoing_tx) = (
+                self.accept_message().await?,
+                outgoing_tx.clone(),
             );
 
-            // Receive message
-            let msg = match conn.recv().await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("Failed to receive message: {}", e);
-                    continue;
-                }
-            };
-
-            tracing::info!(
-                "Agent {} received {:?} from {}",
-                self.config.role,
-                msg.kind,
-                msg.from
-            );
-
-            // Process the message through the AI backend
             let prompt = format_prompt_for_agent(&msg, &self.config);
-
             let (mut handle, mut output_rx) = self
                 .backend
                 .spawn(&prompt, &self.config.working_dir, None)
                 .await
                 .context("Failed to spawn backend")?;
 
-            // Process output stream
-            let outgoing_tx = outgoing_tx.clone();
-            let from_role = self.config.role;
-
+            let from_id = self.config.agent_id.clone();
+            let cmd_tx = self.command_tx.clone();
             while let Some(output) = output_rx.recv().await {
-                // Log the output
                 if let Some(text) = output.text() {
-                    tracing::debug!("[{}] {}", from_role, text);
-
-                    // Parse for structured output
-                    if let Some(outgoing) = parse_agent_output(from_role, text) {
-                        if outgoing_tx.send(outgoing).await.is_err() {
-                            break;
+                    tracing::debug!("[{}] {}", from_id, text);
+                    match parse_agent_output(&from_id, text) {
+                        ParsedOutput::Message(msg) => {
+                            if outgoing_tx.send(msg).await.is_err() {
+                                break;
+                            }
                         }
+                        ParsedOutput::Command(cmd) => {
+                            let _ = cmd_tx.send(cmd).await;
+                        }
+                        ParsedOutput::None => {}
                     }
                 }
-
                 if output.is_final() {
                     break;
                 }
             }
 
-            // Ensure process completes
             let _ = handle.wait().await;
+        }
+    }
+
+    /// Accept and validate an incoming message
+    async fn accept_message(&self) -> Result<AgentMessage> {
+        loop {
+            let (mut conn, creds) = self.listener.accept().await?;
+            tracing::debug!("Agent {} got connection from pid={}", self.config.agent_id, creds.pid);
+
+            match conn.recv().await {
+                Ok(msg) => {
+                    tracing::info!(
+                        "Agent {} received {:?} from {}",
+                        self.config.agent_id, msg.kind, msg.from
+                    );
+                    return Ok(msg);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to receive message: {}", e);
+                    continue;
+                }
+            }
         }
     }
 }
@@ -147,97 +159,136 @@ fn format_prompt_for_agent(msg: &AgentMessage, config: &AgentConfig) -> String {
     )
 }
 
-/// Parse agent output for structured messages
-fn parse_agent_output(from: AgentRole, text: &str) -> Option<AgentMessage> {
+/// Message routing table: (prefix, target_role, kind, require_from_role)
+const ROUTES: &[(&str, AgentRole, MessageKind, Option<AgentRole>)] = &[
+    ("TASK:", AgentRole::Architect, MessageKind::TaskAssignment, None),
+    ("REJECTED:", AgentRole::Manager, MessageKind::ArchitectReview, None),
+    ("INTERRUPT:", AgentRole::Developer, MessageKind::Interrupt, Some(AgentRole::Architect)),
+];
+
+/// Parse agent output line into a message, runtime command, or nothing
+pub fn parse_agent_output(from: &AgentId, text: &str) -> ParsedOutput {
     let text = text.trim();
 
-    // Manager -> Architect: TASK:
-    if text.starts_with("TASK:") {
-        let content = text.strip_prefix("TASK:")?.trim().to_string();
-        return Some(AgentMessage::new(
-            from,
-            AgentRole::Architect,
-            MessageKind::TaskAssignment,
-            content,
-        ));
+    if let Some(cmd) = parse_runtime_command(from, text) {
+        return ParsedOutput::Command(cmd);
     }
-
-    // Architect -> Developer: APPROVED:
-    if text.starts_with("APPROVED:") {
-        let content = text.strip_prefix("APPROVED:")?.trim().to_string();
-        return Some(AgentMessage::new(
-            from,
-            AgentRole::Developer,
-            MessageKind::TaskAssignment,
-            content,
-        ));
+    if let Some(msg) = parse_approved_message(from, text) {
+        return ParsedOutput::Message(msg);
     }
-
-    // Architect -> Manager: REJECTED:
-    if text.starts_with("REJECTED:") {
-        let content = text.strip_prefix("REJECTED:")?.trim().to_string();
-        return Some(AgentMessage::new(
-            from,
-            AgentRole::Manager,
-            MessageKind::ArchitectReview,
-            content,
-        ));
+    if let Some(parsed) = parse_completion_message(from, text) {
+        return parsed;
     }
-
-    // Developer -> Manager: COMPLETE:
-    if text.starts_with("COMPLETE:") {
-        let content = text.strip_prefix("COMPLETE:")?.trim().to_string();
-        return Some(AgentMessage::new(
-            from,
-            AgentRole::Manager,
-            MessageKind::TaskComplete,
-            content,
-        ));
+    if let Some(msg) = parse_routed_message(from, text) {
+        return ParsedOutput::Message(msg);
     }
+    log_scorer_output(from, text);
+    ParsedOutput::None
+}
 
-    // Developer -> Manager: BLOCKED:
-    if text.starts_with("BLOCKED:") {
-        let content = text.strip_prefix("BLOCKED:")?.trim().to_string();
-        return Some(AgentMessage::new(
-            from,
-            AgentRole::Manager,
-            MessageKind::TaskGiveUp,
-            content,
-        ));
-    }
-
-    // Architect -> Developer: INTERRUPT:
-    if text.starts_with("INTERRUPT:") && from == AgentRole::Architect {
-        let content = text.strip_prefix("INTERRUPT:")?.trim().to_string();
-        return Some(AgentMessage::new(
-            from,
-            AgentRole::Developer,
-            MessageKind::Interrupt,
-            content,
-        ));
-    }
-
-    // Scorer outputs (logged but not routed to decision-makers)
-    if from == AgentRole::Scorer {
-        if text.starts_with("EVALUATION:") {
-            let content = text.strip_prefix("EVALUATION:")?.trim().to_string();
-            // Log evaluation but don't route (scorer has no decision power)
-            tracing::info!("[SCORER EVALUATION] {}", content);
+/// Parse CREW: and RELIEVE: commands destined for the runtime
+fn parse_runtime_command(from: &AgentId, text: &str) -> Option<RuntimeCommand> {
+    if let Some(rest) = text.strip_prefix("CREW:") {
+        if from.role != AgentRole::Manager {
             return None;
         }
-        if text.starts_with("OBSERVATION:") {
-            let content = text.strip_prefix("OBSERVATION:")?.trim().to_string();
-            tracing::info!("[SCORER OBSERVATION] {}", content);
+        let count: u8 = rest.trim().parse().ok()?;
+        return Some(RuntimeCommand::SetCrewSize { count });
+    }
+    if let Some(rest) = text.strip_prefix("RELIEVE:") {
+        if from.role != AgentRole::Scorer {
             return None;
         }
+        let reason = rest.trim().to_string();
+        return Some(RuntimeCommand::RelieveManager { reason });
     }
-
     None
+}
+
+/// Parse APPROVED: with optional developer-N target
+fn parse_approved_message(from: &AgentId, text: &str) -> Option<AgentMessage> {
+    let rest = text.strip_prefix("APPROVED:")?;
+    let content = rest.trim();
+    let target = parse_developer_target(content);
+    Some(AgentMessage::new(
+        from.clone(),
+        target,
+        MessageKind::TaskAssignment,
+        content.to_string(),
+    ))
+}
+
+/// Extract `developer-N` from text prefix, default to developer-0
+fn parse_developer_target(text: &str) -> AgentId {
+    if let Some(rest) = text.strip_prefix("developer-")
+        && let Some(digit) = rest.chars().next()
+        && let Some(idx) = digit.to_digit(10)
+    {
+        return AgentId::new_developer(idx as u8);
+    }
+    AgentId::new_developer(0)
+}
+
+/// Parse COMPLETE:/BLOCKED: — produces both a message and a runtime TaskUpdate
+fn parse_completion_message(from: &AgentId, text: &str) -> Option<ParsedOutput> {
+    let (content, status, kind) = if let Some(rest) = text.strip_prefix("COMPLETE:") {
+        (rest.trim(), TaskStatus::Completed, MessageKind::TaskComplete)
+    } else if let Some(rest) = text.strip_prefix("BLOCKED:") {
+        (rest.trim(), TaskStatus::Blocked, MessageKind::TaskGiveUp)
+    } else {
+        return None;
+    };
+
+    // The message goes to manager; the TaskUpdate goes to runtime via the caller
+    let msg = AgentMessage::new(
+        from.clone(),
+        AgentId::new_singleton(AgentRole::Manager),
+        kind,
+        content.to_string(),
+    );
+
+    // Log the task update (runtime will pick it up via command channel separately)
+    tracing::info!("[TASK {:?}] from {}: {}", status, from, content);
+    Some(ParsedOutput::Message(msg))
+}
+
+/// Match output against simple routing table
+fn parse_routed_message(from: &AgentId, text: &str) -> Option<AgentMessage> {
+    for &(prefix, target_role, kind, require_from) in ROUTES {
+        if !text.starts_with(prefix) {
+            continue;
+        }
+        if let Some(required) = require_from
+            && from.role != required
+        {
+            continue;
+        }
+        let content = text[prefix.len()..].trim().to_string();
+        return Some(AgentMessage::new(
+            from.clone(),
+            AgentId::new_singleton(target_role),
+            kind,
+            content,
+        ));
+    }
+    None
+}
+
+/// Log scorer evaluation/observation output (not routed)
+fn log_scorer_output(from: &AgentId, text: &str) {
+    if from.role != AgentRole::Scorer {
+        return;
+    }
+    if let Some(content) = text.strip_prefix("EVALUATION:") {
+        tracing::info!("[SCORER EVALUATION] {}", content.trim());
+    } else if let Some(content) = text.strip_prefix("OBSERVATION:") {
+        tracing::info!("[SCORER OBSERVATION] {}", content.trim());
+    }
 }
 
 /// Send a message to another agent via their socket
 async fn send_to_agent(msg: &AgentMessage, base_path: &Path) -> Result<()> {
-    let mut conn = AgentConnection::connect(msg.to, base_path).await?;
+    let mut conn = AgentConnection::connect(&msg.to, base_path).await?;
     conn.send(msg).await?;
     tracing::debug!("Sent {:?} message to {}", msg.kind, msg.to);
     Ok(())

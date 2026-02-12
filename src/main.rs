@@ -1,18 +1,20 @@
 mod agent;
 mod backend;
+mod runtime;
 mod transport;
 mod types;
 
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use agent::{Agent, AgentConfig};
 use backend::ClaudeBackend;
+use runtime::{OrchestratorRuntime, RuntimeCommand};
 use transport::{AgentConnection, AgentMessage, MessageKind};
-use types::AgentRole;
+use types::{AgentId, AgentRole};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/claude/orchestrator";
 
@@ -105,20 +107,29 @@ fn parse_role(s: &str) -> Result<AgentRole> {
 }
 
 async fn run_agent(role: AgentRole, working_dir: &str) -> Result<()> {
-    info!("Starting agent {} in {}", role, working_dir);
+    let agent_id = AgentId::new_singleton(role);
+    info!("Starting agent {} in {}", agent_id, working_dir);
 
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
     std::fs::create_dir_all(&base_path)?;
 
     let backend = Arc::new(ClaudeBackend::new());
 
+    // Standalone mode: commands are logged but not handled
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<RuntimeCommand>(64);
+    tokio::spawn(async move {
+        while let Some(cmd) = command_rx.recv().await {
+            tracing::info!("Standalone agent received runtime command: {:?}", cmd);
+        }
+    });
+
     let config = AgentConfig {
-        role,
+        agent_id,
         working_dir: working_dir.to_string(),
         system_prompt: role.system_prompt().to_string(),
     };
 
-    let agent = Agent::new(config, backend, &base_path).await?;
+    let agent = Agent::new(config, backend, &base_path, command_tx).await?;
     agent.run().await
 }
 
@@ -129,64 +140,25 @@ async fn run_orchestrator(working_dir: &str) -> Result<()> {
     std::fs::create_dir_all(&base_path)?;
 
     let backend = Arc::new(ClaudeBackend::new());
-
-    // Spawn all agents
-    let mut handles = Vec::new();
-
-    for role in [
-        AgentRole::Manager,
-        AgentRole::Architect,
-        AgentRole::Developer,
-        AgentRole::Scorer,
-    ] {
-        let backend = backend.clone();
-        let base_path = base_path.clone();
-        let working_dir = working_dir.to_string();
-
-        let handle = tokio::spawn(async move {
-            let config = AgentConfig {
-                role,
-                working_dir,
-                system_prompt: role.system_prompt().to_string(),
-            };
-
-            match Agent::new(config, backend, &base_path).await {
-                Ok(agent) => {
-                    if let Err(e) = agent.run().await {
-                        tracing::error!("Agent {} error: {}", role, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create agent {}: {}", role, e);
-                }
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    // Wait for all agents (they run forever unless interrupted)
-    for handle in handles {
-        let _ = handle.await;
-    }
-
-    Ok(())
+    let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string());
+    runtime.run().await
 }
 
 async fn send_message(to: AgentRole, content: &str) -> Result<()> {
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
+    let to_id = AgentId::new_singleton(to);
 
     let message = AgentMessage::new(
-        AgentRole::Manager, // External input goes to manager
-        to,
+        AgentId::new_singleton(AgentRole::Manager), // External input goes to manager
+        to_id.clone(),
         MessageKind::Info,
         content.to_string(),
     );
 
-    let mut conn = AgentConnection::connect(to, &base_path).await?;
+    let mut conn = AgentConnection::connect(&to_id, &base_path).await?;
     conn.send(&message).await?;
 
-    info!("Sent message to {}: {}", to, content);
+    info!("Sent message to {}: {}", to_id, content);
     Ok(())
 }
 
@@ -194,24 +166,33 @@ async fn show_status() -> Result<()> {
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
 
     println!("=== Agent Sockets ===");
-    for role in [
-        AgentRole::Manager,
-        AgentRole::Architect,
-        AgentRole::Developer,
-        AgentRole::Scorer,
-    ] {
-        let socket_path = base_path.join(format!("{}.sock", role.as_str()));
-        let status = if socket_path.exists() {
-            // Try to connect
-            match AgentConnection::connect(role, &base_path).await {
-                Ok(_) => "listening",
-                Err(_) => "stale socket",
-            }
-        } else {
-            "not running"
-        };
-        println!("  {}: {}", role, status);
+
+    // Singletons
+    for role in [AgentRole::Manager, AgentRole::Architect, AgentRole::Scorer] {
+        let agent_id = AgentId::new_singleton(role);
+        println!("  {}: {}", agent_id, probe_socket(&agent_id, &base_path).await);
+    }
+
+    // Developers (0-2)
+    for i in 0..3u8 {
+        let agent_id = AgentId::new_developer(i);
+        let status = probe_socket(&agent_id, &base_path).await;
+        if status != "not running" || i == 0 {
+            println!("  {}: {}", agent_id, status);
+        }
     }
 
     Ok(())
+}
+
+async fn probe_socket(agent_id: &AgentId, base_path: &Path) -> &'static str {
+    let socket_path = base_path.join(format!("{}.sock", agent_id.socket_name()));
+    if socket_path.exists() {
+        match AgentConnection::connect(agent_id, base_path).await {
+            Ok(_) => "listening",
+            Err(_) => "stale socket",
+        }
+    } else {
+        "not running"
+    }
 }

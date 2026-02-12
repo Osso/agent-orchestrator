@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::message::{wire, AgentMessage};
-use crate::types::AgentRole;
+use crate::types::AgentId;
 
 /// Peer credentials from SO_PEERCRED
 #[derive(Debug, Clone)]
@@ -37,15 +37,15 @@ impl PeerCredentials {
 pub struct AgentListener {
     listener: UnixListener,
     socket_path: PathBuf,
-    role: AgentRole,
+    agent_id: AgentId,
 }
 
 impl AgentListener {
-    /// Create a new listener for an agent role
+    /// Create a new listener for an agent
     ///
-    /// Socket path will be: `{base_path}/{role}.sock`
-    pub async fn bind(role: AgentRole, base_path: &Path) -> Result<Self> {
-        let socket_path = base_path.join(format!("{}.sock", role.as_str()));
+    /// Socket path will be: `{base_path}/{agent_id.socket_name()}.sock`
+    pub async fn bind(agent_id: AgentId, base_path: &Path) -> Result<Self> {
+        let socket_path = base_path.join(format!("{}.sock", agent_id.socket_name()));
 
         // Remove existing socket file if present
         if socket_path.exists() {
@@ -60,12 +60,12 @@ impl AgentListener {
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("Failed to bind to {}", socket_path.display()))?;
 
-        tracing::info!("Agent {} listening on {}", role, socket_path.display());
+        tracing::info!("Agent {} listening on {}", agent_id, socket_path.display());
 
         Ok(Self {
             listener,
             socket_path,
-            role,
+            agent_id,
         })
     }
 
@@ -87,7 +87,7 @@ impl AgentListener {
 
         tracing::debug!(
             "Agent {} accepted connection from pid={} uid={}",
-            self.role,
+            self.agent_id,
             creds.pid,
             creds.uid
         );
@@ -119,8 +119,8 @@ impl AgentConnection {
     }
 
     /// Connect to an agent's socket
-    pub async fn connect(role: AgentRole, base_path: &Path) -> Result<Self> {
-        let socket_path = base_path.join(format!("{}.sock", role.as_str()));
+    pub async fn connect(agent_id: &AgentId, base_path: &Path) -> Result<Self> {
+        let socket_path = base_path.join(format!("{}.sock", agent_id.socket_name()));
 
         let stream = UnixStream::connect(&socket_path)
             .await
