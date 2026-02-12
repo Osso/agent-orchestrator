@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::backend::AgentBackend;
+use crate::backend::{AgentBackend, AgentOutput};
 use crate::runtime::{RuntimeCommand, TaskStatus};
 use crate::transport::{AgentConnection, AgentListener, AgentMessage, MessageKind};
 use crate::types::{AgentId, AgentRole};
@@ -23,14 +23,12 @@ pub struct AgentConfig {
     pub system_prompt: String,
 }
 
-/// Result of parsing an agent output line
+/// Result of parsing an agent output section
 pub enum ParsedOutput {
     /// Route a message to another agent
     Message(AgentMessage),
     /// Send a command to the runtime
     Command(RuntimeCommand),
-    /// No actionable output
-    None,
 }
 
 /// Running agent instance
@@ -94,19 +92,15 @@ impl Agent {
             let from_id = self.config.agent_id.clone();
             let cmd_tx = self.command_tx.clone();
             while let Some(output) = output_rx.recv().await {
+                // Log all text output for visibility
                 if let Some(text) = output.text() {
-                    tracing::info!("[{}] {}", from_id, text);
-                    match parse_agent_output(&from_id, text) {
-                        ParsedOutput::Message(msg) => {
-                            if outgoing_tx.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        ParsedOutput::Command(cmd) => {
-                            let _ = cmd_tx.send(cmd).await;
-                        }
-                        ParsedOutput::None => {}
+                    if !text.is_empty() {
+                        tracing::info!("[{}] {}", from_id, text);
                     }
+                }
+                // Only parse Text outputs (Result duplicates the same content)
+                if let AgentOutput::Text(ref text) = output {
+                    dispatch_parsed(&from_id, text, &outgoing_tx, &cmd_tx).await;
                 }
                 if output.is_final() {
                     break;
@@ -140,6 +134,27 @@ impl Agent {
     }
 }
 
+/// Dispatch all parsed outputs from a text block to the appropriate channels
+async fn dispatch_parsed(
+    from: &AgentId,
+    text: &str,
+    outgoing_tx: &mpsc::Sender<AgentMessage>,
+    cmd_tx: &mpsc::Sender<RuntimeCommand>,
+) {
+    for parsed in parse_agent_output(from, text) {
+        match parsed {
+            ParsedOutput::Message(msg) => {
+                tracing::info!("{} -> {} ({:?})", from, msg.to, msg.kind);
+                let _ = outgoing_tx.send(msg).await;
+            }
+            ParsedOutput::Command(cmd) => {
+                tracing::info!("{} -> runtime ({:?})", from, cmd);
+                let _ = cmd_tx.send(cmd).await;
+            }
+        }
+    }
+}
+
 /// Format incoming message as a prompt for the AI
 fn format_prompt_for_agent(msg: &AgentMessage, config: &AgentConfig) -> String {
     let context = match msg.kind {
@@ -159,6 +174,17 @@ fn format_prompt_for_agent(msg: &AgentMessage, config: &AgentConfig) -> String {
     )
 }
 
+// --- Multi-line section-based output parsing ---
+
+/// All recognized output prefixes
+const ALL_PREFIXES: &[&str] = &[
+    "CREW:", "RELIEVE:", "TASK:", "APPROVED:", "REJECTED:",
+    "COMPLETE:", "BLOCKED:", "INTERRUPT:", "EVALUATION:", "OBSERVATION:",
+];
+
+/// Prefixes whose content is only the remainder of the same line
+const SINGLE_LINE_PREFIXES: &[&str] = &["CREW:", "RELIEVE:"];
+
 /// Message routing table: (prefix, target_role, kind, require_from_role)
 const ROUTES: &[(&str, AgentRole, MessageKind, Option<AgentRole>)] = &[
     ("TASK:", AgentRole::Architect, MessageKind::TaskAssignment, None),
@@ -166,56 +192,122 @@ const ROUTES: &[(&str, AgentRole, MessageKind, Option<AgentRole>)] = &[
     ("INTERRUPT:", AgentRole::Developer, MessageKind::Interrupt, Some(AgentRole::Architect)),
 ];
 
-/// Parse agent output line into a message, runtime command, or nothing
-pub fn parse_agent_output(from: &AgentId, text: &str) -> ParsedOutput {
-    let text = text.trim();
-
-    if let Some(cmd) = parse_runtime_command(from, text) {
-        return ParsedOutput::Command(cmd);
-    }
-    if let Some(msg) = parse_approved_message(from, text) {
-        return ParsedOutput::Message(msg);
-    }
-    if let Some(parsed) = parse_completion_message(from, text) {
-        return parsed;
-    }
-    if let Some(msg) = parse_routed_message(from, text) {
-        return ParsedOutput::Message(msg);
-    }
-    log_scorer_output(from, text);
-    ParsedOutput::None
+/// Check if a line starts with a recognized prefix
+fn recognized_prefix(line: &str) -> Option<&'static str> {
+    ALL_PREFIXES.iter().find(|&&p| line.starts_with(p)).copied()
 }
 
-/// Parse CREW: and RELIEVE: commands destined for the runtime
-fn parse_runtime_command(from: &AgentId, text: &str) -> Option<RuntimeCommand> {
-    if let Some(rest) = text.strip_prefix("CREW:") {
-        if from.role != AgentRole::Manager {
-            return None;
+/// Extract structured sections from multi-line agent output.
+/// Returns (prefix, content) pairs where content includes continuation lines.
+fn extract_sections(text: &str) -> Vec<(&'static str, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim_start();
+        if let Some(prefix) = recognized_prefix(line) {
+            let first = line[prefix.len()..].trim();
+
+            if SINGLE_LINE_PREFIXES.contains(&prefix) {
+                sections.push((prefix, first.to_string()));
+                i += 1;
+                continue;
+            }
+
+            // Multi-line: collect until next prefix or end
+            let mut content = first.to_string();
+            i += 1;
+            while i < lines.len() {
+                if recognized_prefix(lines[i].trim_start()).is_some() {
+                    break;
+                }
+                content.push('\n');
+                content.push_str(lines[i]);
+                i += 1;
+            }
+
+            sections.push((prefix, content.trim_end().to_string()));
+        } else {
+            i += 1;
         }
-        let count: u8 = rest.trim().parse().ok()?;
-        return Some(RuntimeCommand::SetCrewSize { count });
     }
-    if let Some(rest) = text.strip_prefix("RELIEVE:") {
-        if from.role != AgentRole::Scorer {
-            return None;
+
+    sections
+}
+
+/// Parse multi-line agent output into messages and runtime commands
+pub fn parse_agent_output(from: &AgentId, text: &str) -> Vec<ParsedOutput> {
+    extract_sections(text)
+        .into_iter()
+        .filter_map(|(prefix, content)| parse_section(from, prefix, &content))
+        .collect()
+}
+
+/// Parse a single extracted section into a ParsedOutput
+fn parse_section(from: &AgentId, prefix: &str, content: &str) -> Option<ParsedOutput> {
+    match prefix {
+        "CREW:" => {
+            if from.role != AgentRole::Manager { return None; }
+            let count: u8 = content.trim().parse().ok()?;
+            Some(ParsedOutput::Command(RuntimeCommand::SetCrewSize { count }))
         }
-        let reason = rest.trim().to_string();
-        return Some(RuntimeCommand::RelieveManager { reason });
+        "RELIEVE:" => {
+            if from.role != AgentRole::Scorer { return None; }
+            Some(ParsedOutput::Command(RuntimeCommand::RelieveManager {
+                reason: content.to_string(),
+            }))
+        }
+        "APPROVED:" => {
+            let target = parse_developer_target(content);
+            Some(ParsedOutput::Message(AgentMessage::new(
+                from.clone(), target, MessageKind::TaskAssignment, content.to_string(),
+            )))
+        }
+        "COMPLETE:" | "BLOCKED:" => parse_completion_section(from, prefix, content),
+        "EVALUATION:" | "OBSERVATION:" => {
+            if from.role == AgentRole::Scorer {
+                tracing::info!("[SCORER {}] {}", prefix.trim_end_matches(':'), first_line(content));
+            }
+            None
+        }
+        _ => parse_routed_section(from, prefix, content),
+    }
+}
+
+/// Parse COMPLETE:/BLOCKED: into a message back to the manager
+fn parse_completion_section(from: &AgentId, prefix: &str, content: &str) -> Option<ParsedOutput> {
+    let (status, kind) = if prefix == "COMPLETE:" {
+        (TaskStatus::Completed, MessageKind::TaskComplete)
+    } else {
+        (TaskStatus::Blocked, MessageKind::TaskGiveUp)
+    };
+    tracing::info!("[TASK {:?}] from {}: {}", status, from, first_line(content));
+    Some(ParsedOutput::Message(AgentMessage::new(
+        from.clone(),
+        AgentId::new_singleton(AgentRole::Manager),
+        kind,
+        content.to_string(),
+    )))
+}
+
+/// Route a section via the routing table (TASK:, REJECTED:, INTERRUPT:)
+fn parse_routed_section(from: &AgentId, prefix: &str, content: &str) -> Option<ParsedOutput> {
+    for &(route_prefix, target_role, kind, require_from) in ROUTES {
+        if prefix != route_prefix { continue; }
+        if let Some(required) = require_from
+            && from.role != required
+        {
+            continue;
+        }
+        return Some(ParsedOutput::Message(AgentMessage::new(
+            from.clone(),
+            AgentId::new_singleton(target_role),
+            kind,
+            content.to_string(),
+        )));
     }
     None
-}
-
-/// Parse APPROVED: with optional developer-N target
-fn parse_approved_message(from: &AgentId, text: &str) -> Option<AgentMessage> {
-    let rest = text.strip_prefix("APPROVED:")?;
-    let content = rest.trim();
-    let target = parse_developer_target(content);
-    Some(AgentMessage::new(
-        from.clone(),
-        target,
-        MessageKind::TaskAssignment,
-        content.to_string(),
-    ))
 }
 
 /// Extract `developer-N` from text prefix, default to developer-0
@@ -229,67 +321,14 @@ fn parse_developer_target(text: &str) -> AgentId {
     AgentId::new_developer(0)
 }
 
-/// Parse COMPLETE:/BLOCKED: — produces both a message and a runtime TaskUpdate
-fn parse_completion_message(from: &AgentId, text: &str) -> Option<ParsedOutput> {
-    let (content, status, kind) = if let Some(rest) = text.strip_prefix("COMPLETE:") {
-        (rest.trim(), TaskStatus::Completed, MessageKind::TaskComplete)
-    } else if let Some(rest) = text.strip_prefix("BLOCKED:") {
-        (rest.trim(), TaskStatus::Blocked, MessageKind::TaskGiveUp)
-    } else {
-        return None;
-    };
-
-    // The message goes to manager; the TaskUpdate goes to runtime via the caller
-    let msg = AgentMessage::new(
-        from.clone(),
-        AgentId::new_singleton(AgentRole::Manager),
-        kind,
-        content.to_string(),
-    );
-
-    // Log the task update (runtime will pick it up via command channel separately)
-    tracing::info!("[TASK {:?}] from {}: {}", status, from, content);
-    Some(ParsedOutput::Message(msg))
-}
-
-/// Match output against simple routing table
-fn parse_routed_message(from: &AgentId, text: &str) -> Option<AgentMessage> {
-    for &(prefix, target_role, kind, require_from) in ROUTES {
-        if !text.starts_with(prefix) {
-            continue;
-        }
-        if let Some(required) = require_from
-            && from.role != required
-        {
-            continue;
-        }
-        let content = text[prefix.len()..].trim().to_string();
-        return Some(AgentMessage::new(
-            from.clone(),
-            AgentId::new_singleton(target_role),
-            kind,
-            content,
-        ));
-    }
-    None
-}
-
-/// Log scorer evaluation/observation output (not routed)
-fn log_scorer_output(from: &AgentId, text: &str) {
-    if from.role != AgentRole::Scorer {
-        return;
-    }
-    if let Some(content) = text.strip_prefix("EVALUATION:") {
-        tracing::info!("[SCORER EVALUATION] {}", content.trim());
-    } else if let Some(content) = text.strip_prefix("OBSERVATION:") {
-        tracing::info!("[SCORER OBSERVATION] {}", content.trim());
-    }
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
 }
 
 /// Send a message to another agent via their socket
 async fn send_to_agent(msg: &AgentMessage, base_path: &Path) -> Result<()> {
     let mut conn = AgentConnection::connect(&msg.to, base_path).await?;
     conn.send(msg).await?;
-    tracing::debug!("Sent {:?} message to {}", msg.kind, msg.to);
+    tracing::info!("Delivered {:?} to {} from {}", msg.kind, msg.to, msg.from);
     Ok(())
 }
