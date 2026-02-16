@@ -4,8 +4,10 @@
 //! Each backend knows how to spawn a process, send messages, and receive streaming output.
 
 mod claude;
+mod claudius;
 
 pub use claude::ClaudeBackend;
+pub use claudius::ClaudiusBackend;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -85,5 +87,6 @@ pub trait AgentBackend: Send + Sync {
         prompt: &str,
         working_dir: &str,
         session_id: Option<String>,
+        title: Option<&str>,
     ) -> Result<(Box<dyn AgentHandle>, mpsc::Receiver<AgentOutput>)>;
 }

@@ -11,7 +11,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use agent::{Agent, AgentConfig};
-use backend::ClaudeBackend;
+use backend::{AgentBackend, ClaudeBackend, ClaudiusBackend};
 use runtime::{OrchestratorRuntime, RuntimeCommand};
 use transport::{AgentConnection, AgentMessage, MessageKind};
 use types::{AgentId, AgentRole};
@@ -27,7 +27,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let opts = extract_global_opts(&mut args);
 
     if args.len() < 2 {
         print_usage();
@@ -41,7 +42,7 @@ async fn main() -> Result<()> {
             }
             let working_dir = &args[2];
             let task = args[3..].join(" ");
-            run_task(working_dir, &task).await
+            run_task(working_dir, &task, create_backend(&opts)).await
         }
         "agent" => {
             if args.len() < 3 {
@@ -49,11 +50,11 @@ async fn main() -> Result<()> {
             }
             let role = parse_role(&args[2])?;
             let working_dir = args.get(3).map(|s| s.as_str()).unwrap_or(".");
-            run_agent(role, working_dir).await
+            run_agent(role, working_dir, create_backend(&opts)).await
         }
         "orchestrate" => {
             let working_dir = args.get(2).map(|s| s.as_str()).unwrap_or(".");
-            run_orchestrator(working_dir).await
+            run_orchestrator(working_dir, create_backend(&opts)).await
         }
         "send" => {
             if args.len() < 4 {
@@ -76,7 +77,12 @@ fn print_usage() {
         r#"Agent Orchestrator - Multi-agent coordination for AI coding assistants
 
 USAGE:
-    agent-orchestrator <COMMAND>
+    agent-orchestrator [OPTIONS] <COMMAND>
+
+OPTIONS:
+    --backend <name>             Backend: claude (default), claudius
+    --claudius-url <url>         Claudius API URL (default: http://127.0.0.1:43527)
+    --claudius-password <pass>   Claudius password (or OPENCODE_SERVER_PASSWORD env)
 
 COMMANDS:
     run <dir> <task...>     Run agents on a task (non-interactive)
@@ -93,11 +99,69 @@ EXAMPLES:
     # Run a task non-interactively
     agent-orchestrator run ~/my-project "Add a login button to the homepage"
 
+    # Use Claudius backend (agents appear as tabs in the desktop app)
+    agent-orchestrator --backend claudius orchestrate ~/my-project
+
     # Start agents, then send tasks separately
     agent-orchestrator orchestrate ~/my-project
     agent-orchestrator send manager "Add a login button"
 "#
     );
+}
+
+struct GlobalOpts {
+    backend: String,
+    claudius_url: String,
+    claudius_password: Option<String>,
+}
+
+fn extract_global_opts(args: &mut Vec<String>) -> GlobalOpts {
+    let mut backend = "claude".to_string();
+    let mut claudius_url = "http://127.0.0.1:43527".to_string();
+    let mut claudius_password = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--backend" if i + 1 < args.len() => {
+                backend = args[i + 1].clone();
+                args.drain(i..i + 2);
+            }
+            "--claudius-url" if i + 1 < args.len() => {
+                claudius_url = args[i + 1].clone();
+                args.drain(i..i + 2);
+            }
+            "--claudius-password" if i + 1 < args.len() => {
+                claudius_password = Some(args[i + 1].clone());
+                args.drain(i..i + 2);
+            }
+            _ => i += 1,
+        }
+    }
+
+    // Fall back to env var for password
+    if claudius_password.is_none() {
+        claudius_password = std::env::var("OPENCODE_SERVER_PASSWORD").ok();
+    }
+
+    GlobalOpts {
+        backend,
+        claudius_url,
+        claudius_password,
+    }
+}
+
+fn create_backend(opts: &GlobalOpts) -> Arc<dyn AgentBackend> {
+    match opts.backend.as_str() {
+        "claudius" => {
+            info!("Using Claudius backend at {}", opts.claudius_url);
+            Arc::new(ClaudiusBackend::new(
+                &opts.claudius_url,
+                opts.claudius_password.as_deref(),
+            ))
+        }
+        _ => Arc::new(ClaudeBackend::new()),
+    }
 }
 
 fn parse_role(s: &str) -> Result<AgentRole> {
@@ -113,14 +177,12 @@ fn parse_role(s: &str) -> Result<AgentRole> {
     }
 }
 
-async fn run_agent(role: AgentRole, working_dir: &str) -> Result<()> {
+async fn run_agent(role: AgentRole, working_dir: &str, backend: Arc<dyn AgentBackend>) -> Result<()> {
     let agent_id = AgentId::new_singleton(role);
-    info!("Starting agent {} in {}", agent_id, working_dir);
+    info!("Starting agent {} in {} (backend: {})", agent_id, working_dir, backend.name());
 
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
     std::fs::create_dir_all(&base_path)?;
-
-    let backend = Arc::new(ClaudeBackend::new());
 
     // Standalone mode: commands are logged but not handled
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<RuntimeCommand>(64);
@@ -140,24 +202,22 @@ async fn run_agent(role: AgentRole, working_dir: &str) -> Result<()> {
     agent.run().await
 }
 
-async fn run_task(working_dir: &str, task: &str) -> Result<()> {
+async fn run_task(working_dir: &str, task: &str, backend: Arc<dyn AgentBackend>) -> Result<()> {
     info!("Running task in {}: {}", working_dir, task);
 
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
     std::fs::create_dir_all(&base_path)?;
 
-    let backend = Arc::new(ClaudeBackend::new());
     let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string());
     runtime.run_with_task(task.to_string()).await
 }
 
-async fn run_orchestrator(working_dir: &str) -> Result<()> {
+async fn run_orchestrator(working_dir: &str, backend: Arc<dyn AgentBackend>) -> Result<()> {
     info!("Starting orchestrator for {}", working_dir);
 
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
     std::fs::create_dir_all(&base_path)?;
 
-    let backend = Arc::new(ClaudeBackend::new());
     let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string());
     runtime.run().await
 }

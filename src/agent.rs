@@ -76,6 +76,9 @@ impl Agent {
             tracing::debug!("Outgoing message handler for {} stopped", agent_id_for_log);
         });
 
+        let mut session_id: Option<String> = None;
+        let title = format!("Orchestrator: {}", self.config.agent_id);
+
         loop {
             let (msg, outgoing_tx) = (
                 self.accept_message().await?,
@@ -85,13 +88,22 @@ impl Agent {
             let prompt = format_prompt_for_agent(&msg, &self.config);
             let (mut handle, mut output_rx) = self
                 .backend
-                .spawn(&prompt, &self.config.working_dir, None)
+                .spawn(&prompt, &self.config.working_dir, session_id.clone(), Some(&title))
                 .await
                 .context("Failed to spawn backend")?;
 
             let from_id = self.config.agent_id.clone();
             let cmd_tx = self.command_tx.clone();
             while let Some(output) = output_rx.recv().await {
+                // Capture session_id for reuse across spawn calls
+                match &output {
+                    AgentOutput::System { session_id: sid @ Some(_) }
+                    | AgentOutput::Result { session_id: sid @ Some(_), .. } => {
+                        session_id = sid.clone();
+                    }
+                    _ => {}
+                }
+
                 // Log all text output for visibility
                 if let Some(text) = output.text() {
                     if !text.is_empty() {
