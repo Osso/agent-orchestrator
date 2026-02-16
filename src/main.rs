@@ -85,7 +85,7 @@ USAGE:
 
 OPTIONS:
     --backend <name>             Backend: claude (default), claudius
-    --claudius-url <url>         Claudius API URL (default: http://127.0.0.1:43527)
+    --claudius-url <url>         Claudius API URL (default: http://127.0.0.1:45801)
     --claudius-password <pass>   Claudius password (or OPENCODE_SERVER_PASSWORD env)
 
 COMMANDS:
@@ -121,7 +121,7 @@ struct GlobalOpts {
 
 fn extract_global_opts(args: &mut Vec<String>) -> GlobalOpts {
     let mut backend = "claude".to_string();
-    let mut claudius_url = "http://127.0.0.1:43527".to_string();
+    let mut claudius_url = "http://127.0.0.1:45801".to_string();
     let mut claudius_password = None;
 
     let mut i = 0;
