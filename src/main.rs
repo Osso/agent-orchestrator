@@ -3,18 +3,20 @@ mod backend;
 mod runtime;
 mod transport;
 mod types;
+mod watcher;
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use agent::{Agent, AgentConfig};
-use backend::{AgentBackend, ClaudeBackend, ClaudiusBackend};
+use backend::{AgentBackend, ClaudeBackend, ClaudiusBackend, build_claudius_client};
 use runtime::{OrchestratorRuntime, RuntimeCommand};
 use transport::{AgentConnection, AgentMessage, MessageKind};
 use types::{AgentId, AgentRole};
+use watcher::{SessionRegistry, WatcherConfig};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/claude/orchestrator";
 
@@ -42,7 +44,8 @@ async fn main() -> Result<()> {
             }
             let working_dir = &args[2];
             let task = args[3..].join(" ");
-            run_task(working_dir, &task, create_backend(&opts)).await
+            let watcher = build_watcher_config(&opts, working_dir);
+            run_task(working_dir, &task, create_backend(&opts), watcher).await
         }
         "agent" => {
             if args.len() < 3 {
@@ -54,7 +57,8 @@ async fn main() -> Result<()> {
         }
         "orchestrate" => {
             let working_dir = args.get(2).map(|s| s.as_str()).unwrap_or(".");
-            run_orchestrator(working_dir, create_backend(&opts)).await
+            let watcher = build_watcher_config(&opts, working_dir);
+            run_orchestrator(working_dir, create_backend(&opts), watcher).await
         }
         "send" => {
             if args.len() < 4 {
@@ -164,6 +168,17 @@ fn create_backend(opts: &GlobalOpts) -> Arc<dyn AgentBackend> {
     }
 }
 
+fn build_watcher_config(opts: &GlobalOpts, working_dir: &str) -> Option<WatcherConfig> {
+    if opts.backend != "claudius" {
+        return None;
+    }
+    Some(WatcherConfig {
+        base_url: opts.claudius_url.trim_end_matches('/').to_string(),
+        client: build_claudius_client(opts.claudius_password.as_deref()),
+        working_dir: working_dir.to_string(),
+    })
+}
+
 fn parse_role(s: &str) -> Result<AgentRole> {
     match s.to_lowercase().as_str() {
         "manager" => Ok(AgentRole::Manager),
@@ -192,6 +207,7 @@ async fn run_agent(role: AgentRole, working_dir: &str, backend: Arc<dyn AgentBac
         }
     });
 
+    let registry = Arc::new(Mutex::new(SessionRegistry::new()));
     let config = AgentConfig {
         agent_id,
         working_dir: working_dir.to_string(),
@@ -199,27 +215,36 @@ async fn run_agent(role: AgentRole, working_dir: &str, backend: Arc<dyn AgentBac
         initial_task: None,
     };
 
-    let agent = Agent::new(config, backend, &base_path, command_tx).await?;
+    let agent = Agent::new(config, backend, &base_path, command_tx, registry).await?;
     agent.run().await
 }
 
-async fn run_task(working_dir: &str, task: &str, backend: Arc<dyn AgentBackend>) -> Result<()> {
+async fn run_task(
+    working_dir: &str,
+    task: &str,
+    backend: Arc<dyn AgentBackend>,
+    watcher_config: Option<WatcherConfig>,
+) -> Result<()> {
     info!("Running task in {}: {}", working_dir, task);
 
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
     std::fs::create_dir_all(&base_path)?;
 
-    let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string());
+    let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string(), watcher_config);
     runtime.run_with_task(task.to_string()).await
 }
 
-async fn run_orchestrator(working_dir: &str, backend: Arc<dyn AgentBackend>) -> Result<()> {
+async fn run_orchestrator(
+    working_dir: &str,
+    backend: Arc<dyn AgentBackend>,
+    watcher_config: Option<WatcherConfig>,
+) -> Result<()> {
     info!("Starting orchestrator for {}", working_dir);
 
     let base_path = PathBuf::from(DEFAULT_SOCKET_PATH);
     std::fs::create_dir_all(&base_path)?;
 
-    let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string());
+    let runtime = OrchestratorRuntime::new(backend, base_path, working_dir.to_string(), watcher_config);
     runtime.run().await
 }
 

@@ -7,7 +7,7 @@ mod claude;
 mod claudius;
 
 pub use claude::ClaudeBackend;
-pub use claudius::ClaudiusBackend;
+pub use claudius::{ClaudiusBackend, build_claudius_client, fetch_message};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ pub enum AgentOutput {
         text: Option<String>,
         is_error: bool,
         session_id: Option<String>,
+        message_id: Option<String>,
     },
 
     /// Error from the agent

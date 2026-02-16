@@ -195,6 +195,7 @@ fn convert_output(output: ClaudeOutput) -> AgentOutput {
             text: msg.result,
             is_error: msg.is_error,
             session_id: msg.session_id,
+            message_id: None,
         },
         ClaudeOutput::Error(msg) => {
             AgentOutput::Error(msg.error.or(msg.message).unwrap_or_default())

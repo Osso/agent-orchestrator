@@ -14,6 +14,24 @@ use tokio::task::JoinHandle;
 
 use super::{AgentBackend, AgentHandle, AgentOutput};
 
+/// Build an HTTP client with optional Basic auth for the Claudius API
+pub fn build_claudius_client(password: Option<&str>) -> reqwest::Client {
+    let mut headers = HeaderMap::new();
+    if let Some(pass) = password {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("opencode:{}", pass));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", encoded))
+                .expect("valid auth header value"),
+        );
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("failed to build HTTP client")
+}
+
 /// Claudius HTTP API backend
 pub struct ClaudiusBackend {
     base_url: String,
@@ -22,25 +40,9 @@ pub struct ClaudiusBackend {
 
 impl ClaudiusBackend {
     pub fn new(base_url: &str, password: Option<&str>) -> Self {
-        let mut headers = HeaderMap::new();
-        if let Some(pass) = password {
-            let encoded =
-                base64::engine::general_purpose::STANDARD.encode(format!("opencode:{}", pass));
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Basic {}", encoded))
-                    .expect("valid auth header value"),
-            );
-        }
-
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("failed to build HTTP client");
-
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client,
+            client: build_claudius_client(password),
         }
     }
 }
@@ -354,6 +356,7 @@ async fn send_and_process(
             },
             is_error: response.info.error.is_some(),
             session_id: Some(session_id.to_string()),
+            message_id: Some(response.info.id),
         })
         .await;
 
@@ -451,7 +454,6 @@ struct MessageResponse {
 
 #[derive(Debug, Deserialize)]
 struct MessageInfo {
-    #[allow(dead_code)]
     id: String,
     #[serde(default)]
     error: Option<String>,
@@ -483,4 +485,39 @@ struct ToolState {
     output: Value,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// Fetch a specific message from a Claudius session and extract its text content
+pub async fn fetch_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    message_id: &str,
+    working_dir: &str,
+) -> Result<String> {
+    let url = format!("{}/session/{}/message/{}", base_url, session_id, message_id);
+    let resp = client
+        .get(&url)
+        .query(&[("directory", working_dir)])
+        .send()
+        .await
+        .context("Failed to fetch message from Claudius")?;
+
+    if !resp.status().is_success() {
+        bail!("Fetch message failed ({})", resp.status());
+    }
+
+    let response: MessageResponse = resp
+        .json()
+        .await
+        .context("Failed to parse message response")?;
+
+    let mut text = String::new();
+    for part in &response.parts {
+        if let MessagePart::Text { text: t } = part {
+            text.push_str(t);
+        }
+    }
+
+    Ok(text)
 }

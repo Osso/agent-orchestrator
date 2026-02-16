@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,6 +19,7 @@ const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 use crate::agent::{Agent, AgentConfig};
 use crate::backend::AgentBackend;
 use crate::types::{AgentId, AgentRole};
+use crate::watcher::{SessionRegistry, WatcherConfig, spawn_watcher};
 
 /// Commands sent from agents to the runtime (not over the wire)
 #[derive(Debug)]
@@ -68,6 +69,8 @@ pub struct OrchestratorRuntime {
     command_tx: mpsc::Sender<RuntimeCommand>,
     command_rx: mpsc::Receiver<RuntimeCommand>,
     agent_handles: HashMap<AgentId, JoinHandle<()>>,
+    registry: Arc<Mutex<SessionRegistry>>,
+    watcher_config: Option<WatcherConfig>,
 }
 
 impl OrchestratorRuntime {
@@ -75,6 +78,7 @@ impl OrchestratorRuntime {
         backend: Arc<dyn AgentBackend>,
         base_path: PathBuf,
         working_dir: String,
+        watcher_config: Option<WatcherConfig>,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(64);
 
@@ -91,19 +95,35 @@ impl OrchestratorRuntime {
             command_tx,
             command_rx,
             agent_handles: HashMap::new(),
+            registry: Arc::new(Mutex::new(SessionRegistry::new())),
+            watcher_config,
         }
     }
 
     /// Run the orchestrator: spawn initial agents, then process commands
     pub async fn run(mut self) -> Result<()> {
         self.spawn_initial_agents(None).await?;
+        self.start_watcher();
         self.command_loop().await
     }
 
     /// Run with an initial task: spawn agents with task queued for manager
     pub async fn run_with_task(mut self, task: String) -> Result<()> {
         self.spawn_initial_agents(Some(task)).await?;
+        self.start_watcher();
         self.command_loop().await
+    }
+
+    /// Start the SSE watcher if configured (claudius backend only)
+    fn start_watcher(&mut self) {
+        if let Some(config) = self.watcher_config.take() {
+            spawn_watcher(
+                config,
+                self.registry.clone(),
+                self.command_tx.clone(),
+                self.base_path.clone(),
+            );
+        }
     }
 
     /// Process runtime commands until shutdown signal or all senders drop
@@ -214,6 +234,7 @@ impl OrchestratorRuntime {
         let base_path = self.base_path.clone();
         let working_dir = self.working_dir.clone();
         let command_tx = self.command_tx.clone();
+        let registry = self.registry.clone();
         let id_for_log = agent_id.clone();
 
         let handle = tokio::spawn(async move {
@@ -224,7 +245,7 @@ impl OrchestratorRuntime {
                 initial_task,
             };
 
-            match Agent::new(config, backend, &base_path, command_tx).await {
+            match Agent::new(config, backend, &base_path, command_tx, registry).await {
                 Ok(agent) => {
                     if let Err(e) = agent.run().await {
                         tracing::error!("Agent {} error: {}", id_for_log, e);

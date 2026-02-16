@@ -8,13 +8,14 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::backend::{AgentBackend, AgentOutput};
 use crate::runtime::{RuntimeCommand, TaskStatus};
 use crate::transport::{AgentConnection, AgentListener, AgentMessage, MessageKind};
 use crate::types::{AgentId, AgentRole};
+use crate::watcher::SessionRegistry;
 
 /// Configuration for an agent
 pub struct AgentConfig {
@@ -40,6 +41,7 @@ pub struct Agent {
     listener: AgentListener,
     base_path: std::path::PathBuf,
     command_tx: mpsc::Sender<RuntimeCommand>,
+    registry: Arc<Mutex<SessionRegistry>>,
 }
 
 impl Agent {
@@ -49,6 +51,7 @@ impl Agent {
         backend: Arc<dyn AgentBackend>,
         base_path: &Path,
         command_tx: mpsc::Sender<RuntimeCommand>,
+        registry: Arc<Mutex<SessionRegistry>>,
     ) -> Result<Self> {
         let listener = AgentListener::bind(config.agent_id.clone(), base_path).await?;
 
@@ -58,6 +61,7 @@ impl Agent {
             listener,
             base_path: base_path.to_path_buf(),
             command_tx,
+            registry,
         })
     }
 
@@ -107,6 +111,11 @@ impl Agent {
         let perm_mode = permission_mode_for_role(self.config.agent_id.role);
         let (mut session_id, mut system_prompt_sent, mut pending_task) = self.init().await;
 
+        // Register session in the watcher registry
+        if let Some(sid) = &session_id {
+            self.registry.lock().unwrap().sessions.insert(sid.clone(), self.config.agent_id.clone());
+        }
+
         loop {
             let msg = match pending_task.take() {
                 Some(m) => {
@@ -122,13 +131,20 @@ impl Agent {
                 system_prompt_sent = true;
                 format_prompt_for_agent(&msg, &self.config)
             };
+
+            // Mark session busy before sending (save for idle marking after)
+            let busy_sid = session_id.clone();
+            if let Some(sid) = &busy_sid {
+                self.registry.lock().unwrap().busy.insert(sid.clone());
+            }
+
             let (mut handle, mut output_rx) = self
                 .backend
                 .spawn(&prompt, &self.config.working_dir, session_id.clone(), Some(&title), Some(perm_mode))
                 .await
                 .context("Failed to spawn backend")?;
 
-            session_id = process_output(
+            let (new_session_id, message_id) = process_output(
                 &mut output_rx,
                 session_id,
                 &self.config.agent_id,
@@ -136,6 +152,17 @@ impl Agent {
                 &self.command_tx,
             )
             .await;
+
+            session_id = new_session_id;
+
+            // Mark session idle and record processed message
+            if let Some(sid) = &busy_sid {
+                let mut reg = self.registry.lock().unwrap();
+                reg.busy.remove(sid);
+                if let Some(mid) = message_id {
+                    reg.processed.insert(mid);
+                }
+            }
 
             let _ = handle.wait().await;
         }
@@ -181,19 +208,26 @@ fn spawn_outgoing_handler(
     tx
 }
 
-/// Process output stream: log text, route parsed messages, capture session_id
+/// Process output stream: log text, route parsed messages, capture session_id and message_id
 async fn process_output(
     output_rx: &mut mpsc::Receiver<AgentOutput>,
     mut session_id: Option<String>,
     from_id: &AgentId,
     outgoing_tx: &mpsc::Sender<AgentMessage>,
     cmd_tx: &mpsc::Sender<RuntimeCommand>,
-) -> Option<String> {
+) -> (Option<String>, Option<String>) {
+    let mut message_id = None;
+
     while let Some(output) = output_rx.recv().await {
         match &output {
-            AgentOutput::System { session_id: sid @ Some(_) }
-            | AgentOutput::Result { session_id: sid @ Some(_), .. } => {
+            AgentOutput::System { session_id: sid @ Some(_) } => {
                 session_id = sid.clone();
+            }
+            AgentOutput::Result { session_id: sid, message_id: mid, .. } => {
+                if sid.is_some() {
+                    session_id = sid.clone();
+                }
+                message_id = mid.clone();
             }
             _ => {}
         }
@@ -209,11 +243,11 @@ async fn process_output(
             break;
         }
     }
-    session_id
+    (session_id, message_id)
 }
 
 /// Dispatch all parsed outputs from a text block to the appropriate channels
-async fn dispatch_parsed(
+pub async fn dispatch_parsed(
     from: &AgentId,
     text: &str,
     outgoing_tx: &mpsc::Sender<AgentMessage>,
@@ -419,7 +453,7 @@ fn permission_mode_for_role(role: AgentRole) -> &'static str {
 }
 
 /// Send a message to another agent via their socket
-async fn send_to_agent(msg: &AgentMessage, base_path: &Path) -> Result<()> {
+pub async fn send_to_agent(msg: &AgentMessage, base_path: &Path) -> Result<()> {
     let mut conn = AgentConnection::connect(&msg.to, base_path).await?;
     conn.send(msg).await?;
     tracing::info!("Delivered {:?} to {} from {}", msg.kind, msg.to, msg.from);
