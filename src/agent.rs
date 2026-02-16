@@ -69,12 +69,14 @@ impl Agent {
         );
 
         let title = format!("Orchestrator: {}", self.config.agent_id);
+        let perm_mode = permission_mode_for_role(self.config.agent_id.role);
         let mut session_id = self
             .backend
             .init_session(
                 &self.config.working_dir,
                 Some(&title),
                 Some(&self.config.system_prompt),
+                Some(perm_mode),
             )
             .await
             .unwrap_or(None);
@@ -94,7 +96,7 @@ impl Agent {
             };
             let (mut handle, mut output_rx) = self
                 .backend
-                .spawn(&prompt, &self.config.working_dir, session_id.clone(), Some(&title))
+                .spawn(&prompt, &self.config.working_dir, session_id.clone(), Some(&title), Some(perm_mode))
                 .await
                 .context("Failed to spawn backend")?;
 
@@ -376,6 +378,15 @@ fn parse_developer_target(text: &str) -> AgentId {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
+}
+
+/// Map agent role to permission mode.
+/// Only developers can edit files; others are read-only.
+fn permission_mode_for_role(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Developer => "acceptEdits",
+        AgentRole::Manager | AgentRole::Architect | AgentRole::Scorer => "plan",
+    }
 }
 
 /// Send a message to another agent via their socket

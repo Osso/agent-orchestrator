@@ -88,6 +88,7 @@ pub trait AgentBackend: Send + Sync {
         _working_dir: &str,
         _title: Option<&str>,
         _system_prompt: Option<&str>,
+        _permission_mode: Option<&str>,
     ) -> Result<Option<String>> {
         Ok(None)
     }
@@ -101,5 +102,6 @@ pub trait AgentBackend: Send + Sync {
         working_dir: &str,
         session_id: Option<String>,
         title: Option<&str>,
+        permission_mode: Option<&str>,
     ) -> Result<(Box<dyn AgentHandle>, mpsc::Receiver<AgentOutput>)>;
 }

@@ -18,7 +18,6 @@ use super::{AgentBackend, AgentHandle, AgentOutput};
 pub struct ClaudiusBackend {
     base_url: String,
     client: reqwest::Client,
-    permission_mode: String,
 }
 
 impl ClaudiusBackend {
@@ -42,7 +41,6 @@ impl ClaudiusBackend {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
-            permission_mode: "acceptEdits".to_string(),
         }
     }
 }
@@ -85,18 +83,23 @@ impl AgentBackend for ClaudiusBackend {
         working_dir: &str,
         title: Option<&str>,
         system_prompt: Option<&str>,
+        permission_mode: Option<&str>,
     ) -> Result<Option<String>> {
-        let sid = create_session(&self.client, &self.base_url, working_dir, title).await?;
-        if let Some(prompt) = system_prompt {
-            send_system_prompt(
-                &self.client,
-                &self.base_url,
-                &sid,
-                prompt,
-                working_dir,
-                &self.permission_mode,
-            )
-            .await?;
+        let mode = permission_mode.unwrap_or("acceptEdits");
+        let (sid, is_new) =
+            find_or_create_session(&self.client, &self.base_url, working_dir, title).await?;
+        if is_new {
+            if let Some(prompt) = system_prompt {
+                send_system_prompt(
+                    &self.client,
+                    &self.base_url,
+                    &sid,
+                    prompt,
+                    working_dir,
+                    mode,
+                )
+                .await?;
+            }
         }
         Ok(Some(sid))
     }
@@ -107,12 +110,18 @@ impl AgentBackend for ClaudiusBackend {
         working_dir: &str,
         session_id: Option<String>,
         title: Option<&str>,
+        permission_mode: Option<&str>,
     ) -> Result<(Box<dyn AgentHandle>, mpsc::Receiver<AgentOutput>)> {
         let (tx, rx) = mpsc::channel(256);
 
         let sid = match session_id {
             Some(id) => id,
-            None => create_session(&self.client, &self.base_url, working_dir, title).await?,
+            None => {
+                let (id, _) =
+                    find_or_create_session(&self.client, &self.base_url, working_dir, title)
+                        .await?;
+                id
+            }
         };
 
         let _ = tx
@@ -121,10 +130,11 @@ impl AgentBackend for ClaudiusBackend {
             })
             .await;
 
+        let mode = permission_mode.unwrap_or("acceptEdits").to_string();
         let task = spawn_message_task(
             self.client.clone(),
             self.base_url.clone(),
-            self.permission_mode.clone(),
+            mode,
             sid.clone(),
             prompt.to_string(),
             working_dir.to_string(),
@@ -166,6 +176,53 @@ fn spawn_message_task(
             let _ = tx.send(AgentOutput::Error(e.to_string())).await;
         }
     })
+}
+
+/// Find an existing session by title (case-insensitive), or create a new one.
+async fn find_or_create_session(
+    client: &reqwest::Client,
+    base_url: &str,
+    working_dir: &str,
+    title: Option<&str>,
+) -> Result<(String, bool)> {
+    if let Some(title) = title {
+        if let Some(id) = find_session_by_title(client, base_url, working_dir, title).await? {
+            tracing::info!("Reusing Claudius session: {} ({})", id, title);
+            return Ok((id, false));
+        }
+    }
+    let id = create_session(client, base_url, working_dir, title).await?;
+    Ok((id, true))
+}
+
+async fn find_session_by_title(
+    client: &reqwest::Client,
+    base_url: &str,
+    working_dir: &str,
+    title: &str,
+) -> Result<Option<String>> {
+    let url = format!("{}/session", base_url);
+    let resp = client
+        .get(&url)
+        .query(&[("directory", working_dir)])
+        .send()
+        .await
+        .context("Failed to list Claudius sessions")?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let sessions: Vec<SessionListEntry> = resp
+        .json()
+        .await
+        .unwrap_or_default();
+
+    let needle = title.to_lowercase();
+    Ok(sessions
+        .into_iter()
+        .find(|s| s.title.to_lowercase() == needle)
+        .map(|s| s.id))
 }
 
 async fn create_session(
@@ -356,6 +413,12 @@ fn value_as_string(v: &Value) -> String {
 }
 
 // --- Claudius API response types ---
+
+#[derive(Debug, Deserialize)]
+struct SessionListEntry {
+    id: String,
+    title: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct CreateSessionResponse {

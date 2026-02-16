@@ -68,6 +68,7 @@ impl AgentBackend for ClaudeBackend {
         working_dir: &str,
         session_id: Option<String>,
         _title: Option<&str>,
+        _permission_mode: Option<&str>,
     ) -> Result<(Box<dyn AgentHandle>, mpsc::Receiver<AgentOutput>)> {
         let mut child = spawn_claude_process(&self.extra_args, working_dir, session_id)?;
 
