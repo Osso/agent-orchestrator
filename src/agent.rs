@@ -63,61 +63,45 @@ impl Agent {
     pub async fn run(self) -> Result<()> {
         tracing::info!("Agent {} starting", self.config.agent_id);
 
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<AgentMessage>(64);
+        let outgoing_tx = spawn_outgoing_handler(
+            self.config.agent_id.clone(),
+            self.base_path.clone(),
+        );
 
-        let base_path = self.base_path.clone();
-        let agent_id_for_log = self.config.agent_id.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = outgoing_rx.recv().await {
-                if let Err(e) = send_to_agent(&msg, &base_path).await {
-                    tracing::error!("Failed to send message to {}: {}", msg.to, e);
-                }
-            }
-            tracing::debug!("Outgoing message handler for {} stopped", agent_id_for_log);
-        });
-
-        let mut session_id: Option<String> = None;
         let title = format!("Orchestrator: {}", self.config.agent_id);
+        let mut session_id = self
+            .backend
+            .init_session(&self.config.working_dir, Some(&title))
+            .await
+            .unwrap_or(None);
+        if session_id.is_some() {
+            tracing::info!("Agent {} session pre-created", self.config.agent_id);
+        }
+        let mut system_prompt_sent = false;
 
         loop {
-            let (msg, outgoing_tx) = (
-                self.accept_message().await?,
-                outgoing_tx.clone(),
-            );
+            let msg = self.accept_message().await?;
 
-            let prompt = format_prompt_for_agent(&msg, &self.config);
+            let prompt = if system_prompt_sent {
+                format_task_content(&msg)
+            } else {
+                system_prompt_sent = true;
+                format_prompt_for_agent(&msg, &self.config)
+            };
             let (mut handle, mut output_rx) = self
                 .backend
                 .spawn(&prompt, &self.config.working_dir, session_id.clone(), Some(&title))
                 .await
                 .context("Failed to spawn backend")?;
 
-            let from_id = self.config.agent_id.clone();
-            let cmd_tx = self.command_tx.clone();
-            while let Some(output) = output_rx.recv().await {
-                // Capture session_id for reuse across spawn calls
-                match &output {
-                    AgentOutput::System { session_id: sid @ Some(_) }
-                    | AgentOutput::Result { session_id: sid @ Some(_), .. } => {
-                        session_id = sid.clone();
-                    }
-                    _ => {}
-                }
-
-                // Log all text output for visibility
-                if let Some(text) = output.text() {
-                    if !text.is_empty() {
-                        tracing::info!("[{}] {}", from_id, text);
-                    }
-                }
-                // Only parse Text outputs (Result duplicates the same content)
-                if let AgentOutput::Text(ref text) = output {
-                    dispatch_parsed(&from_id, text, &outgoing_tx, &cmd_tx).await;
-                }
-                if output.is_final() {
-                    break;
-                }
-            }
+            session_id = process_output(
+                &mut output_rx,
+                session_id,
+                &self.config.agent_id,
+                &outgoing_tx,
+                &self.command_tx,
+            )
+            .await;
 
             let _ = handle.wait().await;
         }
@@ -146,6 +130,54 @@ impl Agent {
     }
 }
 
+/// Spawn a task that forwards outgoing messages to their target agents
+fn spawn_outgoing_handler(
+    agent_id: AgentId,
+    base_path: std::path::PathBuf,
+) -> mpsc::Sender<AgentMessage> {
+    let (tx, mut rx) = mpsc::channel::<AgentMessage>(64);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = send_to_agent(&msg, &base_path).await {
+                tracing::error!("Failed to send message to {}: {}", msg.to, e);
+            }
+        }
+        tracing::debug!("Outgoing message handler for {} stopped", agent_id);
+    });
+    tx
+}
+
+/// Process output stream: log text, route parsed messages, capture session_id
+async fn process_output(
+    output_rx: &mut mpsc::Receiver<AgentOutput>,
+    mut session_id: Option<String>,
+    from_id: &AgentId,
+    outgoing_tx: &mpsc::Sender<AgentMessage>,
+    cmd_tx: &mpsc::Sender<RuntimeCommand>,
+) -> Option<String> {
+    while let Some(output) = output_rx.recv().await {
+        match &output {
+            AgentOutput::System { session_id: sid @ Some(_) }
+            | AgentOutput::Result { session_id: sid @ Some(_), .. } => {
+                session_id = sid.clone();
+            }
+            _ => {}
+        }
+        if let Some(text) = output.text() {
+            if !text.is_empty() {
+                tracing::info!("[{}] {}", from_id, text);
+            }
+        }
+        if let AgentOutput::Text(ref text) = output {
+            dispatch_parsed(from_id, text, outgoing_tx, cmd_tx).await;
+        }
+        if output.is_final() {
+            break;
+        }
+    }
+    session_id
+}
+
 /// Dispatch all parsed outputs from a text block to the appropriate channels
 async fn dispatch_parsed(
     from: &AgentId,
@@ -167,8 +199,13 @@ async fn dispatch_parsed(
     }
 }
 
-/// Format incoming message as a prompt for the AI
+/// Format incoming message as a prompt for the AI (includes system prompt)
 fn format_prompt_for_agent(msg: &AgentMessage, config: &AgentConfig) -> String {
+    format!("{}\n\n{}", config.system_prompt, format_task_content(msg))
+}
+
+/// Format just the task content (without system prompt, for subsequent messages)
+fn format_task_content(msg: &AgentMessage) -> String {
     let context = match msg.kind {
         MessageKind::TaskAssignment => "NEW TASK",
         MessageKind::TaskComplete => "TASK COMPLETE",
@@ -181,8 +218,8 @@ fn format_prompt_for_agent(msg: &AgentMessage, config: &AgentConfig) -> String {
     };
 
     format!(
-        "{}\n\n{} from {}: {}\n\nTask ID: {:?}",
-        config.system_prompt, context, msg.from, msg.content, msg.task_id
+        "{} from {}: {}\n\nTask ID: {:?}",
+        context, msg.from, msg.content, msg.task_id
     )
 }
 

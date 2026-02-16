@@ -79,6 +79,16 @@ pub trait AgentBackend: Send + Sync {
     /// Name of this backend (e.g., "claude", "gemini", "codex")
     fn name(&self) -> &'static str;
 
+    /// Pre-create a session for an agent. Returns session_id if the backend
+    /// supports persistent sessions (e.g. Claudius). Default: no-op.
+    async fn init_session(
+        &self,
+        _working_dir: &str,
+        _title: Option<&str>,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Spawn a new agent process with the given prompt
     ///
     /// Returns a handle for control and a receiver for streaming output.

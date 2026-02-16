@@ -80,6 +80,15 @@ impl AgentBackend for ClaudiusBackend {
         "claudius"
     }
 
+    async fn init_session(
+        &self,
+        working_dir: &str,
+        title: Option<&str>,
+    ) -> Result<Option<String>> {
+        let sid = create_session(&self.client, &self.base_url, working_dir, title).await?;
+        Ok(Some(sid))
+    }
+
     async fn spawn(
         &self,
         prompt: &str,
