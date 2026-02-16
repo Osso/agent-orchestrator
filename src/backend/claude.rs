@@ -68,9 +68,9 @@ impl AgentBackend for ClaudeBackend {
         working_dir: &str,
         session_id: Option<String>,
         _title: Option<&str>,
-        _permission_mode: Option<&str>,
+        permission_mode: Option<&str>,
     ) -> Result<(Box<dyn AgentHandle>, mpsc::Receiver<AgentOutput>)> {
-        let mut child = spawn_claude_process(&self.extra_args, working_dir, session_id)?;
+        let mut child = spawn_claude_process(&self.extra_args, working_dir, session_id, permission_mode)?;
 
         let stdout = child.stdout.take().context("Failed to get stdout")?;
         let stderr = child.stderr.take().context("Failed to get stderr")?;
@@ -89,6 +89,7 @@ fn spawn_claude_process(
     extra_args: &[String],
     working_dir: &str,
     session_id: Option<String>,
+    permission_mode: Option<&str>,
 ) -> Result<Child> {
     let mut cmd = Command::new("claude");
 
@@ -98,6 +99,10 @@ fn spawn_claude_process(
         "--output-format", "stream-json",
         "--verbose",
     ]);
+
+    if let Some(mode) = permission_mode {
+        cmd.args(["--permission-mode", mode]);
+    }
 
     for arg in extra_args {
         cmd.arg(arg);

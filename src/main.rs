@@ -196,6 +196,7 @@ async fn run_agent(role: AgentRole, working_dir: &str, backend: Arc<dyn AgentBac
         agent_id,
         working_dir: working_dir.to_string(),
         system_prompt: role.system_prompt().to_string(),
+        initial_task: None,
     };
 
     let agent = Agent::new(config, backend, &base_path, command_tx).await?;

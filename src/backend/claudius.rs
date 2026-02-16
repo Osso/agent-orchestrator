@@ -87,7 +87,7 @@ impl AgentBackend for ClaudiusBackend {
     ) -> Result<Option<String>> {
         let mode = permission_mode.unwrap_or("acceptEdits");
         let (sid, is_new) =
-            find_or_create_session(&self.client, &self.base_url, working_dir, title).await?;
+            find_or_create_session(&self.client, &self.base_url, working_dir, title, permission_mode).await?;
         if is_new {
             if let Some(prompt) = system_prompt {
                 send_system_prompt(
@@ -118,7 +118,7 @@ impl AgentBackend for ClaudiusBackend {
             Some(id) => id,
             None => {
                 let (id, _) =
-                    find_or_create_session(&self.client, &self.base_url, working_dir, title)
+                    find_or_create_session(&self.client, &self.base_url, working_dir, title, permission_mode)
                         .await?;
                 id
             }
@@ -184,6 +184,7 @@ async fn find_or_create_session(
     base_url: &str,
     working_dir: &str,
     title: Option<&str>,
+    permission_mode: Option<&str>,
 ) -> Result<(String, bool)> {
     if let Some(title) = title {
         if let Some(id) = find_session_by_title(client, base_url, working_dir, title).await? {
@@ -191,7 +192,7 @@ async fn find_or_create_session(
             return Ok((id, false));
         }
     }
-    let id = create_session(client, base_url, working_dir, title).await?;
+    let id = create_session(client, base_url, working_dir, title, permission_mode).await?;
     Ok((id, true))
 }
 
@@ -230,9 +231,13 @@ async fn create_session(
     base_url: &str,
     working_dir: &str,
     title: Option<&str>,
+    permission_mode: Option<&str>,
 ) -> Result<String> {
     let url = format!("{}/session", base_url);
-    let body = serde_json::json!({ "title": title.unwrap_or("Orchestrator") });
+    let mut body = serde_json::json!({ "title": title.unwrap_or("Orchestrator") });
+    if let Some(mode) = permission_mode {
+        body["permissionMode"] = serde_json::Value::String(mode.to_string());
+    }
 
     let resp = client
         .post(&url)

@@ -21,6 +21,8 @@ pub struct AgentConfig {
     pub agent_id: AgentId,
     pub working_dir: String,
     pub system_prompt: String,
+    /// Task to process immediately after session init (before accepting socket messages)
+    pub initial_task: Option<String>,
 }
 
 /// Result of parsing an agent output section
@@ -59,18 +61,11 @@ impl Agent {
         })
     }
 
-    /// Run the agent main loop
-    pub async fn run(self) -> Result<()> {
-        tracing::info!("Agent {} starting", self.config.agent_id);
-
-        let outgoing_tx = spawn_outgoing_handler(
-            self.config.agent_id.clone(),
-            self.base_path.clone(),
-        );
-
+    /// Initialize session and build pending task from config
+    async fn init(&mut self) -> (Option<String>, bool, Option<AgentMessage>) {
         let title = format!("Orchestrator: {}", self.config.agent_id);
         let perm_mode = permission_mode_for_role(self.config.agent_id.role);
-        let mut session_id = self
+        let session_id = self
             .backend
             .init_session(
                 &self.config.working_dir,
@@ -80,13 +75,46 @@ impl Agent {
             )
             .await
             .unwrap_or(None);
-        let mut system_prompt_sent = session_id.is_some();
+        let system_prompt_sent = session_id.is_some();
         if system_prompt_sent {
             tracing::info!("Agent {} session pre-created with system prompt", self.config.agent_id);
         }
 
+        // Queue initial task to process before accepting socket messages.
+        // This avoids the race where socket injection arrives before init_session completes.
+        let pending = self.config.initial_task.take().map(|task| {
+            AgentMessage::new(
+                self.config.agent_id.clone(),
+                self.config.agent_id.clone(),
+                MessageKind::Info,
+                task,
+            )
+        });
+
+        (session_id, system_prompt_sent, pending)
+    }
+
+    /// Run the agent main loop
+    pub async fn run(mut self) -> Result<()> {
+        tracing::info!("Agent {} starting", self.config.agent_id);
+
+        let outgoing_tx = spawn_outgoing_handler(
+            self.config.agent_id.clone(),
+            self.base_path.clone(),
+        );
+
+        let title = format!("Orchestrator: {}", self.config.agent_id);
+        let perm_mode = permission_mode_for_role(self.config.agent_id.role);
+        let (mut session_id, mut system_prompt_sent, mut pending_task) = self.init().await;
+
         loop {
-            let msg = self.accept_message().await?;
+            let msg = match pending_task.take() {
+                Some(m) => {
+                    tracing::info!("Agent {} processing initial task", self.config.agent_id);
+                    m
+                }
+                None => self.accept_message().await?,
+            };
 
             let prompt = if system_prompt_sent {
                 format_task_content(&msg)
@@ -381,11 +409,12 @@ fn first_line(text: &str) -> &str {
 }
 
 /// Map agent role to permission mode.
-/// Only developers can edit files; others are read-only.
+/// Developers auto-accept edits. Others use dontAsk mode which auto-denies
+/// tool uses that aren't pre-approved (read-only tools work without approval).
 fn permission_mode_for_role(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Developer => "acceptEdits",
-        AgentRole::Manager | AgentRole::Architect | AgentRole::Scorer => "plan",
+        AgentRole::Manager | AgentRole::Architect | AgentRole::Scorer => "dontAsk",
     }
 }
 

@@ -18,7 +18,6 @@ const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 
 use crate::agent::{Agent, AgentConfig};
 use crate::backend::AgentBackend;
-use crate::transport::{AgentConnection, AgentMessage, MessageKind};
 use crate::types::{AgentId, AgentRole};
 
 /// Commands sent from agents to the runtime (not over the wire)
@@ -97,34 +96,14 @@ impl OrchestratorRuntime {
 
     /// Run the orchestrator: spawn initial agents, then process commands
     pub async fn run(mut self) -> Result<()> {
-        self.spawn_initial_agents().await?;
+        self.spawn_initial_agents(None).await?;
         self.command_loop().await
     }
 
-    /// Run with an initial task: spawn agents, inject task, process commands
+    /// Run with an initial task: spawn agents with task queued for manager
     pub async fn run_with_task(mut self, task: String) -> Result<()> {
-        self.spawn_initial_agents().await?;
-
-        // Give sockets a moment to be ready, then inject the task
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        self.inject_task(&task).await?;
-
+        self.spawn_initial_agents(Some(task)).await?;
         self.command_loop().await
-    }
-
-    /// Send a task to the manager via its socket
-    async fn inject_task(&self, task: &str) -> Result<()> {
-        let manager_id = AgentId::new_singleton(AgentRole::Manager);
-        let msg = AgentMessage::new(
-            AgentId::new_singleton(AgentRole::Manager),
-            manager_id.clone(),
-            MessageKind::Info,
-            task.to_string(),
-        );
-        let mut conn = AgentConnection::connect(&manager_id, &self.base_path).await?;
-        conn.send(&msg).await?;
-        tracing::info!("Injected task to manager: {}", task);
-        Ok(())
     }
 
     /// Process runtime commands until shutdown signal or all senders drop
@@ -206,22 +185,31 @@ impl OrchestratorRuntime {
     }
 
     /// Spawn the four initial agents: manager, architect, scorer, developer-0
-    async fn spawn_initial_agents(&mut self) -> Result<()> {
-        for role in [AgentRole::Manager, AgentRole::Architect, AgentRole::Scorer] {
+    async fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
+        let mgr_id = AgentId::new_singleton(AgentRole::Manager);
+        self.spawn_agent(mgr_id, AgentRole::Manager.system_prompt().to_string(), manager_task)
+            .await?;
+
+        for role in [AgentRole::Architect, AgentRole::Scorer] {
             let id = AgentId::new_singleton(role);
-            self.spawn_agent(id, role.system_prompt().to_string())
+            self.spawn_agent(id, role.system_prompt().to_string(), None)
                 .await?;
         }
 
         let dev_id = AgentId::new_developer(0);
-        self.spawn_agent(dev_id, AgentRole::Developer.system_prompt().to_string())
+        self.spawn_agent(dev_id, AgentRole::Developer.system_prompt().to_string(), None)
             .await?;
 
         Ok(())
     }
 
     /// Spawn a single agent and track its handle
-    async fn spawn_agent(&mut self, agent_id: AgentId, system_prompt: String) -> Result<()> {
+    async fn spawn_agent(
+        &mut self,
+        agent_id: AgentId,
+        system_prompt: String,
+        initial_task: Option<String>,
+    ) -> Result<()> {
         let backend = self.backend.clone();
         let base_path = self.base_path.clone();
         let working_dir = self.working_dir.clone();
@@ -233,6 +221,7 @@ impl OrchestratorRuntime {
                 agent_id: id_for_log.clone(),
                 working_dir,
                 system_prompt,
+                initial_task,
             };
 
             match Agent::new(config, backend, &base_path, command_tx).await {
@@ -276,7 +265,7 @@ impl OrchestratorRuntime {
         for i in from..to {
             let dev_id = AgentId::new_developer(i);
             let prompt = AgentRole::Developer.system_prompt().to_string();
-            if let Err(e) = self.spawn_agent(dev_id.clone(), prompt).await {
+            if let Err(e) = self.spawn_agent(dev_id.clone(), prompt, None).await {
                 tracing::error!("Failed to spawn {}: {}", dev_id, e);
             }
         }
@@ -318,7 +307,7 @@ impl OrchestratorRuntime {
         let briefing = self.build_manager_briefing(reason);
         let prompt = format!("{}\n\n{}", AgentRole::Manager.system_prompt(), briefing);
 
-        if let Err(e) = self.spawn_agent(AgentId::new_singleton(AgentRole::Manager), prompt).await
+        if let Err(e) = self.spawn_agent(AgentId::new_singleton(AgentRole::Manager), prompt, None).await
         {
             tracing::error!("Failed to spawn replacement manager: {}", e);
         }
