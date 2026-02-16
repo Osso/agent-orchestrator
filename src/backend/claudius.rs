@@ -178,7 +178,11 @@ fn spawn_message_task(
     })
 }
 
-/// Find an existing session by title (case-insensitive), or create a new one.
+/// Delete any stale session with this title, then create a fresh one.
+///
+/// Sessions from a previous server instance look valid in the DB but their SDK
+/// isn't initialized, causing message POSTs to hang. Always starting fresh
+/// avoids this.
 async fn find_or_create_session(
     client: &reqwest::Client,
     base_url: &str,
@@ -188,12 +192,21 @@ async fn find_or_create_session(
 ) -> Result<(String, bool)> {
     if let Some(title) = title {
         if let Some(id) = find_session_by_title(client, base_url, working_dir, title).await? {
-            tracing::info!("Reusing Claudius session: {} ({})", id, title);
-            return Ok((id, false));
+            tracing::info!("Deleting stale session: {} ({})", id, title);
+            delete_session(client, base_url, &id, working_dir).await;
         }
     }
     let id = create_session(client, base_url, working_dir, title, permission_mode).await?;
     Ok((id, true))
+}
+
+async fn delete_session(client: &reqwest::Client, base_url: &str, id: &str, working_dir: &str) {
+    let url = format!("{}/session/{}", base_url, id);
+    let _ = client
+        .delete(&url)
+        .query(&[("directory", working_dir)])
+        .send()
+        .await;
 }
 
 async fn find_session_by_title(
