@@ -309,9 +309,15 @@ const ROUTES: &[(&str, AgentRole, MessageKind, Option<AgentRole>)] = &[
     ("INTERRUPT:", AgentRole::Developer, MessageKind::Interrupt, Some(AgentRole::Architect)),
 ];
 
-/// Check if a line starts with a recognized prefix
+/// Strip leading markdown bold markers (e.g. "**TASK:" → "TASK:")
+fn strip_markdown_bold(line: &str) -> &str {
+    line.strip_prefix("**").unwrap_or(line)
+}
+
+/// Check if a line starts with a recognized prefix (ignoring markdown bold)
 fn recognized_prefix(line: &str) -> Option<&'static str> {
-    ALL_PREFIXES.iter().find(|&&p| line.starts_with(p)).copied()
+    let clean = strip_markdown_bold(line);
+    ALL_PREFIXES.iter().find(|&&p| clean.starts_with(p)).copied()
 }
 
 /// Extract structured sections from multi-line agent output.
@@ -324,7 +330,8 @@ fn extract_sections(text: &str) -> Vec<(&'static str, String)> {
     while i < lines.len() {
         let line = lines[i].trim_start();
         if let Some(prefix) = recognized_prefix(line) {
-            let first = line[prefix.len()..].trim();
+            let clean = strip_markdown_bold(line);
+            let first = clean[prefix.len()..].trim().trim_end_matches("**");
 
             if SINGLE_LINE_PREFIXES.contains(&prefix) {
                 sections.push((prefix, first.to_string()));
