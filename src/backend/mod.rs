@@ -81,10 +81,13 @@ pub trait AgentBackend: Send + Sync {
 
     /// Pre-create a session for an agent. Returns session_id if the backend
     /// supports persistent sessions (e.g. Claudius). Default: no-op.
+    /// If `system_prompt` is provided, it is sent as the first message so
+    /// the agent has its instructions even when used interactively.
     async fn init_session(
         &self,
         _working_dir: &str,
         _title: Option<&str>,
+        _system_prompt: Option<&str>,
     ) -> Result<Option<String>> {
         Ok(None)
     }

@@ -71,13 +71,17 @@ impl Agent {
         let title = format!("Orchestrator: {}", self.config.agent_id);
         let mut session_id = self
             .backend
-            .init_session(&self.config.working_dir, Some(&title))
+            .init_session(
+                &self.config.working_dir,
+                Some(&title),
+                Some(&self.config.system_prompt),
+            )
             .await
             .unwrap_or(None);
-        if session_id.is_some() {
-            tracing::info!("Agent {} session pre-created", self.config.agent_id);
+        let mut system_prompt_sent = session_id.is_some();
+        if system_prompt_sent {
+            tracing::info!("Agent {} session pre-created with system prompt", self.config.agent_id);
         }
-        let mut system_prompt_sent = false;
 
         loop {
             let msg = self.accept_message().await?;

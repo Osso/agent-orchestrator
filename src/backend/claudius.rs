@@ -84,8 +84,20 @@ impl AgentBackend for ClaudiusBackend {
         &self,
         working_dir: &str,
         title: Option<&str>,
+        system_prompt: Option<&str>,
     ) -> Result<Option<String>> {
         let sid = create_session(&self.client, &self.base_url, working_dir, title).await?;
+        if let Some(prompt) = system_prompt {
+            send_system_prompt(
+                &self.client,
+                &self.base_url,
+                &sid,
+                prompt,
+                working_dir,
+                &self.permission_mode,
+            )
+            .await?;
+        }
         Ok(Some(sid))
     }
 
@@ -186,6 +198,40 @@ async fn create_session(
 
     tracing::info!("Created Claudius session: {}", session.id);
     Ok(session.id)
+}
+
+/// Send the system prompt as the first message so the agent has instructions
+/// even when users interact with the session directly through Claudius.
+async fn send_system_prompt(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    prompt: &str,
+    working_dir: &str,
+    permission_mode: &str,
+) -> Result<()> {
+    let url = format!("{}/session/{}/message", base_url, session_id);
+    let body = serde_json::json!({
+        "parts": [{ "type": "text", "text": prompt }],
+        "permissionMode": permission_mode,
+    });
+
+    let resp = client
+        .post(&url)
+        .query(&[("directory", working_dir)])
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to send system prompt to Claudius")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("System prompt failed ({}): {}", status, text);
+    }
+
+    tracing::info!("Sent system prompt to session {}", session_id);
+    Ok(())
 }
 
 async fn send_and_process(
