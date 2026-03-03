@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use agent_bus::Bus;
 use anyhow::{Context, Result};
+use llm_sdk::session::SessionStore;
 use llm_tasks::db::Database;
 use tokio::task::JoinHandle;
 
@@ -30,6 +31,7 @@ pub struct OrchestratorRuntime {
     state: RuntimeState,
     bus: Bus,
     db: Database,
+    session_store: SessionStore,
     working_dir: String,
     agent_handles: HashMap<String, JoinHandle<()>>,
 }
@@ -40,6 +42,12 @@ impl OrchestratorRuntime {
             .await
             .context("Failed to open task database")?;
 
+        let project = Path::new(&working_dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default");
+        let session_store = SessionStore::new("agent-orchestrator", project);
+
         Ok(Self {
             state: RuntimeState {
                 developer_count: 1,
@@ -48,6 +56,7 @@ impl OrchestratorRuntime {
             },
             bus: Bus::new(),
             db,
+            session_store,
             working_dir,
             agent_handles: HashMap::new(),
         })
@@ -156,6 +165,10 @@ impl OrchestratorRuntime {
 
     fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
         let bus_name = config.agent_id.bus_name();
+        let session = self
+            .session_store
+            .session(&bus_name)
+            .system_prompt(&config.system_prompt);
         let mailbox = self
             .bus
             .register(&bus_name)
@@ -163,9 +176,13 @@ impl OrchestratorRuntime {
 
         let agent_id = config.agent_id.clone();
         let handle = tokio::spawn(async move {
-            let agent = Agent::new(config, mailbox);
-            if let Err(e) = agent.run().await {
-                tracing::error!("Agent {} error: {}", agent_id, e);
+            match Agent::new(config, mailbox, session) {
+                Ok(agent) => {
+                    if let Err(e) = agent.run().await {
+                        tracing::error!("Agent {} error: {}", agent_id, e);
+                    }
+                }
+                Err(e) => tracing::error!("Agent {} init failed: {}", agent_id, e),
             }
         });
 
@@ -209,6 +226,7 @@ impl OrchestratorRuntime {
         );
 
         self.abort_agent("manager");
+        self.session_store.remove("manager");
         self.state.manager_generation += 1;
         self.state.last_relieve = Some(Instant::now());
 

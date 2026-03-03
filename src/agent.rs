@@ -9,8 +9,8 @@
 
 use agent_bus::Mailbox;
 use anyhow::Result;
-use llm_sdk::Backend;
 use llm_sdk::claude::Claude;
+use llm_sdk::session::Session;
 
 use crate::types::{AgentId, AgentRole};
 
@@ -42,16 +42,22 @@ pub enum ParsedOutput {
 pub struct Agent {
     config: AgentConfig,
     mailbox: Mailbox,
-    session_id: Option<String>,
+    session: Session,
+    base_claude: Claude,
 }
 
 impl Agent {
-    pub fn new(config: AgentConfig, mailbox: Mailbox) -> Self {
-        Self {
+    pub fn new(config: AgentConfig, mailbox: Mailbox, session: Session) -> Result<Self> {
+        let perm_mode = permission_mode_for_role(config.agent_id.role);
+        let base_claude = Claude::new()?
+            .permission_mode(perm_mode)
+            .working_dir(&config.working_dir);
+        Ok(Self {
             config,
             mailbox,
-            session_id: None,
-        }
+            session,
+            base_claude,
+        })
     }
 
     /// Run the agent main loop
@@ -74,13 +80,6 @@ impl Agent {
 
             if let Err(e) = self.process_prompt(&content).await {
                 tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
-                if matches!(
-                    e.downcast_ref::<llm_sdk::Error>(),
-                    Some(llm_sdk::Error::SessionExpired)
-                ) {
-                    tracing::warn!("Session expired, resetting");
-                    self.session_id = None;
-                }
             }
         }
 
@@ -89,38 +88,10 @@ impl Agent {
     }
 
     async fn process_prompt(&mut self, content: &str) -> Result<()> {
-        let prompt = self.build_prompt(content);
-        let claude = self.build_claude()?;
-        let output = claude.complete(&prompt).await?;
-
-        if output.session_id.is_some() {
-            self.session_id = output.session_id.clone();
-        }
+        let output = self.session.complete(&self.base_claude, content).await?;
         log_completion(&self.config.agent_id, &output);
         self.dispatch_output(&output.text);
         Ok(())
-    }
-
-    fn build_prompt(&self, content: &str) -> String {
-        if self.session_id.is_none() {
-            format!("{}\n\n{}", self.config.system_prompt, content)
-        } else {
-            content.to_string()
-        }
-    }
-
-    fn build_claude(&self) -> Result<Claude, llm_sdk::Error> {
-        let perm_mode = permission_mode_for_role(self.config.agent_id.role);
-        let mut claude = Claude::new()?;
-
-        claude = match &self.session_id {
-            Some(sid) => claude.resume(sid),
-            None => claude.system_prompt(&self.config.system_prompt),
-        };
-
-        Ok(claude
-            .permission_mode(perm_mode)
-            .working_dir(&self.config.working_dir))
     }
 
     fn dispatch_output(&self, text: &str) {
