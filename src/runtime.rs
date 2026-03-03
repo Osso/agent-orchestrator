@@ -308,7 +308,7 @@ impl OrchestratorRuntime {
             _ => AgentId::new_singleton(role),
         };
         let bus_name = agent_id.bus_name();
-        let working_dir = self.working_dir_for_role(role, &bus_name);
+        let (working_dir, sandbox_prefix) = self.working_dir_and_sandbox(role, &bus_name);
         let fresh = role == AgentRole::Developer;
         let bus = match self.backend {
             BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
@@ -324,18 +324,33 @@ impl OrchestratorRuntime {
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
             bus,
+            sandbox_prefix,
         };
         self.spawn_agent_with_config(config)
     }
 
-    fn working_dir_for_role(&self, role: AgentRole, bus_name: &str) -> String {
+    fn working_dir_and_sandbox(
+        &self,
+        role: AgentRole,
+        bus_name: &str,
+    ) -> (String, Vec<String>) {
+        let use_sandbox = llm_sdk::sandbox::is_available();
+        let project_path = PathBuf::from(&self.working_dir);
+
         if matches!(role, AgentRole::Developer | AgentRole::Merger) {
             let cfg = WorktreeConfig {
-                project_dir: PathBuf::from(&self.working_dir),
+                project_dir: project_path.clone(),
                 agent_name: bus_name.to_string(),
             };
             match worktree::create_worktree(&cfg) {
-                Ok(path) => return path.to_string_lossy().into_owned(),
+                Ok(wt_path) => {
+                    let prefix = if use_sandbox {
+                        llm_sdk::sandbox::developer_prefix(&wt_path, &project_path)
+                    } else {
+                        Vec::new()
+                    };
+                    return (wt_path.to_string_lossy().into_owned(), prefix);
+                }
                 Err(e) => tracing::warn!(
                     "Failed to create worktree for {}, using project dir: {}",
                     bus_name,
@@ -343,7 +358,13 @@ impl OrchestratorRuntime {
                 ),
             }
         }
-        self.working_dir.clone()
+
+        let prefix = if use_sandbox {
+            llm_sdk::sandbox::readonly_prefix()
+        } else {
+            Vec::new()
+        };
+        (self.working_dir.clone(), prefix)
     }
 
     fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
@@ -445,6 +466,11 @@ impl OrchestratorRuntime {
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
             bus,
+            sandbox_prefix: if llm_sdk::sandbox::is_available() {
+                llm_sdk::sandbox::readonly_prefix()
+            } else {
+                Vec::new()
+            },
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);

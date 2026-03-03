@@ -1365,7 +1365,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "llm-sdk"
 version = "0.1.0"
-source = "git+https://github.com/Osso/llm-sdk.git#10a8fe1189d72527d63cd7cc077d49daf55bf8ba"
+source = "git+https://github.com/Osso/llm-sdk.git#40c1f7111d560c5aa5984d68924adb6e9a086a56"
 dependencies = [
  "async-trait",
  "dirs",

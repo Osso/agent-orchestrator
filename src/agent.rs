@@ -89,6 +89,8 @@ pub struct AgentConfig {
     pub session_store: SessionStore,
     /// Bus for OpenRouter bus tools (None for Claude backend / tests).
     pub bus: Option<Bus>,
+    /// Bwrap command prefix for sandboxing (empty = no sandbox).
+    pub sandbox_prefix: Vec<String>,
 }
 
 /// Running agent instance
@@ -243,7 +245,8 @@ fn build_claude_completer(
         .permission_mode(perm_mode)
         .working_dir(&config.working_dir)
         .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .command_prefix(config.sandbox_prefix.clone());
     if !role_has_tools(config.agent_id.role) {
         base_claude = base_claude.allowed_tools(vec![ALLOWED_TOOLS_PATTERN.to_string()]);
     }
@@ -337,9 +340,10 @@ fn first_line(text: &str) -> &str {
 }
 
 pub fn permission_mode_for_role(role: AgentRole) -> &'static str {
+    // All agents use bypassPermissions — bwrap sandbox is the real security boundary.
     match role {
-        AgentRole::Developer | AgentRole::Merger => "acceptEdits",
-        AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "dontAsk",
+        AgentRole::Developer | AgentRole::Merger => "bypassPermissions",
+        AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "bypassPermissions",
     }
 }
 
@@ -350,7 +354,11 @@ pub fn role_has_tools(role: AgentRole) -> bool {
 /// Build the ToolSet for an OpenRouter agent: file tools for developers, bus tools for all.
 fn build_openrouter_tools(config: &AgentConfig, bus_name: &str) -> llm_sdk::tools::ToolSet {
     let mut set = if role_has_tools(config.agent_id.role) {
-        llm_sdk::tools::ToolSet::standard()
+        if config.sandbox_prefix.is_empty() {
+            llm_sdk::tools::ToolSet::standard()
+        } else {
+            llm_sdk::tools::ToolSet::standard_sandboxed(config.sandbox_prefix.clone())
+        }
     } else {
         llm_sdk::tools::ToolSet::new()
     };

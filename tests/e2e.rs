@@ -244,11 +244,12 @@ fn role_has_tools_only_for_developer_and_merger() {
 
 #[test]
 fn permission_modes_match_roles() {
-    assert_eq!(permission_mode_for_role(AgentRole::Developer), "acceptEdits");
-    assert_eq!(permission_mode_for_role(AgentRole::Merger), "acceptEdits");
-    assert_eq!(permission_mode_for_role(AgentRole::Manager), "dontAsk");
-    assert_eq!(permission_mode_for_role(AgentRole::Architect), "dontAsk");
-    assert_eq!(permission_mode_for_role(AgentRole::Auditor), "dontAsk");
+    // All agents use bypassPermissions — bwrap sandbox is the security boundary.
+    assert_eq!(permission_mode_for_role(AgentRole::Developer), "bypassPermissions");
+    assert_eq!(permission_mode_for_role(AgentRole::Merger), "bypassPermissions");
+    assert_eq!(permission_mode_for_role(AgentRole::Manager), "bypassPermissions");
+    assert_eq!(permission_mode_for_role(AgentRole::Architect), "bypassPermissions");
+    assert_eq!(permission_mode_for_role(AgentRole::Auditor), "bypassPermissions");
 }
 
 #[test]

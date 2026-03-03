@@ -73,6 +73,7 @@ pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> Ag
         backend: BackendKind::Claude,
         session_store: test_session_store(),
         bus: None,
+        sandbox_prefix: Vec::new(),
     }
 }
 
