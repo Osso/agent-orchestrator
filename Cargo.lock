@@ -67,6 +67,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dotenvy",
+ "glob",
  "llm-sdk",
  "llm-tasks",
  "peercred-ipc",

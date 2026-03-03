@@ -15,6 +15,9 @@ use llm_sdk::session::{Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
 
+/// Glob pattern restricting non-developer Claude CLI agents to orchestrator MCP tools only.
+pub const ALLOWED_TOOLS_PATTERN: &str = "mcp__orchestrator__*";
+
 /// Which backend to use for completions.
 #[derive(Clone, Debug)]
 pub enum BackendKind {
@@ -128,7 +131,7 @@ impl Agent {
 
         if let Some(task) = self.config.initial_task.take() {
             tracing::info!("Agent {} processing initial task", self.config.agent_id);
-            self.process_prompt(&task).await?;
+            let _ = self.process_prompt(&task).await;
         }
 
         while let Some(msg) = self.mailbox.recv().await {
@@ -139,13 +142,24 @@ impl Agent {
                 msg.from
             );
 
-            if msg.kind == "task_assignment" {
+            let is_task = msg.kind == "task_assignment";
+            if is_task {
                 self.reset_completer_for_task();
             }
 
             let content = extract_content(&msg.payload);
-            if let Err(e) = self.process_prompt(&content).await {
-                tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
+            match self.process_prompt(&content).await {
+                Ok(output) if is_task => {
+                    self.auto_report_completion(&output.text);
+                }
+                Err(e) if is_task => {
+                    tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
+                    self.auto_report_blocked(&e.to_string());
+                }
+                Err(e) => {
+                    tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
+                }
+                _ => {}
             }
         }
 
@@ -178,10 +192,33 @@ impl Agent {
         tracing::info!("Agent {} fresh completer for task", self.config.agent_id);
     }
 
-    async fn process_prompt(&mut self, content: &str) -> Result<()> {
+    /// Auto-send task_complete to manager if the developer didn't do it via tool.
+    fn auto_report_completion(&self, text: &str) {
+        let summary = if text.is_empty() {
+            "Task completed".to_string()
+        } else {
+            first_line(text).to_string()
+        };
+        let payload = serde_json::json!({ "content": summary });
+        if let Err(e) = self.mailbox.send("manager", "task_complete", payload.clone()) {
+            tracing::warn!("Auto task_complete send failed: {}", e);
+        }
+        let _ = self.mailbox.send("runtime", "task_complete", payload);
+    }
+
+    /// Auto-send task_blocked to manager on completion failure.
+    fn auto_report_blocked(&self, error: &str) {
+        let payload = serde_json::json!({ "content": format!("Task failed: {error}") });
+        if let Err(e) = self.mailbox.send("manager", "task_blocked", payload.clone()) {
+            tracing::warn!("Auto task_blocked send failed: {}", e);
+        }
+        let _ = self.mailbox.send("runtime", "task_blocked", payload);
+    }
+
+    async fn process_prompt(&mut self, content: &str) -> Result<llm_sdk::Output> {
         let output = self.completer.complete(content).await?;
         log_completion(&self.config.agent_id, &output);
-        Ok(())
+        Ok(output)
     }
 }
 
@@ -208,7 +245,7 @@ fn build_claude_completer(
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT");
     if !role_has_tools(config.agent_id.role) {
-        base_claude = base_claude.allowed_tools(vec!["mcp__orchestrator".to_string()]);
+        base_claude = base_claude.allowed_tools(vec![ALLOWED_TOOLS_PATTERN.to_string()]);
     }
     if let Some(ref cfg) = config.mcp_config {
         base_claude = base_claude.mcp_config(cfg);

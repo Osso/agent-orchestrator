@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use agent_bus::Bus;
-use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools, Agent};
+use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools, Agent, ALLOWED_TOOLS_PATTERN};
 use agent_orchestrator::bus_tools::bus_tools_for_role;
 use agent_orchestrator::runtime::RELIEVE_COOLDOWN;
 use agent_orchestrator::types::AgentRole;
@@ -249,6 +249,24 @@ fn permission_modes_match_roles() {
     assert_eq!(permission_mode_for_role(AgentRole::Manager), "dontAsk");
     assert_eq!(permission_mode_for_role(AgentRole::Architect), "dontAsk");
     assert_eq!(permission_mode_for_role(AgentRole::Auditor), "dontAsk");
+}
+
+#[test]
+fn allowed_tools_pattern_matches_mcp_tool_names() {
+    // Claude CLI names MCP tools as mcp__<server>__<tool>.
+    // Our pattern must match these with a glob wildcard.
+    let pattern = ALLOWED_TOOLS_PATTERN;
+    assert!(pattern.starts_with("mcp__orchestrator__"));
+    assert!(pattern.ends_with("*"));
+    // Verify it would match actual tool names via glob
+    let glob = glob::Pattern::new(pattern).expect("valid glob");
+    assert!(glob.matches("mcp__orchestrator__send_message"));
+    assert!(glob.matches("mcp__orchestrator__set_crew"));
+    assert!(glob.matches("mcp__orchestrator__relieve_manager"));
+    // Must NOT match non-orchestrator tools
+    assert!(!glob.matches("Bash"));
+    assert!(!glob.matches("Write"));
+    assert!(!glob.matches("mcp__other__send_message"));
 }
 
 #[test]

@@ -63,7 +63,7 @@ impl ToolDef for SendMessageTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent name" },
+                    "to": { "type": "string", "enum": ["architect", "developer-0", "developer-1", "developer-2", "merger", "auditor", "manager"], "description": "Target agent name (use exact names)" },
                     "kind": { "type": "string", "description": "Message kind" },
                     "content": { "type": "string", "description": "Message content" }
                 },
@@ -85,9 +85,13 @@ impl ToolDef for SendMessageTool {
             return "Only architect can send interrupt".into();
         }
         let payload = serde_json::json!({ "content": content });
-        match self.mailbox.send(to, kind, payload) {
+        match self.mailbox.send(to, kind, payload.clone()) {
             Ok(_) => {
                 tracing::info!("bus_tool send_message: -> {} kind={}", to, kind);
+                // CC runtime on task lifecycle events for DB recording
+                if kind == "task_complete" || kind == "task_blocked" {
+                    let _ = self.mailbox.send("runtime", kind, payload);
+                }
                 "Message sent".into()
             }
             Err(e) => {

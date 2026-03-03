@@ -171,10 +171,17 @@ fn handle_send_message(
         "from_agent": agent_name,
     });
 
-    mailbox
-        .send(to, kind, payload)
+    let result = mailbox
+        .send(to, kind, payload.clone())
         .map(|_| serde_json::json!({"ok": true}))
-        .map_err(|e| format!("send failed: {}", e))
+        .map_err(|e| format!("send failed: {}", e));
+
+    // CC runtime on task lifecycle events for DB recording
+    if result.is_ok() && (kind == "task_complete" || kind == "task_blocked") {
+        let _ = mailbox.send("runtime", kind, payload);
+    }
+
+    result
 }
 
 fn handle_set_crew(

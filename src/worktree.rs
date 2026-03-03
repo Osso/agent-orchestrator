@@ -32,7 +32,7 @@ pub fn create_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
             "worktree",
             "add",
             "--force",
-            "-b",
+            "-B",
             &branch,
             path.to_str().context("worktree path is not valid UTF-8")?,
             "HEAD",
