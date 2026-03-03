@@ -13,7 +13,13 @@ cargo clippy                   # Lint
 
 ## Architecture
 
-This is a multi-agent orchestration system that coordinates AI coding assistants (Claude, Gemini, Codex) through Unix sockets with peercred authentication.
+Multi-agent orchestration system that coordinates AI coding assistants via an in-process message bus. Each agent runs Claude Code CLI through `llm-sdk` and communicates with peers through `agent-bus`.
+
+### Dependencies (local crates)
+
+- **llm-sdk** (`../../lib/llm-sdk`) — Claude CLI backend (`Claude` builder) + `SessionStore`/`Session` for persistent session lifecycle
+- **agent-bus** (`../agent-bus`) — In-process message bus with named mailboxes
+- **llm-tasks** (`../llm-tasks`) — Task persistence via Turso/SQLite
 
 ### Agent Roles and Message Flow
 
@@ -53,102 +59,50 @@ Agents communicate via structured output lines that get parsed and routed:
 
 ```
 src/
-├── backend/
-│   ├── mod.rs          # AgentBackend trait (provider-agnostic)
-│   └── claude.rs       # Claude Code implementation (stream-json)
-├── transport/
-│   ├── mod.rs
-│   ├── message.rs      # Wire protocol (length-prefixed JSON)
-│   └── unix.rs         # Unix sockets + SO_PEERCRED
 ├── types/
+│   ├── mod.rs
 │   └── agent.rs        # AgentRole, AgentId (role + index)
-├── agent.rs            # Agent runtime, ParsedOutput, output parsing
-├── runtime.rs          # OrchestratorRuntime, RuntimeCommand, state management
-└── main.rs             # CLI entrypoint
+├── agent.rs            # Agent struct, output parsing, message routing
+├── runtime.rs          # OrchestratorRuntime, agent lifecycle, state
+└── main.rs             # CLI entrypoint (run/orchestrate/send)
 ```
 
 ### Key Abstractions
 
-**AgentBackend trait** (`backend/mod.rs`):
-- Abstracts AI provider (Claude, Gemini, Codex)
-- `spawn(prompt, working_dir, session_id)` → handle + output stream
-- Converts provider-specific output to generic `AgentOutput`
+**Agent** (`agent.rs`):
+- Holds a `Session` (from llm-sdk) and a base `Claude` instance
+- `session.complete(&base_claude, content)` handles resume, expiry, retry
+- Parses structured output lines and routes via `agent-bus` mailbox
+- Base Claude is configured per-role (permission mode, working dir)
 
-**Transport** (`transport/`):
-- Unix sockets at `/tmp/claude/orchestrator/{agent_id}.sock`
-- Singletons: `manager.sock`, `architect.sock`, `scorer.sock`
-- Developers: `developer-0.sock`, `developer-1.sock`, `developer-2.sock`
-- `SO_PEERCRED` for same-user verification
-- Length-prefixed JSON messages
+**Session Persistence** (via `llm-sdk::session`):
+- `SessionStore::new("agent-orchestrator", project)` → `~/.local/share/agent-orchestrator/{project}/sessions.json`
+- Each agent gets a `Session` keyed by bus name (e.g. "manager", "developer-0")
+- Sessions resume across restarts; `SessionExpired` triggers automatic retry with fresh session
+- On manager RELIEVE, session is removed via `store.remove("manager")` so replacement starts fresh
 
 **OrchestratorRuntime** (`runtime.rs`):
-- Spawns/tracks agent processes via `HashMap<AgentId, JoinHandle>`
-- Processes `RuntimeCommand`s from agents via mpsc channel
+- Owns the `Bus`, `SessionStore`, and `Database`
+- Spawns agents with `AgentConfig` + `Session` from the store
 - `CREW:` commands dynamically spawn/kill developer agents (1-3)
-- `RELIEVE:` fires manager, spawns replacement with state briefing (60s cooldown)
-- Maintains `task_log` for manager briefings on replacement
+- `RELIEVE:` fires manager, clears session, spawns replacement with state briefing (60s cooldown)
+- Records task events to llm-tasks database
 
-### Adding a New Backend
-
-1. Create `src/backend/gemini.rs` (or codex.rs)
-2. Implement `AgentBackend` trait
-3. Convert provider output to `AgentOutput` enum
-4. Add to `src/backend/mod.rs` exports
-
-```rust
-// src/backend/gemini.rs
-pub struct GeminiBackend {
-    api_key: String,
-    model: String,  // e.g. "gemini-2.5-flash"
-    client: reqwest::Client,
-}
-
-#[async_trait]
-impl AgentBackend for GeminiBackend {
-    fn name(&self) -> &'static str { "gemini" }
-
-    async fn spawn(
-        &self,
-        prompt: &str,
-        _working_dir: &str,  // Gemini API doesn't have filesystem access
-        _session_id: Option<String>,
-    ) -> Result<(Box<dyn AgentHandle>, Receiver<AgentOutput>)> {
-        let (tx, rx) = mpsc::channel(256);
-
-        // POST https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}
-        // Body: {"contents":[{"parts":[{"text":"prompt"}]}]}
-        // Response: SSE chunks with candidates[0].content.parts[0].text
-    }
-}
-```
-
-Note: Gemini API is text-only (no filesystem/tool access). For coding tasks, you'd need to
-implement tool calling yourself or use a wrapper that provides code execution.
+**Output Parsing** (`agent.rs`):
+- Section-based parser: scans for recognized prefixes, collects multi-line content until next prefix
+- Strips markdown bold (`**TASK:**` → `TASK:`) before matching
+- Routes via table: prefix → target role + message kind
+- Single-line prefixes: `CREW:`, `RELIEVE:` (no continuation lines)
 
 ## Usage
 
 ```bash
-# Run a single agent
-agent-orchestrator agent developer .
+# Run agents on a task
+agent-orchestrator run ~/my-project "Add login button"
 
-# Run all four agents
-agent-orchestrator orchestrate ~/project
+# Start agents, wait for messages
+agent-orchestrator orchestrate ~/my-project
 
-# Send message to manager
-agent-orchestrator send manager "Add login button"
-
-# Check socket status
-agent-orchestrator status
-```
-
-## Socket Layout
-
-```
-/tmp/claude/orchestrator/
-├── manager.sock
-├── architect.sock
-├── scorer.sock
-├── developer-0.sock      # Always present
-├── developer-1.sock      # When CREW >= 2
-└── developer-2.sock      # When CREW == 3
+# Options
+agent-orchestrator --db /path/to/tasks.db run ~/project "task"
 ```
