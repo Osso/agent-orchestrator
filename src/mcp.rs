@@ -135,7 +135,7 @@ impl OrchestratorMcp {
         }
     }
 
-    #[tool(description = "Relieve the current manager and spawn a replacement. Scorer only.")]
+    #[tool(description = "Relieve the current manager and spawn a replacement. Auditor only.")]
     async fn relieve_manager(&self, Parameters(params): Parameters<RelieveManagerParams>) -> String {
         let args = match serde_json::to_value(&params) {
             Ok(v) => v,
@@ -147,7 +147,7 @@ impl OrchestratorMcp {
         }
     }
 
-    #[tool(description = "Submit a progress evaluation or observation. Scorer only.")]
+    #[tool(description = "Submit a progress evaluation or observation. Auditor only.")]
     async fn report(&self, Parameters(params): Parameters<ReportParams>) -> String {
         let args = match serde_json::to_value(&params) {
             Ok(v) => v,

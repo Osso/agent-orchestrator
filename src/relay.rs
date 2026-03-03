@@ -199,7 +199,7 @@ fn handle_relieve_manager(
     agent_name: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    if role_from_agent_name(agent_name) != Some(AgentRole::Scorer) {
+    if role_from_agent_name(agent_name) != Some(AgentRole::Auditor) {
         return Err(format!(
             "'{}' is not allowed to relieve the manager",
             agent_name
@@ -220,7 +220,7 @@ fn handle_report(
     agent_name: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    if role_from_agent_name(agent_name) != Some(AgentRole::Scorer) {
+    if role_from_agent_name(agent_name) != Some(AgentRole::Auditor) {
         return Err(format!("'{}' is not allowed to submit reports", agent_name));
     }
 
@@ -228,7 +228,7 @@ fn handle_report(
     let content = args["content"].as_str().ok_or("missing 'content'")?;
 
     tracing::info!(
-        "[SCORER {}] {}",
+        "[AUDITOR {}] {}",
         report_type.to_uppercase(),
         first_line(content)
     );
@@ -240,7 +240,7 @@ fn handle_report(
     });
 
     mailbox
-        .send("runtime", "scorer_report", payload)
+        .send("runtime", "auditor_report", payload)
         .map(|_| serde_json::json!({"ok": true}))
         .map_err(|e| format!("send failed: {}", e))
 }
@@ -249,7 +249,7 @@ fn role_from_agent_name(name: &str) -> Option<AgentRole> {
     match name {
         "manager" => Some(AgentRole::Manager),
         "architect" => Some(AgentRole::Architect),
-        "scorer" => Some(AgentRole::Scorer),
+        "auditor" => Some(AgentRole::Auditor),
         n if n.starts_with("developer-") => Some(AgentRole::Developer),
         _ => None,
     }
@@ -315,7 +315,7 @@ mod tests {
     fn role_from_agent_name_known_names() {
         assert_eq!(role_from_agent_name("manager"), Some(AgentRole::Manager));
         assert_eq!(role_from_agent_name("architect"), Some(AgentRole::Architect));
-        assert_eq!(role_from_agent_name("scorer"), Some(AgentRole::Scorer));
+        assert_eq!(role_from_agent_name("auditor"), Some(AgentRole::Auditor));
         assert_eq!(role_from_agent_name("developer-0"), Some(AgentRole::Developer));
         assert_eq!(role_from_agent_name("developer-2"), Some(AgentRole::Developer));
     }
@@ -417,7 +417,7 @@ mod tests {
     // --- Role validation: relieve_manager ---
 
     #[test]
-    fn relieve_manager_rejected_from_non_scorer() {
+    fn relieve_manager_rejected_from_non_auditor() {
         let bus = Bus::new();
         let mailbox = bus.register("relay-manager").unwrap();
         let _runtime = bus.register("runtime").unwrap();
@@ -428,12 +428,12 @@ mod tests {
     }
 
     #[test]
-    fn relieve_manager_allowed_from_scorer() {
+    fn relieve_manager_allowed_from_auditor() {
         let bus = Bus::new();
-        let mailbox = bus.register("relay-scorer").unwrap();
+        let mailbox = bus.register("relay-auditor").unwrap();
         let mut runtime = bus.register("runtime").unwrap();
         let args = serde_json::json!({"reason": "poor performance"});
-        let result = handle_relieve_manager(&mailbox, "scorer", &args);
+        let result = handle_relieve_manager(&mailbox, "auditor", &args);
         assert!(result.is_ok());
         let msg = runtime.try_recv().unwrap();
         assert_eq!(msg.kind, "relieve_manager");
@@ -443,7 +443,7 @@ mod tests {
     // --- Role validation: report ---
 
     #[test]
-    fn report_rejected_from_non_scorer() {
+    fn report_rejected_from_non_auditor() {
         let bus = Bus::new();
         let mailbox = bus.register("relay-manager").unwrap();
         let _runtime = bus.register("runtime").unwrap();
@@ -454,15 +454,15 @@ mod tests {
     }
 
     #[test]
-    fn report_allowed_from_scorer() {
+    fn report_allowed_from_auditor() {
         let bus = Bus::new();
-        let mailbox = bus.register("relay-scorer").unwrap();
+        let mailbox = bus.register("relay-auditor").unwrap();
         let mut runtime = bus.register("runtime").unwrap();
         let args = serde_json::json!({"report_type": "evaluation", "content": "progress is good"});
-        let result = handle_report(&mailbox, "scorer", &args);
+        let result = handle_report(&mailbox, "auditor", &args);
         assert!(result.is_ok());
         let msg = runtime.try_recv().unwrap();
-        assert_eq!(msg.kind, "scorer_report");
+        assert_eq!(msg.kind, "auditor_report");
         assert_eq!(msg.payload["report_type"], "evaluation");
     }
 

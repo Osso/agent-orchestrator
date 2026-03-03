@@ -28,14 +28,14 @@ User → Manager → Architect → Developer-0..2
            ↑          ↓            ↓
            ←──────────←────────────←
 
-       Scorer (observes all, can RELIEVE manager)
+       Auditor (patrol timer every 10min, can RELIEVE manager)
        Runtime (spawns/kills agents, maintains state)
 ```
 
 - **Manager**: Receives user requests, breaks into tasks, decides crew size (1-3 devs)
 - **Architect**: Reviews task approaches for simplicity/safety, approves with developer target
 - **Developer-N**: Implements approved tasks, reports completion or blockers (N = 0-2)
-- **Scorer**: Observes progress, evaluates direction, can fire manager via RELIEVE
+- **Auditor**: Wakes every 10 minutes via patrol timer, evaluates task snapshot, can fire manager via RELIEVE
 - **Runtime**: Spawns/kills agents, handles CREW/RELIEVE commands, maintains task log
 
 ### Communication Protocol
@@ -51,9 +51,9 @@ Agents communicate via structured output lines that get parsed and routed:
 | `BLOCKED:` | Developer | Manager | Task stuck, needs help |
 | `INTERRUPT:` | Architect | Developer | Stop current work |
 | `CREW: N` | Manager | Runtime | Set developer count (1-3) |
-| `RELIEVE:` | Scorer | Runtime | Fire manager, spawn replacement |
-| `EVALUATION:` | Scorer | (logged) | Progress assessment |
-| `OBSERVATION:` | Scorer | (logged) | Issue noticed |
+| `RELIEVE:` | Auditor | Runtime | Fire manager, spawn replacement |
+| `EVALUATION:` | Auditor | (logged) | Progress assessment |
+| `OBSERVATION:` | Auditor | (logged) | Issue noticed |
 
 ### Module Structure
 

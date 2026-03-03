@@ -146,6 +146,6 @@ fn first_line(text: &str) -> &str {
 fn permission_mode_for_role(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Developer => "acceptEdits",
-        AgentRole::Manager | AgentRole::Architect | AgentRole::Scorer => "dontAsk",
+        AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "dontAsk",
     }
 }

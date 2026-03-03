@@ -126,7 +126,8 @@ impl OrchestratorRuntime {
         // Brief pause for relay and control to bind their sockets before agents connect
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.spawn_initial_agents(initial_task)?;
+        let enriched_task = self.enrich_with_task_state(initial_task).await;
+        self.spawn_initial_agents(enriched_task)?;
         self.command_loop(&mut mailbox, shutdown_tx).await
     }
 
@@ -160,15 +161,26 @@ impl OrchestratorRuntime {
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+        let mut audit_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(600),
+        );
+
         loop {
             tokio::select! {
                 msg = mailbox.recv() => {
                     match msg {
                         Some(msg) => {
                             self.handle_message(&msg.kind, &msg.payload, &msg.from).await;
+                            if msg.kind == "task_complete" || msg.kind == "task_blocked" {
+                                self.notify_manager_task_state(mailbox).await;
+                            }
                         }
                         None => break,
                     }
+                }
+                _ = audit_timer.tick() => {
+                    self.send_audit_snapshot(mailbox).await;
                 }
                 _ = sigint.recv() => {
                     tracing::info!("Received SIGINT, shutting down");
@@ -184,6 +196,55 @@ impl OrchestratorRuntime {
         let _ = shutdown_tx.send(true);
         self.shutdown();
         Ok(())
+    }
+
+    async fn enrich_with_task_state(&self, task: Option<String>) -> Option<String> {
+        let task = task?;
+        let snapshot = self.build_task_snapshot().await;
+        if snapshot.contains("No tasks") {
+            Some(task)
+        } else {
+            Some(format!("{}\n\n## Your Task\n{}", snapshot, task))
+        }
+    }
+
+    async fn notify_manager_task_state(&self, mailbox: &Mailbox) {
+        let snapshot = self.build_task_snapshot().await;
+        let payload = serde_json::json!({ "content": snapshot });
+        if let Err(e) = mailbox.send("manager", "task_update", payload) {
+            tracing::debug!("Failed to send task update to manager: {}", e);
+        }
+    }
+
+    async fn send_audit_snapshot(&self, mailbox: &Mailbox) {
+        let snapshot = self.build_task_snapshot().await;
+        let payload = serde_json::json!({ "content": snapshot });
+        if let Err(e) = mailbox.send("auditor", "patrol_snapshot", payload) {
+            tracing::warn!("Failed to send audit snapshot: {}", e);
+        }
+    }
+
+    async fn build_task_snapshot(&self) -> String {
+        let mut snap = String::from("## Task State Snapshot\n\n");
+        match self.db.list_tasks(None, None).await {
+            Ok(tasks) if tasks.is_empty() => {
+                snap.push_str("No tasks recorded yet.\n");
+            }
+            Ok(tasks) => {
+                for task in &tasks {
+                    let who = task.assignee.as_deref().unwrap_or("unassigned");
+                    snap.push_str(&format!(
+                        "- [{}] {} (assigned: {})\n",
+                        task.status, task.title, who
+                    ));
+                }
+                snap.push_str(&format!("\nTotal tasks: {}\n", tasks.len()));
+            }
+            Err(e) => {
+                snap.push_str(&format!("Error querying tasks: {}\n", e));
+            }
+        }
+        snap
     }
 
     pub async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
@@ -222,7 +283,7 @@ impl OrchestratorRuntime {
     fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
         self.spawn_agent(AgentRole::Manager, 0, manager_task)?;
         self.spawn_agent(AgentRole::Architect, 0, None)?;
-        self.spawn_agent(AgentRole::Scorer, 0, None)?;
+        self.spawn_agent(AgentRole::Auditor, 0, None)?;
         self.spawn_agent(AgentRole::Developer, 0, None)?;
         Ok(())
     }

@@ -139,8 +139,8 @@ fn role_from_name(name: &str) -> &str {
         "manager"
     } else if name == "architect" {
         "architect"
-    } else if name == "scorer" {
-        "scorer"
+    } else if name == "auditor" {
+        "auditor"
     } else {
         "unknown"
     }

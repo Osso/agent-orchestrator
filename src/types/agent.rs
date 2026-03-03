@@ -6,7 +6,7 @@ pub enum AgentRole {
     Manager,
     Architect,
     Developer,
-    Scorer,
+    Auditor,
 }
 
 impl AgentRole {
@@ -15,7 +15,7 @@ impl AgentRole {
             AgentRole::Manager => "manager",
             AgentRole::Architect => "architect",
             AgentRole::Developer => "developer",
-            AgentRole::Scorer => "scorer",
+            AgentRole::Auditor => "auditor",
         }
     }
 
@@ -24,7 +24,7 @@ impl AgentRole {
             AgentRole::Manager => include_str!("../../prompts/manager.md"),
             AgentRole::Architect => include_str!("../../prompts/architect.md"),
             AgentRole::Developer => include_str!("../../prompts/developer.md"),
-            AgentRole::Scorer => include_str!("../../prompts/scorer.md"),
+            AgentRole::Auditor => include_str!("../../prompts/auditor.md"),
         }
     }
 }
@@ -36,7 +36,7 @@ impl std::fmt::Display for AgentRole {
 }
 
 /// Unique identifier for an agent instance.
-/// Singletons (manager, architect, scorer) use index 0.
+/// Singletons (manager, architect, auditor) use index 0.
 /// Developers use index 0-2 for multi-developer support.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId {

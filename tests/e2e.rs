@@ -206,7 +206,7 @@ async fn handle_message_dispatches_relieve() {
     rt.spawn_agent(AgentRole::Manager, 0, None).unwrap();
 
     let payload = serde_json::json!({"reason": "not performing"});
-    rt.handle_message("relieve_manager", &payload, "scorer").await;
+    rt.handle_message("relieve_manager", &payload, "auditor").await;
     assert_eq!(rt.state.manager_generation, 1);
 }
 
