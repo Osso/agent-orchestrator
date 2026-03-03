@@ -49,10 +49,16 @@ pub struct OrchestratorRuntime {
     agent_handles: HashMap<String, JoinHandle<()>>,
     agent_factory: AgentFactory,
     pub backend: BackendKind,
+    no_sandbox: bool,
 }
 
 impl OrchestratorRuntime {
-    pub async fn new(db_path: &Path, working_dir: String, backend: BackendKind) -> Result<Self> {
+    pub async fn new(
+        db_path: &Path,
+        working_dir: String,
+        backend: BackendKind,
+        no_sandbox: bool,
+    ) -> Result<Self> {
         let db = Database::open(db_path)
             .await
             .context("Failed to open task database")?;
@@ -76,6 +82,7 @@ impl OrchestratorRuntime {
             agent_handles: HashMap::new(),
             agent_factory: default_agent_factory(),
             backend,
+            no_sandbox,
         })
     }
 
@@ -114,6 +121,7 @@ impl OrchestratorRuntime {
             agent_handles: HashMap::new(),
             agent_factory: factory,
             backend,
+            no_sandbox: true,
         })
     }
 
@@ -334,7 +342,7 @@ impl OrchestratorRuntime {
         role: AgentRole,
         bus_name: &str,
     ) -> (String, Vec<String>) {
-        let use_sandbox = llm_sdk::sandbox::is_available();
+        let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
         if matches!(role, AgentRole::Developer | AgentRole::Merger) {
@@ -466,7 +474,7 @@ impl OrchestratorRuntime {
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
             bus,
-            sandbox_prefix: if llm_sdk::sandbox::is_available() {
+            sandbox_prefix: if !self.no_sandbox && llm_sdk::sandbox::is_available() {
                 llm_sdk::sandbox::readonly_prefix()
             } else {
                 Vec::new()

@@ -87,6 +87,7 @@ OPTIONS:
     --db <path>         Task database path (default: per-project under {DEFAULT_DB_DIR}/)
     --backend <name>    Backend to use: claude (default) or openrouter
     --model <name>      Model name (required for --backend openrouter)
+    --no-sandbox        Disable bwrap sandboxing
 
 COMMANDS:
     run <dir> <task...>                         Run agents on a task (non-interactive)
@@ -107,12 +108,14 @@ struct Opts {
     db_path: Option<PathBuf>,
     backend: String,
     model: Option<String>,
+    no_sandbox: bool,
 }
 
 fn extract_opts(args: &mut Vec<String>) -> Opts {
     let mut db_path: Option<PathBuf> = None;
     let mut backend = "claude".to_string();
     let mut model: Option<String> = None;
+    let mut no_sandbox = false;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--db" && i + 1 < args.len() {
@@ -124,11 +127,14 @@ fn extract_opts(args: &mut Vec<String>) -> Opts {
         } else if args[i] == "--model" && i + 1 < args.len() {
             model = Some(args[i + 1].clone());
             args.drain(i..i + 2);
+        } else if args[i] == "--no-sandbox" {
+            no_sandbox = true;
+            args.drain(i..i + 1);
         } else {
             i += 1;
         }
     }
-    Opts { db_path, backend, model }
+    Opts { db_path, backend, model, no_sandbox }
 }
 
 /// Derive a project-specific DB path from the working directory.
@@ -171,7 +177,9 @@ async fn run_orchestrator(working_dir: &str, task: Option<String>, opts: &Opts) 
         .clone()
         .unwrap_or_else(|| db_path_for_project(working_dir));
     let backend = build_backend(opts)?;
-    let runtime = OrchestratorRuntime::new(&db_path, working_dir.to_string(), backend).await?;
+    let runtime =
+        OrchestratorRuntime::new(&db_path, working_dir.to_string(), backend, opts.no_sandbox)
+            .await?;
     runtime.run(task).await
 }
 

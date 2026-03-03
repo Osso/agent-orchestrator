@@ -15,8 +15,10 @@ use llm_sdk::session::{Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
 
-/// Glob pattern restricting non-developer Claude CLI agents to orchestrator MCP tools only.
-pub const ALLOWED_TOOLS_PATTERN: &str = "mcp__orchestrator__*";
+/// Tools blocked for non-developer agents (managers, architects, auditors).
+const DISALLOWED_TOOLS: &[&str] = &[
+    "Bash", "Write", "Edit", "NotebookEdit", "Agent",
+];
 
 /// Which backend to use for completions.
 #[derive(Clone, Debug)]
@@ -248,7 +250,8 @@ fn build_claude_completer(
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .command_prefix(config.sandbox_prefix.clone());
     if !role_has_tools(config.agent_id.role) {
-        base_claude = base_claude.allowed_tools(vec![ALLOWED_TOOLS_PATTERN.to_string()]);
+        base_claude = base_claude
+            .disallowed_tools(DISALLOWED_TOOLS.iter().map(|s| s.to_string()).collect());
     }
     if let Some(ref cfg) = config.mcp_config {
         base_claude = base_claude.mcp_config(cfg);
