@@ -22,9 +22,9 @@ use crate::control;
 use crate::relay::{self, RelayServer};
 use crate::types::{AgentId, AgentRole};
 
-pub(crate) const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
+pub const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 
-pub(crate) struct RuntimeState {
+pub struct RuntimeState {
     pub developer_count: u8,
     pub manager_generation: u32,
     pub last_relieve: Option<Instant>,
@@ -32,17 +32,17 @@ pub(crate) struct RuntimeState {
 
 /// Factory function that creates an Agent from config + mailbox + session.
 /// Tests inject a factory that uses FakeCompleter instead of real Claude.
-pub(crate) type AgentFactory =
+pub type AgentFactory =
     Arc<dyn Fn(AgentConfig, Mailbox, Session) -> Result<Agent> + Send + Sync>;
 
 /// Default factory: creates a real Agent backed by Claude CLI.
 fn default_agent_factory() -> AgentFactory {
-    Arc::new(|config, mailbox, session| Agent::new(config, mailbox, session))
+    Arc::new(Agent::new)
 }
 
 pub struct OrchestratorRuntime {
-    pub(crate) state: RuntimeState,
-    pub(crate) bus: Bus,
+    pub state: RuntimeState,
+    pub bus: Bus,
     db: Database,
     session_store: SessionStore,
     working_dir: String,
@@ -79,12 +79,16 @@ impl OrchestratorRuntime {
 
     /// Create a runtime suitable for testing — uses tempdir for DB + sessions,
     /// and an injected agent factory.
-    pub(crate) async fn new_test(
+    pub async fn new_test(
         bus: Bus,
         working_dir: &str,
         factory: AgentFactory,
     ) -> Result<Self> {
-        let tmp = std::env::temp_dir().join(format!("orch-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "orch-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let _ = std::fs::create_dir_all(&tmp);
 
         let db_path = tmp.join("tasks.db");
@@ -182,7 +186,7 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    pub(crate) async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
+    pub async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
         tracing::info!("Runtime received '{}' from {}", kind, from);
         match kind {
             "set_crew" => {
@@ -223,7 +227,7 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    fn spawn_agent(
+    pub fn spawn_agent(
         &mut self,
         role: AgentRole,
         index: u8,
@@ -272,7 +276,7 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    pub(crate) fn handle_crew_size(&mut self, count: u8) {
+    pub fn handle_crew_size(&mut self, count: u8) {
         let count = count.clamp(1, 3);
         let current = self.state.developer_count;
         if count == current {
@@ -296,7 +300,7 @@ impl OrchestratorRuntime {
         self.state.developer_count = count;
     }
 
-    pub(crate) async fn handle_relieve_manager(&mut self, reason: &str) {
+    pub async fn handle_relieve_manager(&mut self, reason: &str) {
         if !self.relieve_cooldown_elapsed(reason) {
             return;
         }
