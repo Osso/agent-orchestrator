@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 use agent_bus::{Bus, Mailbox};
 use anyhow::{Context, Result};
-use llm_sdk::session::{Session, SessionStore};
+use llm_sdk::session::SessionStore;
 use llm_tasks::db::Database;
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, AgentConfig};
+use crate::agent::{Agent, AgentConfig, BackendKind};
 use crate::control;
 use crate::relay::{self, RelayServer};
 use crate::types::{AgentId, AgentRole};
@@ -31,12 +31,11 @@ pub struct RuntimeState {
     pub last_relieve: Option<Instant>,
 }
 
-/// Factory function that creates an Agent from config + mailbox + session.
+/// Factory function that creates an Agent from config + mailbox.
 /// Tests inject a factory that uses FakeCompleter instead of real Claude.
-pub type AgentFactory =
-    Arc<dyn Fn(AgentConfig, Mailbox, Session) -> Result<Agent> + Send + Sync>;
+pub type AgentFactory = Arc<dyn Fn(AgentConfig, Mailbox) -> Result<Agent> + Send + Sync>;
 
-/// Default factory: creates a real Agent backed by Claude CLI.
+/// Default factory: creates a real Agent backed by the configured backend.
 fn default_agent_factory() -> AgentFactory {
     Arc::new(Agent::new)
 }
@@ -49,10 +48,11 @@ pub struct OrchestratorRuntime {
     working_dir: String,
     agent_handles: HashMap<String, JoinHandle<()>>,
     agent_factory: AgentFactory,
+    pub backend: BackendKind,
 }
 
 impl OrchestratorRuntime {
-    pub async fn new(db_path: &Path, working_dir: String) -> Result<Self> {
+    pub async fn new(db_path: &Path, working_dir: String, backend: BackendKind) -> Result<Self> {
         let db = Database::open(db_path)
             .await
             .context("Failed to open task database")?;
@@ -75,6 +75,7 @@ impl OrchestratorRuntime {
             working_dir,
             agent_handles: HashMap::new(),
             agent_factory: default_agent_factory(),
+            backend,
         })
     }
 
@@ -84,6 +85,7 @@ impl OrchestratorRuntime {
         bus: Bus,
         working_dir: &str,
         factory: AgentFactory,
+        backend: BackendKind,
     ) -> Result<Self> {
         let tmp = std::env::temp_dir().join(format!(
             "orch-test-{}-{}",
@@ -111,6 +113,7 @@ impl OrchestratorRuntime {
             working_dir: working_dir.to_string(),
             agent_handles: HashMap::new(),
             agent_factory: factory,
+            backend,
         })
     }
 
@@ -314,11 +317,8 @@ impl OrchestratorRuntime {
             initial_task,
             mcp_config: Some(build_mcp_config(&bus_name)),
             fresh_session_per_task: fresh,
-            session_store: if fresh {
-                Some((self.session_store.clone(), bus_name.clone()))
-            } else {
-                None
-            },
+            backend: self.backend.clone(),
+            session_store: self.session_store.clone(),
         };
         self.spawn_agent_with_config(config)
     }
@@ -343,10 +343,6 @@ impl OrchestratorRuntime {
 
     fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
         let bus_name = config.agent_id.bus_name();
-        let session = self
-            .session_store
-            .session(&bus_name)
-            .system_prompt(&config.system_prompt);
         let mailbox = self
             .bus
             .register(&bus_name)
@@ -355,7 +351,7 @@ impl OrchestratorRuntime {
         let agent_id = config.agent_id.clone();
         let factory = self.agent_factory.clone();
         let handle = tokio::spawn(async move {
-            match factory(config, mailbox, session) {
+            match factory(config, mailbox) {
                 Ok(agent) => {
                     if let Err(e) = agent.run().await {
                         tracing::error!("Agent {} error: {}", agent_id, e);
@@ -406,6 +402,7 @@ impl OrchestratorRuntime {
 
         self.abort_agent("manager");
         self.session_store.remove("manager");
+        self.session_store.remove_message_log("manager");
         self.state.manager_generation += 1;
         self.state.last_relieve = Some(Instant::now());
 
@@ -436,7 +433,8 @@ impl OrchestratorRuntime {
             initial_task: None,
             mcp_config: Some(build_mcp_config("manager")),
             fresh_session_per_task: false,
-            session_store: None,
+            backend: self.backend.clone(),
+            session_store: self.session_store.clone(),
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);

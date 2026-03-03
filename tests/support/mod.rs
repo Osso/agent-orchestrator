@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_bus::Bus;
-use agent_orchestrator::agent::{Agent, AgentConfig, Completer};
+use agent_orchestrator::agent::{Agent, AgentConfig, BackendKind, Completer};
 use agent_orchestrator::runtime::{AgentFactory, OrchestratorRuntime};
 use agent_orchestrator::types::{AgentId, AgentRole};
 use anyhow::Result;
 use async_trait::async_trait;
+use llm_sdk::session::SessionStore;
 
 /// Test completer that returns pre-configured responses.
 pub struct FakeCompleter {
@@ -47,6 +48,15 @@ pub fn fake_output(text: &str) -> llm_sdk::Output {
     }
 }
 
+fn test_session_store() -> SessionStore {
+    let tmp = std::env::temp_dir().join(format!(
+        "orch-test-support-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    SessionStore::load(tmp)
+}
+
 /// Build an AgentConfig for testing.
 pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> AgentConfig {
     let agent_id = match role {
@@ -60,7 +70,8 @@ pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> Ag
         initial_task: initial_task.map(|s| s.to_string()),
         mcp_config: None,
         fresh_session_per_task: false,
-        session_store: None,
+        backend: BackendKind::Claude,
+        session_store: test_session_store(),
     }
 }
 
@@ -71,7 +82,7 @@ pub fn fake_factory(responses: Vec<&str>) -> (AgentFactory, Arc<AtomicUsize>) {
     let shared: Arc<Vec<String>> = Arc::new(responses.into_iter().map(|s| s.to_string()).collect());
     let counter = call_count.clone();
 
-    let factory: AgentFactory = Arc::new(move |config, mailbox, _session| {
+    let factory: AgentFactory = Arc::new(move |config, mailbox| {
         let resps: Vec<Result<llm_sdk::Output, llm_sdk::Error>> =
             shared.iter().map(|t| Ok(fake_output(t))).collect();
         let mut fake = FakeCompleter::new(resps);
@@ -88,6 +99,7 @@ pub async fn test_runtime(
     responses: Vec<&str>,
 ) -> Result<(OrchestratorRuntime, Arc<AtomicUsize>)> {
     let (factory, calls) = fake_factory(responses);
-    let rt = OrchestratorRuntime::new_test(bus, "/tmp/test-project", factory).await?;
+    let rt = OrchestratorRuntime::new_test(bus, "/tmp/test-project", factory, BackendKind::Claude)
+        .await?;
     Ok((rt, calls))
 }

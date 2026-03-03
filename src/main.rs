@@ -1,7 +1,8 @@
+use agent_orchestrator::agent::BackendKind;
 use agent_orchestrator::relay;
 use agent_orchestrator::runtime::OrchestratorRuntime;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -82,7 +83,9 @@ USAGE:
     agent-orchestrator [OPTIONS] <COMMAND>
 
 OPTIONS:
-    --db <path>     Task database path (default: {DEFAULT_DB_PATH})
+    --db <path>         Task database path (default: {DEFAULT_DB_PATH})
+    --backend <name>    Backend to use: claude (default) or openrouter
+    --model <name>      Model name (required for --backend openrouter)
 
 COMMANDS:
     run <dir> <task...>                         Run agents on a task (non-interactive)
@@ -93,6 +96,7 @@ COMMANDS:
 EXAMPLES:
     agent-orchestrator run ~/my-project "Add a login button"
     agent-orchestrator orchestrate ~/my-project
+    agent-orchestrator --backend openrouter --model anthropic/claude-3.5-sonnet run ~/my-project "task"
     agent-orchestrator send manager "Add a login button"
 "#
     );
@@ -100,20 +104,30 @@ EXAMPLES:
 
 struct Opts {
     db_path: PathBuf,
+    backend: String,
+    model: Option<String>,
 }
 
 fn extract_opts(args: &mut Vec<String>) -> Opts {
     let mut db_path = PathBuf::from(DEFAULT_DB_PATH);
+    let mut backend = "claude".to_string();
+    let mut model: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--db" && i + 1 < args.len() {
             db_path = PathBuf::from(&args[i + 1]);
             args.drain(i..i + 2);
+        } else if args[i] == "--backend" && i + 1 < args.len() {
+            backend = args[i + 1].clone();
+            args.drain(i..i + 2);
+        } else if args[i] == "--model" && i + 1 < args.len() {
+            model = Some(args[i + 1].clone());
+            args.drain(i..i + 2);
         } else {
             i += 1;
         }
     }
-    Opts { db_path }
+    Opts { db_path, backend, model }
 }
 
 fn extract_named_arg(args: &[String], flag: &str) -> Option<String> {
@@ -122,9 +136,29 @@ fn extract_named_arg(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+fn build_backend(opts: &Opts) -> Result<BackendKind> {
+    match opts.backend.as_str() {
+        "openrouter" => {
+            let api_key = std::env::var("OPENROUTER_API_KEY")
+                .context("OPENROUTER_API_KEY required for openrouter backend")?;
+            let model = opts
+                .model
+                .as_deref()
+                .context("--model required for openrouter backend")?;
+            Ok(BackendKind::OpenRouter {
+                model: model.to_string(),
+                api_key,
+            })
+        }
+        _ => Ok(BackendKind::Claude),
+    }
+}
+
 async fn run_orchestrator(working_dir: &str, task: Option<String>, opts: &Opts) -> Result<()> {
     info!("Starting orchestrator for {}", working_dir);
-    let runtime = OrchestratorRuntime::new(&opts.db_path, working_dir.to_string()).await?;
+    let backend = build_backend(opts)?;
+    let runtime =
+        OrchestratorRuntime::new(&opts.db_path, working_dir.to_string(), backend).await?;
     runtime.run(task).await
 }
 

@@ -5,6 +5,8 @@
 //! 2. Waits for messages from other agents
 //! 3. Calls llm-sdk to get a completion (with MCP tools for outbound communication)
 
+use std::sync::Arc;
+
 use agent_bus::Mailbox;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,6 +14,13 @@ use llm_sdk::claude::Claude;
 use llm_sdk::session::{Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
+
+/// Which backend to use for completions.
+#[derive(Clone, Debug)]
+pub enum BackendKind {
+    Claude,
+    OpenRouter { model: String, api_key: String },
+}
 
 /// Abstraction over Session+Claude so tests can inject a fake.
 #[async_trait]
@@ -32,12 +41,32 @@ impl Completer for SessionCompleter {
     }
 }
 
-/// Context needed to issue a fresh session for each task.
-struct FreshSessionCtx {
-    store: SessionStore,
-    session_key: String,
-    system_prompt: String,
-    base_claude: Claude,
+/// Production completer backed by OpenRouter chat API with MessageLog persistence.
+struct OpenRouterCompleter {
+    openrouter: Arc<llm_sdk::openrouter::OpenRouter>,
+    log: llm_sdk::MessageLog,
+}
+
+#[async_trait]
+impl Completer for OpenRouterCompleter {
+    async fn complete(&mut self, prompt: &str) -> Result<llm_sdk::Output, llm_sdk::Error> {
+        self.openrouter.complete_chat(&mut self.log, prompt).await
+    }
+}
+
+/// Context needed to issue a fresh completer for each task.
+enum FreshCtx {
+    Claude {
+        store: SessionStore,
+        key: String,
+        system_prompt: String,
+        base_claude: Box<Claude>,
+    },
+    OpenRouter {
+        store: SessionStore,
+        key: String,
+        openrouter: Arc<llm_sdk::openrouter::OpenRouter>,
+    },
 }
 
 /// Configuration for an agent
@@ -49,11 +78,12 @@ pub struct AgentConfig {
     pub initial_task: Option<String>,
     /// MCP config JSON to pass to Claude CLI (--mcp-config)
     pub mcp_config: Option<String>,
-    /// When true, reset the session before each task_assignment message.
-    /// Requires session_store to be set.
+    /// When true, reset the session/log before each task_assignment message.
     pub fresh_session_per_task: bool,
-    /// Session store + key used for fresh-session-per-task resets.
-    pub session_store: Option<(SessionStore, String)>,
+    /// Backend to use for completions.
+    pub backend: BackendKind,
+    /// Session store for persistence.
+    pub session_store: SessionStore,
 }
 
 /// Running agent instance
@@ -61,37 +91,13 @@ pub struct Agent {
     config: AgentConfig,
     mailbox: Mailbox,
     completer: Box<dyn Completer>,
-    fresh_ctx: Option<FreshSessionCtx>,
+    fresh_ctx: Option<FreshCtx>,
 }
 
 impl Agent {
-    pub fn new(config: AgentConfig, mailbox: Mailbox, session: Session) -> Result<Self> {
-        let perm_mode = permission_mode_for_role(config.agent_id.role);
-        let mut base_claude = Claude::new()?
-            .permission_mode(perm_mode)
-            .working_dir(&config.working_dir);
-        if let Some(ref cfg) = config.mcp_config {
-            base_claude = base_claude.mcp_config(cfg);
-        }
-
-        let fresh_ctx = if config.fresh_session_per_task {
-            config
-                .session_store
-                .as_ref()
-                .map(|(store, key)| FreshSessionCtx {
-                    store: store.clone(),
-                    session_key: key.clone(),
-                    system_prompt: config.system_prompt.clone(),
-                    base_claude: base_claude.clone(),
-                })
-        } else {
-            None
-        };
-
-        let completer = Box::new(SessionCompleter {
-            session,
-            claude: base_claude,
-        });
+    pub fn new(config: AgentConfig, mailbox: Mailbox) -> Result<Self> {
+        let bus_name = config.agent_id.bus_name();
+        let (completer, fresh_ctx) = build_completer(&config, &bus_name)?;
         Ok(Self {
             config,
             mailbox,
@@ -132,7 +138,7 @@ impl Agent {
             );
 
             if msg.kind == "task_assignment" {
-                self.reset_session_for_task();
+                self.reset_completer_for_task();
             }
 
             let content = extract_content(&msg.payload);
@@ -145,20 +151,29 @@ impl Agent {
         Ok(())
     }
 
-    fn reset_session_for_task(&mut self) {
+    fn reset_completer_for_task(&mut self) {
         let Some(ctx) = &self.fresh_ctx else {
             return;
         };
-        ctx.store.remove(&ctx.session_key);
-        let session = ctx
-            .store
-            .session(&ctx.session_key)
-            .system_prompt(&ctx.system_prompt);
-        self.completer = Box::new(SessionCompleter {
-            session,
-            claude: ctx.base_claude.clone(),
-        });
-        tracing::info!("Agent {} fresh session for task", self.config.agent_id);
+        match ctx {
+            FreshCtx::Claude { store, key, system_prompt, base_claude } => {
+                store.remove(key);
+                let session = store.session(key).system_prompt(system_prompt);
+                self.completer = Box::new(SessionCompleter {
+                    session,
+                    claude: *base_claude.clone(),
+                });
+            }
+            FreshCtx::OpenRouter { store, key, openrouter } => {
+                store.remove_message_log(key);
+                let log = store.message_log(key);
+                self.completer = Box::new(OpenRouterCompleter {
+                    openrouter: openrouter.clone(),
+                    log,
+                });
+            }
+        }
+        tracing::info!("Agent {} fresh completer for task", self.config.agent_id);
     }
 
     async fn process_prompt(&mut self, content: &str) -> Result<()> {
@@ -166,6 +181,84 @@ impl Agent {
         log_completion(&self.config.agent_id, &output);
         Ok(())
     }
+}
+
+fn build_completer(
+    config: &AgentConfig,
+    bus_name: &str,
+) -> Result<(Box<dyn Completer>, Option<FreshCtx>)> {
+    match &config.backend {
+        BackendKind::Claude => build_claude_completer(config, bus_name),
+        BackendKind::OpenRouter { model, api_key } => {
+            build_openrouter_completer(config, bus_name, model, api_key)
+        }
+    }
+}
+
+fn build_claude_completer(
+    config: &AgentConfig,
+    bus_name: &str,
+) -> Result<(Box<dyn Completer>, Option<FreshCtx>)> {
+    let perm_mode = permission_mode_for_role(config.agent_id.role);
+    let mut base_claude = Claude::new()?
+        .permission_mode(perm_mode)
+        .working_dir(&config.working_dir);
+    if let Some(ref cfg) = config.mcp_config {
+        base_claude = base_claude.mcp_config(cfg);
+    }
+
+    let session = config
+        .session_store
+        .session(bus_name)
+        .system_prompt(&config.system_prompt);
+    let completer: Box<dyn Completer> = Box::new(SessionCompleter {
+        session,
+        claude: base_claude.clone(),
+    });
+
+    let fresh_ctx = if config.fresh_session_per_task {
+        Some(FreshCtx::Claude {
+            store: config.session_store.clone(),
+            key: bus_name.to_string(),
+            system_prompt: config.system_prompt.clone(),
+            base_claude: Box::new(base_claude),
+        })
+    } else {
+        None
+    };
+
+    Ok((completer, fresh_ctx))
+}
+
+fn build_openrouter_completer(
+    config: &AgentConfig,
+    bus_name: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<(Box<dyn Completer>, Option<FreshCtx>)> {
+    let openrouter = Arc::new(
+        llm_sdk::openrouter::OpenRouter::new(model)
+            .api_key(api_key)
+            .system_prompt(&config.system_prompt),
+    );
+
+    let log = config.session_store.message_log(bus_name);
+    let completer: Box<dyn Completer> = Box::new(OpenRouterCompleter {
+        openrouter: openrouter.clone(),
+        log,
+    });
+
+    let fresh_ctx = if config.fresh_session_per_task {
+        Some(FreshCtx::OpenRouter {
+            store: config.session_store.clone(),
+            key: bus_name.to_string(),
+            openrouter,
+        })
+    } else {
+        None
+    };
+
+    Ok((completer, fresh_ctx))
 }
 
 fn log_completion(agent_id: &AgentId, output: &llm_sdk::Output) {
