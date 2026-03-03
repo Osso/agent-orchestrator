@@ -11,7 +11,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+rmcp = { version = "0.9", features = ["server", "transport-io"] }
+schemars = "1"
 
+peercred-ipc = { path = "../../lib/peercred-ipc" }
 llm-sdk = { path = "../../lib/llm-sdk" }
 agent-bus = { path = "../agent-bus" }
 llm-tasks = { path = "../llm-tasks" }

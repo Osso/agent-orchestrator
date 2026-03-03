@@ -7,7 +7,7 @@
 //! - Persists task history via llm-tasks
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_bus::Bus;
@@ -17,6 +17,8 @@ use llm_tasks::db::Database;
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig};
+use crate::control;
+use crate::relay::{self, RelayServer};
 use crate::types::{AgentId, AgentRole};
 
 const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -68,8 +70,22 @@ impl OrchestratorRuntime {
             .register("runtime")
             .map_err(|e| anyhow::anyhow!("Failed to register runtime: {}", e))?;
 
+        self.start_relay();
+        // Brief pause for relay to bind its socket before agents connect
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         self.spawn_initial_agents(initial_task)?;
         self.command_loop(&mut mailbox).await
+    }
+
+    fn start_relay(&self) {
+        let relay = RelayServer::new(self.bus.clone());
+        let socket_path = relay::relay_socket_path();
+        tokio::spawn(async move {
+            if let Err(e) = relay.run(&socket_path).await {
+                tracing::error!("Relay server error: {}", e);
+            }
+        });
     }
 
     async fn command_loop(&mut self, mailbox: &mut agent_bus::Mailbox) -> Result<()> {
@@ -154,11 +170,13 @@ impl OrchestratorRuntime {
             AgentRole::Developer => AgentId::new_developer(index),
             _ => AgentId::new_singleton(role),
         };
+        let bus_name = agent_id.bus_name();
         let config = AgentConfig {
-            agent_id: agent_id.clone(),
+            agent_id,
             working_dir: self.working_dir.clone(),
             system_prompt: role.system_prompt().to_string(),
             initial_task,
+            mcp_config: Some(build_mcp_config(&bus_name)),
         };
         self.spawn_agent_with_config(config)
     }
@@ -255,6 +273,7 @@ impl OrchestratorRuntime {
             working_dir: self.working_dir.clone(),
             system_prompt: prompt,
             initial_task: None,
+            mcp_config: Some(build_mcp_config("manager")),
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);
@@ -292,6 +311,23 @@ impl OrchestratorRuntime {
 
         b
     }
+}
+
+fn build_mcp_config(agent_name: &str) -> String {
+    let socket_path = relay::relay_socket_path();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("agent-orchestrator"))
+        .to_string_lossy()
+        .into_owned();
+    serde_json::json!({
+        "mcpServers": {
+            "orchestrator": {
+                "command": exe,
+                "args": ["mcp-serve", "--socket", socket_path.to_string_lossy(), "--agent", agent_name]
+            }
+        }
+    })
+    .to_string()
 }
 
 fn payload_str(payload: &serde_json::Value, key: &str) -> String {
