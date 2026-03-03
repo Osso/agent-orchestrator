@@ -207,6 +207,9 @@ fn build_claude_completer(
         .working_dir(&config.working_dir)
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT");
+    if !role_has_tools(config.agent_id.role) {
+        base_claude = base_claude.allowed_tools(vec!["mcp__orchestrator".to_string()]);
+    }
     if let Some(ref cfg) = config.mcp_config {
         base_claude = base_claude.mcp_config(cfg);
     }
