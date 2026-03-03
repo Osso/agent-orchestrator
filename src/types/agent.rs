@@ -7,6 +7,7 @@ pub enum AgentRole {
     Architect,
     Developer,
     Auditor,
+    Merger,
 }
 
 impl AgentRole {
@@ -16,6 +17,7 @@ impl AgentRole {
             AgentRole::Architect => "architect",
             AgentRole::Developer => "developer",
             AgentRole::Auditor => "auditor",
+            AgentRole::Merger => "merger",
         }
     }
 
@@ -25,6 +27,7 @@ impl AgentRole {
             AgentRole::Architect => include_str!("../../prompts/architect.md"),
             AgentRole::Developer => include_str!("../../prompts/developer.md"),
             AgentRole::Auditor => include_str!("../../prompts/auditor.md"),
+            AgentRole::Merger => include_str!("../../prompts/merger.md"),
         }
     }
 }

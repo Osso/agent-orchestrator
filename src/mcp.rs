@@ -50,6 +50,14 @@ struct ReportParams {
     content: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct MergeRequestParams {
+    /// Branch name to merge (e.g. "agent/developer-0")
+    branch: String,
+    /// Description of the changes in this branch
+    description: String,
+}
+
 struct BufStream {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
@@ -155,6 +163,18 @@ impl OrchestratorMcp {
         };
         match self.client.call("report", args).await {
             Ok(_) => "Report submitted".to_string(),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    #[tool(description = "Request that your branch be merged into main. Developer only. Call after committing all changes. Wait for merge_success or merge_failed response via send_message before reporting COMPLETE or BLOCKED.")]
+    async fn merge_request(&self, Parameters(params): Parameters<MergeRequestParams>) -> String {
+        let args = match serde_json::to_value(&params) {
+            Ok(v) => v,
+            Err(e) => return format!("Error serializing params: {}", e),
+        };
+        match self.client.call("merge_request", args).await {
+            Ok(_) => "Merge request submitted".to_string(),
             Err(e) => format!("Error: {}", e),
         }
     }

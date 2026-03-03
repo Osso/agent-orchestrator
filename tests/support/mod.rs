@@ -59,6 +59,8 @@ pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> Ag
         system_prompt: "test".to_string(),
         initial_task: initial_task.map(|s| s.to_string()),
         mcp_config: None,
+        fresh_session_per_task: false,
+        session_store: None,
     }
 }
 

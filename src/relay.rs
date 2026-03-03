@@ -134,6 +134,7 @@ fn handle_tool_call(mailbox: &Mailbox, agent_name: &str, req: &RelayRequest) -> 
         "set_crew" => handle_set_crew(mailbox, agent_name, &req.args),
         "relieve_manager" => handle_relieve_manager(mailbox, agent_name, &req.args),
         "report" => handle_report(mailbox, agent_name, &req.args),
+        "merge_request" => handle_merge_request(mailbox, agent_name, &req.args),
         unknown => Err(format!("unknown tool: {}", unknown)),
     };
 
@@ -245,11 +246,36 @@ fn handle_report(
         .map_err(|e| format!("send failed: {}", e))
 }
 
+fn handle_merge_request(
+    mailbox: &Mailbox,
+    agent_name: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if role_from_agent_name(agent_name) != Some(AgentRole::Developer) {
+        return Err(format!("'{}' is not allowed to request merges", agent_name));
+    }
+
+    let branch = args["branch"].as_str().ok_or("missing 'branch'")?;
+    let description = args["description"].as_str().ok_or("missing 'description'")?;
+
+    let payload = serde_json::json!({
+        "branch": branch,
+        "description": description,
+        "from_developer": agent_name,
+    });
+
+    mailbox
+        .send("merger", "merge_request", payload)
+        .map(|_| serde_json::json!({"ok": true}))
+        .map_err(|e| format!("send failed: {}", e))
+}
+
 fn role_from_agent_name(name: &str) -> Option<AgentRole> {
     match name {
         "manager" => Some(AgentRole::Manager),
         "architect" => Some(AgentRole::Architect),
         "auditor" => Some(AgentRole::Auditor),
+        "merger" => Some(AgentRole::Merger),
         n if n.starts_with("developer-") => Some(AgentRole::Developer),
         _ => None,
     }
@@ -316,6 +342,7 @@ mod tests {
         assert_eq!(role_from_agent_name("manager"), Some(AgentRole::Manager));
         assert_eq!(role_from_agent_name("architect"), Some(AgentRole::Architect));
         assert_eq!(role_from_agent_name("auditor"), Some(AgentRole::Auditor));
+        assert_eq!(role_from_agent_name("merger"), Some(AgentRole::Merger));
         assert_eq!(role_from_agent_name("developer-0"), Some(AgentRole::Developer));
         assert_eq!(role_from_agent_name("developer-2"), Some(AgentRole::Developer));
     }
@@ -489,6 +516,34 @@ mod tests {
         let result = handle_send_message(&mailbox, "manager", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("send failed"));
+    }
+
+    // --- Role validation: merge_request ---
+
+    #[test]
+    fn merge_request_rejected_from_non_developer() {
+        let bus = Bus::new();
+        let mailbox = bus.register("relay-manager").unwrap();
+        let _merger = bus.register("merger").unwrap();
+        let args = serde_json::json!({"branch": "agent/developer-0", "description": "add feature"});
+        let result = handle_merge_request(&mailbox, "manager", &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not allowed to request merges"));
+    }
+
+    #[test]
+    fn merge_request_allowed_from_developer() {
+        let bus = Bus::new();
+        let mailbox = bus.register("relay-developer-0").unwrap();
+        let mut merger = bus.register("merger").unwrap();
+        let args = serde_json::json!({"branch": "agent/developer-0", "description": "add login button"});
+        let result = handle_merge_request(&mailbox, "developer-0", &args);
+        assert!(result.is_ok());
+        let msg = merger.try_recv().unwrap();
+        assert_eq!(msg.kind, "merge_request");
+        assert_eq!(msg.payload["branch"], "agent/developer-0");
+        assert_eq!(msg.payload["description"], "add login button");
+        assert_eq!(msg.payload["from_developer"], "developer-0");
     }
 
     // --- set_crew routing ---

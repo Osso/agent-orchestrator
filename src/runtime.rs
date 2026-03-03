@@ -21,6 +21,7 @@ use crate::agent::{Agent, AgentConfig};
 use crate::control;
 use crate::relay::{self, RelayServer};
 use crate::types::{AgentId, AgentRole};
+use crate::worktree::{self, WorktreeConfig};
 
 pub const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -274,9 +275,13 @@ impl OrchestratorRuntime {
 
     fn shutdown(&mut self) {
         tracing::info!("Shutting down {} agents", self.agent_handles.len());
+        let names: Vec<String> = self.agent_handles.keys().cloned().collect();
         for (name, handle) in self.agent_handles.drain() {
             tracing::info!("Stopping {}", name);
             handle.abort();
+        }
+        for name in &names {
+            self.try_remove_worktree(name);
         }
     }
 
@@ -284,6 +289,7 @@ impl OrchestratorRuntime {
         self.spawn_agent(AgentRole::Manager, 0, manager_task)?;
         self.spawn_agent(AgentRole::Architect, 0, None)?;
         self.spawn_agent(AgentRole::Auditor, 0, None)?;
+        self.spawn_agent(AgentRole::Merger, 0, None)?;
         self.spawn_agent(AgentRole::Developer, 0, None)?;
         Ok(())
     }
@@ -299,14 +305,40 @@ impl OrchestratorRuntime {
             _ => AgentId::new_singleton(role),
         };
         let bus_name = agent_id.bus_name();
+        let working_dir = self.working_dir_for_role(role, &bus_name);
+        let fresh = role == AgentRole::Developer;
         let config = AgentConfig {
             agent_id,
-            working_dir: self.working_dir.clone(),
+            working_dir,
             system_prompt: role.system_prompt().to_string(),
             initial_task,
             mcp_config: Some(build_mcp_config(&bus_name)),
+            fresh_session_per_task: fresh,
+            session_store: if fresh {
+                Some((self.session_store.clone(), bus_name.clone()))
+            } else {
+                None
+            },
         };
         self.spawn_agent_with_config(config)
+    }
+
+    fn working_dir_for_role(&self, role: AgentRole, bus_name: &str) -> String {
+        if matches!(role, AgentRole::Developer | AgentRole::Merger) {
+            let cfg = WorktreeConfig {
+                project_dir: PathBuf::from(&self.working_dir),
+                agent_name: bus_name.to_string(),
+            };
+            match worktree::create_worktree(&cfg) {
+                Ok(path) => return path.to_string_lossy().into_owned(),
+                Err(e) => tracing::warn!(
+                    "Failed to create worktree for {}, using project dir: {}",
+                    bus_name,
+                    e
+                ),
+            }
+        }
+        self.working_dir.clone()
     }
 
     fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
@@ -403,6 +435,8 @@ impl OrchestratorRuntime {
             system_prompt: prompt,
             initial_task: None,
             mcp_config: Some(build_mcp_config("manager")),
+            fresh_session_per_task: false,
+            session_store: None,
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);
@@ -414,6 +448,20 @@ impl OrchestratorRuntime {
             tracing::info!("Stopping {}", name);
             handle.abort();
             // Mailbox drop on the agent task handles deregistration
+            self.try_remove_worktree(name);
+        }
+    }
+
+    fn try_remove_worktree(&self, bus_name: &str) {
+        if !is_worktree_role(bus_name) {
+            return;
+        }
+        let cfg = WorktreeConfig {
+            project_dir: PathBuf::from(&self.working_dir),
+            agent_name: bus_name.to_string(),
+        };
+        if let Err(e) = worktree::remove_worktree(&cfg) {
+            tracing::warn!("Failed to remove worktree for {}: {}", bus_name, e);
         }
     }
 
@@ -476,4 +524,8 @@ fn payload_u8(payload: &serde_json::Value, key: &str, default: u8) -> u8 {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
+}
+
+fn is_worktree_role(bus_name: &str) -> bool {
+    bus_name.starts_with("developer-") || bus_name == "merger"
 }

@@ -9,7 +9,7 @@ use agent_bus::Mailbox;
 use anyhow::Result;
 use async_trait::async_trait;
 use llm_sdk::claude::Claude;
-use llm_sdk::session::Session;
+use llm_sdk::session::{Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
 
@@ -32,6 +32,14 @@ impl Completer for SessionCompleter {
     }
 }
 
+/// Context needed to issue a fresh session for each task.
+struct FreshSessionCtx {
+    store: SessionStore,
+    session_key: String,
+    system_prompt: String,
+    base_claude: Claude,
+}
+
 /// Configuration for an agent
 pub struct AgentConfig {
     pub agent_id: AgentId,
@@ -41,6 +49,11 @@ pub struct AgentConfig {
     pub initial_task: Option<String>,
     /// MCP config JSON to pass to Claude CLI (--mcp-config)
     pub mcp_config: Option<String>,
+    /// When true, reset the session before each task_assignment message.
+    /// Requires session_store to be set.
+    pub fresh_session_per_task: bool,
+    /// Session store + key used for fresh-session-per-task resets.
+    pub session_store: Option<(SessionStore, String)>,
 }
 
 /// Running agent instance
@@ -48,6 +61,7 @@ pub struct Agent {
     config: AgentConfig,
     mailbox: Mailbox,
     completer: Box<dyn Completer>,
+    fresh_ctx: Option<FreshSessionCtx>,
 }
 
 impl Agent {
@@ -59,6 +73,21 @@ impl Agent {
         if let Some(ref cfg) = config.mcp_config {
             base_claude = base_claude.mcp_config(cfg);
         }
+
+        let fresh_ctx = if config.fresh_session_per_task {
+            config
+                .session_store
+                .as_ref()
+                .map(|(store, key)| FreshSessionCtx {
+                    store: store.clone(),
+                    session_key: key.clone(),
+                    system_prompt: config.system_prompt.clone(),
+                    base_claude: base_claude.clone(),
+                })
+        } else {
+            None
+        };
+
         let completer = Box::new(SessionCompleter {
             session,
             claude: base_claude,
@@ -67,6 +96,7 @@ impl Agent {
             config,
             mailbox,
             completer,
+            fresh_ctx,
         })
     }
 
@@ -80,6 +110,7 @@ impl Agent {
             config,
             mailbox,
             completer,
+            fresh_ctx: None,
         }
     }
 
@@ -99,8 +130,12 @@ impl Agent {
                 msg.kind,
                 msg.from
             );
-            let content = extract_content(&msg.payload);
 
+            if msg.kind == "task_assignment" {
+                self.reset_session_for_task();
+            }
+
+            let content = extract_content(&msg.payload);
             if let Err(e) = self.process_prompt(&content).await {
                 tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
             }
@@ -108,6 +143,22 @@ impl Agent {
 
         tracing::info!("Agent {} stopped", self.config.agent_id);
         Ok(())
+    }
+
+    fn reset_session_for_task(&mut self) {
+        let Some(ctx) = &self.fresh_ctx else {
+            return;
+        };
+        ctx.store.remove(&ctx.session_key);
+        let session = ctx
+            .store
+            .session(&ctx.session_key)
+            .system_prompt(&ctx.system_prompt);
+        self.completer = Box::new(SessionCompleter {
+            session,
+            claude: ctx.base_claude.clone(),
+        });
+        tracing::info!("Agent {} fresh session for task", self.config.agent_id);
     }
 
     async fn process_prompt(&mut self, content: &str) -> Result<()> {
@@ -145,7 +196,7 @@ fn first_line(text: &str) -> &str {
 
 fn permission_mode_for_role(role: AgentRole) -> &'static str {
     match role {
-        AgentRole::Developer => "acceptEdits",
+        AgentRole::Developer | AgentRole::Merger => "acceptEdits",
         AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "dontAsk",
     }
 }
