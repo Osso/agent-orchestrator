@@ -2,6 +2,9 @@
 name = "agent-orchestrator"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Multi-agent orchestration system for AI coding assistants"
+repository = "https://github.com/Osso/agent-orchestrator"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "net"] }
@@ -15,7 +18,8 @@ uuid = { version = "1", features = ["v4"] }
 rmcp = { version = "0.9", features = ["server", "transport-io"] }
 schemars = "1"
 
-peercred-ipc = { path = "../../lib/peercred-ipc" }
-llm-sdk = { path = "../../lib/llm-sdk" }
-agent-bus = { path = "../agent-bus" }
-llm-tasks = { path = "../llm-tasks" }
+peercred-ipc = { git = "https://github.com/Osso/peercred-ipc.git" }
+llm-sdk = { git = "https://github.com/Osso/llm-sdk.git" }
+agent-bus = { git = "https://github.com/Osso/agent-bus.git" }
+llm-tasks = { git = "https://github.com/Osso/llm-tasks.git" }
+dotenvy = "0.15.7"
