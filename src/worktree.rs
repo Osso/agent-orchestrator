@@ -24,6 +24,7 @@ impl WorktreeConfig {
 }
 
 pub fn create_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
+    ensure_head_exists(&cfg.project_dir)?;
     let path = cfg.path();
     let branch = cfg.branch();
     let status = Command::new("git")
@@ -44,6 +45,24 @@ pub fn create_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
         anyhow::bail!("git worktree add failed with status {}", status);
     }
     Ok(path)
+}
+
+/// Create an initial empty commit if the repo has no commits yet.
+fn ensure_head_exists(project_dir: &std::path::Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_dir)
+        .output()
+        .context("failed to run git rev-parse HEAD")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init (agent-orchestrator)"])
+        .current_dir(project_dir)
+        .status()
+        .context("failed to create initial commit")?;
+    Ok(())
 }
 
 pub fn remove_worktree(cfg: &WorktreeConfig) -> Result<()> {
