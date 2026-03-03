@@ -4,7 +4,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use agent_bus::Bus;
-use agent_orchestrator::agent::Agent;
+use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools, Agent};
+use agent_orchestrator::bus_tools::bus_tools_for_role;
 use agent_orchestrator::runtime::RELIEVE_COOLDOWN;
 use agent_orchestrator::types::AgentRole;
 use support::{test_config, test_runtime, FakeCompleter};
@@ -219,6 +220,80 @@ async fn handle_message_ignores_unknown_kind() {
     rt.handle_message("unknown_kind", &payload, "someone").await;
     assert_eq!(rt.state.developer_count, 1);
     assert_eq!(rt.state.manager_generation, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Tool restriction tests
+// ---------------------------------------------------------------------------
+
+/// Helper: extract sorted tool names from a ToolSet.
+fn tool_names(set: &llm_sdk::tools::ToolSet) -> Vec<String> {
+    let mut names: Vec<String> = set.definitions().iter().map(|d| d.name.clone()).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn role_has_tools_only_for_developer_and_merger() {
+    assert!(role_has_tools(AgentRole::Developer));
+    assert!(role_has_tools(AgentRole::Merger));
+    assert!(!role_has_tools(AgentRole::Manager));
+    assert!(!role_has_tools(AgentRole::Architect));
+    assert!(!role_has_tools(AgentRole::Auditor));
+}
+
+#[test]
+fn permission_modes_match_roles() {
+    assert_eq!(permission_mode_for_role(AgentRole::Developer), "acceptEdits");
+    assert_eq!(permission_mode_for_role(AgentRole::Merger), "acceptEdits");
+    assert_eq!(permission_mode_for_role(AgentRole::Manager), "dontAsk");
+    assert_eq!(permission_mode_for_role(AgentRole::Architect), "dontAsk");
+    assert_eq!(permission_mode_for_role(AgentRole::Auditor), "dontAsk");
+}
+
+#[test]
+fn bus_tools_manager_gets_send_message_and_set_crew() {
+    let bus = Bus::new();
+    let mailbox = std::sync::Arc::new(bus.register("test-mgr").unwrap());
+    let set = bus_tools_for_role(AgentRole::Manager, mailbox);
+    let names = tool_names(&set);
+    assert_eq!(names, vec!["send_message", "set_crew"]);
+}
+
+#[test]
+fn bus_tools_architect_gets_send_message_only() {
+    let bus = Bus::new();
+    let mailbox = std::sync::Arc::new(bus.register("test-arch").unwrap());
+    let set = bus_tools_for_role(AgentRole::Architect, mailbox);
+    let names = tool_names(&set);
+    assert_eq!(names, vec!["send_message"]);
+}
+
+#[test]
+fn bus_tools_developer_gets_send_message_and_merge_request() {
+    let bus = Bus::new();
+    let mailbox = std::sync::Arc::new(bus.register("test-dev").unwrap());
+    let set = bus_tools_for_role(AgentRole::Developer, mailbox);
+    let names = tool_names(&set);
+    assert_eq!(names, vec!["merge_request", "send_message"]);
+}
+
+#[test]
+fn bus_tools_auditor_gets_send_message_relieve_and_report() {
+    let bus = Bus::new();
+    let mailbox = std::sync::Arc::new(bus.register("test-aud").unwrap());
+    let set = bus_tools_for_role(AgentRole::Auditor, mailbox);
+    let names = tool_names(&set);
+    assert_eq!(names, vec!["relieve_manager", "report", "send_message"]);
+}
+
+#[test]
+fn bus_tools_merger_gets_send_message_only() {
+    let bus = Bus::new();
+    let mailbox = std::sync::Arc::new(bus.register("test-merger").unwrap());
+    let set = bus_tools_for_role(AgentRole::Merger, mailbox);
+    let names = tool_names(&set);
+    assert_eq!(names, vec!["send_message"]);
 }
 
 // ---------------------------------------------------------------------------

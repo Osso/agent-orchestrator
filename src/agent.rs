@@ -299,14 +299,14 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
-fn permission_mode_for_role(role: AgentRole) -> &'static str {
+pub fn permission_mode_for_role(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Developer | AgentRole::Merger => "acceptEdits",
         AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "dontAsk",
     }
 }
 
-fn role_has_tools(role: AgentRole) -> bool {
+pub fn role_has_tools(role: AgentRole) -> bool {
     matches!(role, AgentRole::Developer | AgentRole::Merger)
 }
 
