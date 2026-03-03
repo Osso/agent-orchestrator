@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use agent_bus::Mailbox;
+use agent_bus::{Bus, Mailbox};
 use anyhow::Result;
 use async_trait::async_trait;
 use llm_sdk::claude::Claude;
@@ -84,6 +84,8 @@ pub struct AgentConfig {
     pub backend: BackendKind,
     /// Session store for persistence.
     pub session_store: SessionStore,
+    /// Bus for OpenRouter bus tools (None for Claude backend / tests).
+    pub bus: Option<Bus>,
 }
 
 /// Running agent instance
@@ -202,7 +204,9 @@ fn build_claude_completer(
     let perm_mode = permission_mode_for_role(config.agent_id.role);
     let mut base_claude = Claude::new()?
         .permission_mode(perm_mode)
-        .working_dir(&config.working_dir);
+        .working_dir(&config.working_dir)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT");
     if let Some(ref cfg) = config.mcp_config {
         base_claude = base_claude.mcp_config(cfg);
     }
@@ -236,11 +240,14 @@ fn build_openrouter_completer(
     model: &str,
     api_key: &str,
 ) -> Result<(Box<dyn Completer>, Option<FreshCtx>)> {
-    let openrouter = Arc::new(
-        llm_sdk::openrouter::OpenRouter::new(model)
-            .api_key(api_key)
-            .system_prompt(&config.system_prompt),
-    );
+    let mut builder = llm_sdk::openrouter::OpenRouter::new(model)
+        .api_key(api_key)
+        .system_prompt(&config.system_prompt);
+    let tools = build_openrouter_tools(config, bus_name);
+    if !tools.is_empty() {
+        builder = builder.tools(tools);
+    }
+    let openrouter = Arc::new(builder);
 
     let log = config.session_store.message_log(bus_name);
     let completer: Box<dyn Completer> = Box::new(OpenRouterCompleter {
@@ -292,4 +299,31 @@ fn permission_mode_for_role(role: AgentRole) -> &'static str {
         AgentRole::Developer | AgentRole::Merger => "acceptEdits",
         AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "dontAsk",
     }
+}
+
+fn role_has_tools(role: AgentRole) -> bool {
+    matches!(role, AgentRole::Developer | AgentRole::Merger)
+}
+
+/// Build the ToolSet for an OpenRouter agent: file tools for developers, bus tools for all.
+fn build_openrouter_tools(config: &AgentConfig, bus_name: &str) -> llm_sdk::tools::ToolSet {
+    let mut set = if role_has_tools(config.agent_id.role) {
+        llm_sdk::tools::ToolSet::standard()
+    } else {
+        llm_sdk::tools::ToolSet::new()
+    };
+
+    if let Some(ref bus) = config.bus {
+        let tools_name = format!("{}-tools", bus_name);
+        match bus.register(&tools_name) {
+            Ok(mailbox) => {
+                let bus_set =
+                    crate::bus_tools::bus_tools_for_role(config.agent_id.role, Arc::new(mailbox));
+                set = set.merge(bus_set);
+            }
+            Err(e) => tracing::warn!("Failed to register bus tools for {}: {}", bus_name, e),
+        }
+    }
+
+    set
 }

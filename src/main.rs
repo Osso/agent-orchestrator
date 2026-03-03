@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_DB_PATH: &str = "/tmp/claude/orchestrator/tasks.db";
+const DEFAULT_DB_DIR: &str = "/tmp/claude/orchestrator";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     init_tracing()?;
     let mut args: Vec<String> = std::env::args().collect();
     let opts = extract_opts(&mut args);
@@ -83,7 +84,7 @@ USAGE:
     agent-orchestrator [OPTIONS] <COMMAND>
 
 OPTIONS:
-    --db <path>         Task database path (default: {DEFAULT_DB_PATH})
+    --db <path>         Task database path (default: per-project under {DEFAULT_DB_DIR}/)
     --backend <name>    Backend to use: claude (default) or openrouter
     --model <name>      Model name (required for --backend openrouter)
 
@@ -103,19 +104,19 @@ EXAMPLES:
 }
 
 struct Opts {
-    db_path: PathBuf,
+    db_path: Option<PathBuf>,
     backend: String,
     model: Option<String>,
 }
 
 fn extract_opts(args: &mut Vec<String>) -> Opts {
-    let mut db_path = PathBuf::from(DEFAULT_DB_PATH);
+    let mut db_path: Option<PathBuf> = None;
     let mut backend = "claude".to_string();
     let mut model: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--db" && i + 1 < args.len() {
-            db_path = PathBuf::from(&args[i + 1]);
+            db_path = Some(PathBuf::from(&args[i + 1]));
             args.drain(i..i + 2);
         } else if args[i] == "--backend" && i + 1 < args.len() {
             backend = args[i + 1].clone();
@@ -128,6 +129,15 @@ fn extract_opts(args: &mut Vec<String>) -> Opts {
         }
     }
     Opts { db_path, backend, model }
+}
+
+/// Derive a project-specific DB path from the working directory.
+fn db_path_for_project(working_dir: &str) -> PathBuf {
+    let project = std::path::Path::new(working_dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    PathBuf::from(DEFAULT_DB_DIR).join(project).join("tasks.db")
 }
 
 fn extract_named_arg(args: &[String], flag: &str) -> Option<String> {
@@ -156,9 +166,12 @@ fn build_backend(opts: &Opts) -> Result<BackendKind> {
 
 async fn run_orchestrator(working_dir: &str, task: Option<String>, opts: &Opts) -> Result<()> {
     info!("Starting orchestrator for {}", working_dir);
+    let db_path = opts
+        .db_path
+        .clone()
+        .unwrap_or_else(|| db_path_for_project(working_dir));
     let backend = build_backend(opts)?;
-    let runtime =
-        OrchestratorRuntime::new(&opts.db_path, working_dir.to_string(), backend).await?;
+    let runtime = OrchestratorRuntime::new(&db_path, working_dir.to_string(), backend).await?;
     runtime.run(task).await
 }
 
