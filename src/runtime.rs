@@ -310,6 +310,10 @@ impl OrchestratorRuntime {
         let bus_name = agent_id.bus_name();
         let working_dir = self.working_dir_for_role(role, &bus_name);
         let fresh = role == AgentRole::Developer;
+        let bus = match self.backend {
+            BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
+            BackendKind::Claude => None,
+        };
         let config = AgentConfig {
             agent_id,
             working_dir,
@@ -319,6 +323,7 @@ impl OrchestratorRuntime {
             fresh_session_per_task: fresh,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
+            bus,
         };
         self.spawn_agent_with_config(config)
     }
@@ -426,6 +431,10 @@ impl OrchestratorRuntime {
 
     fn spawn_replacement_manager(&mut self, briefing: String) {
         let prompt = format!("{}\n\n{}", AgentRole::Manager.system_prompt(), briefing);
+        let bus = match self.backend {
+            BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
+            BackendKind::Claude => None,
+        };
         let config = AgentConfig {
             agent_id: AgentId::new_singleton(AgentRole::Manager),
             working_dir: self.working_dir.clone(),
@@ -435,6 +444,7 @@ impl OrchestratorRuntime {
             fresh_session_per_task: false,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
+            bus,
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);

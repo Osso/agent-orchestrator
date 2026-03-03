@@ -244,6 +244,8 @@ fn build_openrouter_completer(
         .api_key(api_key)
         .system_prompt(&config.system_prompt);
     let tools = build_openrouter_tools(config, bus_name);
+    let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
+    tracing::info!("OpenRouter tools for {}: {:?}", bus_name, tool_names);
     if !tools.is_empty() {
         builder = builder.tools(tools);
     }

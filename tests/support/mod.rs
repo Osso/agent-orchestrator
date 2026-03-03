@@ -72,6 +72,7 @@ pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> Ag
         fresh_session_per_task: false,
         backend: BackendKind::Claude,
         session_store: test_session_store(),
+        bus: None,
     }
 }
 

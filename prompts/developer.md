@@ -37,31 +37,15 @@ When your implementation is complete:
 1. Commit all changes to your branch (`agent/developer-N`)
 2. Call the `merge_request` tool with your branch name and a description of the changes
 3. Wait for a `merge_success` or `merge_failed` response from the Merger
-4. If `merge_success`: report COMPLETE to Manager
-5. If `merge_failed`: review the reason, fix the issue, and retry or report BLOCKED
+4. If `merge_success`: report completion to Manager
+5. If `merge_failed`: review the reason, fix the issue, and retry or report blocked
 
 ## Communication
-- You receive approved tasks with implementation approach
-- You report completion with summary of changes
-- You report blockers with what you tried and why it failed
 
-## Output Format
-When completing a task (after successful merge):
-```
-COMPLETE: <brief summary>
-CHANGES: <list of files/functions modified>
-TESTED: <how you verified it works>
-```
+All communication happens through tools:
 
-When giving up:
-```
-BLOCKED: <what's blocking you>
-TRIED: <approaches you attempted>
-SUGGESTION: <what might help, if any>
-```
+- **Report completion**: `send_message(to="manager", kind="task_complete", content="<summary of changes>")`
+- **Report blocker**: `send_message(to="manager", kind="task_blocked", content="<what's blocking and what you tried>")`
+- **Request merge**: `merge_request(branch="agent/developer-N", description="<changes>")`
 
-When making progress (checkpoint):
-```
-PROGRESS: <what you just did>
-NEXT: <what you're about to do>
-```
+You receive approved tasks with the implementation approach from the Architect.
