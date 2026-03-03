@@ -8,11 +8,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_bus::Bus;
+use agent_bus::{Bus, Mailbox};
 use anyhow::{Context, Result};
-use llm_sdk::session::SessionStore;
+use llm_sdk::session::{Session, SessionStore};
 use llm_tasks::db::Database;
 use tokio::task::JoinHandle;
 
@@ -21,21 +22,32 @@ use crate::control;
 use crate::relay::{self, RelayServer};
 use crate::types::{AgentId, AgentRole};
 
-const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
+pub(crate) const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 
-struct RuntimeState {
-    developer_count: u8,
-    manager_generation: u32,
-    last_relieve: Option<Instant>,
+pub(crate) struct RuntimeState {
+    pub developer_count: u8,
+    pub manager_generation: u32,
+    pub last_relieve: Option<Instant>,
+}
+
+/// Factory function that creates an Agent from config + mailbox + session.
+/// Tests inject a factory that uses FakeCompleter instead of real Claude.
+pub(crate) type AgentFactory =
+    Arc<dyn Fn(AgentConfig, Mailbox, Session) -> Result<Agent> + Send + Sync>;
+
+/// Default factory: creates a real Agent backed by Claude CLI.
+fn default_agent_factory() -> AgentFactory {
+    Arc::new(|config, mailbox, session| Agent::new(config, mailbox, session))
 }
 
 pub struct OrchestratorRuntime {
-    state: RuntimeState,
-    bus: Bus,
+    pub(crate) state: RuntimeState,
+    pub(crate) bus: Bus,
     db: Database,
     session_store: SessionStore,
     working_dir: String,
     agent_handles: HashMap<String, JoinHandle<()>>,
+    agent_factory: AgentFactory,
 }
 
 impl OrchestratorRuntime {
@@ -61,6 +73,39 @@ impl OrchestratorRuntime {
             session_store,
             working_dir,
             agent_handles: HashMap::new(),
+            agent_factory: default_agent_factory(),
+        })
+    }
+
+    /// Create a runtime suitable for testing — uses tempdir for DB + sessions,
+    /// and an injected agent factory.
+    pub(crate) async fn new_test(
+        bus: Bus,
+        working_dir: &str,
+        factory: AgentFactory,
+    ) -> Result<Self> {
+        let tmp = std::env::temp_dir().join(format!("orch-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let db_path = tmp.join("tasks.db");
+        let db = Database::open(&db_path)
+            .await
+            .context("Failed to open test database")?;
+
+        let session_store = SessionStore::load(tmp.join("sessions"));
+
+        Ok(Self {
+            state: RuntimeState {
+                developer_count: 1,
+                manager_generation: 0,
+                last_relieve: None,
+            },
+            bus,
+            db,
+            session_store,
+            working_dir: working_dir.to_string(),
+            agent_handles: HashMap::new(),
+            agent_factory: factory,
         })
     }
 
@@ -70,12 +115,15 @@ impl OrchestratorRuntime {
             .register("runtime")
             .map_err(|e| anyhow::anyhow!("Failed to register runtime: {}", e))?;
 
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         self.start_relay();
-        // Brief pause for relay to bind its socket before agents connect
+        self.start_control_server(shutdown_tx.clone(), shutdown_rx);
+        // Brief pause for relay and control to bind their sockets before agents connect
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         self.spawn_initial_agents(initial_task)?;
-        self.command_loop(&mut mailbox).await
+        self.command_loop(&mut mailbox, shutdown_tx).await
     }
 
     fn start_relay(&self) {
@@ -88,7 +136,21 @@ impl OrchestratorRuntime {
         });
     }
 
-    async fn command_loop(&mut self, mailbox: &mut agent_bus::Mailbox) -> Result<()> {
+    fn start_control_server(
+        &self,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let bus = self.bus.clone();
+        let project = self.working_dir.clone();
+        tokio::spawn(control::run_control_server(bus, project, shutdown_tx, shutdown_rx));
+    }
+
+    async fn command_loop(
+        &mut self,
+        mailbox: &mut agent_bus::Mailbox,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Result<()> {
         let mut sigint =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut sigterm =
@@ -115,11 +177,12 @@ impl OrchestratorRuntime {
             }
         }
 
+        let _ = shutdown_tx.send(true);
         self.shutdown();
         Ok(())
     }
 
-    async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
+    pub(crate) async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
         tracing::info!("Runtime received '{}' from {}", kind, from);
         match kind {
             "set_crew" => {
@@ -193,8 +256,9 @@ impl OrchestratorRuntime {
             .map_err(|e| anyhow::anyhow!("Failed to register {}: {}", bus_name, e))?;
 
         let agent_id = config.agent_id.clone();
+        let factory = self.agent_factory.clone();
         let handle = tokio::spawn(async move {
-            match Agent::new(config, mailbox, session) {
+            match factory(config, mailbox, session) {
                 Ok(agent) => {
                     if let Err(e) = agent.run().await {
                         tracing::error!("Agent {} error: {}", agent_id, e);
@@ -208,7 +272,7 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    fn handle_crew_size(&mut self, count: u8) {
+    pub(crate) fn handle_crew_size(&mut self, count: u8) {
         let count = count.clamp(1, 3);
         let current = self.state.developer_count;
         if count == current {
@@ -232,7 +296,7 @@ impl OrchestratorRuntime {
         self.state.developer_count = count;
     }
 
-    async fn handle_relieve_manager(&mut self, reason: &str) {
+    pub(crate) async fn handle_relieve_manager(&mut self, reason: &str) {
         if !self.relieve_cooldown_elapsed(reason) {
             return;
         }

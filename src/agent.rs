@@ -7,10 +7,30 @@
 
 use agent_bus::Mailbox;
 use anyhow::Result;
+use async_trait::async_trait;
 use llm_sdk::claude::Claude;
 use llm_sdk::session::Session;
 
 use crate::types::{AgentId, AgentRole};
+
+/// Abstraction over Session+Claude so tests can inject a fake.
+#[async_trait]
+pub trait Completer: Send {
+    async fn complete(&mut self, prompt: &str) -> Result<llm_sdk::Output, llm_sdk::Error>;
+}
+
+/// Production completer backed by llm-sdk Session + Claude CLI.
+struct SessionCompleter {
+    session: Session,
+    claude: Claude,
+}
+
+#[async_trait]
+impl Completer for SessionCompleter {
+    async fn complete(&mut self, prompt: &str) -> Result<llm_sdk::Output, llm_sdk::Error> {
+        self.session.complete(&self.claude, prompt).await
+    }
+}
 
 /// Configuration for an agent
 pub struct AgentConfig {
@@ -27,8 +47,7 @@ pub struct AgentConfig {
 pub struct Agent {
     config: AgentConfig,
     mailbox: Mailbox,
-    session: Session,
-    base_claude: Claude,
+    completer: Box<dyn Completer>,
 }
 
 impl Agent {
@@ -40,12 +59,28 @@ impl Agent {
         if let Some(ref cfg) = config.mcp_config {
             base_claude = base_claude.mcp_config(cfg);
         }
+        let completer = Box::new(SessionCompleter {
+            session,
+            claude: base_claude,
+        });
         Ok(Self {
             config,
             mailbox,
-            session,
-            base_claude,
+            completer,
         })
+    }
+
+    /// Create an agent with a custom completer (for testing).
+    pub fn with_completer(
+        config: AgentConfig,
+        mailbox: Mailbox,
+        completer: Box<dyn Completer>,
+    ) -> Self {
+        Self {
+            config,
+            mailbox,
+            completer,
+        }
     }
 
     /// Run the agent main loop
@@ -76,7 +111,7 @@ impl Agent {
     }
 
     async fn process_prompt(&mut self, content: &str) -> Result<()> {
-        let output = self.session.complete(&self.base_claude, content).await?;
+        let output = self.completer.complete(content).await?;
         log_completion(&self.config.agent_id, &output);
         Ok(())
     }

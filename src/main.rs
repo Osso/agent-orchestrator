@@ -1,16 +1,10 @@
-mod agent;
-mod control;
-mod mcp;
-mod relay;
-mod runtime;
-mod types;
+use agent_orchestrator::relay;
+use agent_orchestrator::runtime::OrchestratorRuntime;
 
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-
-use runtime::OrchestratorRuntime;
 
 const DEFAULT_DB_PATH: &str = "/tmp/claude/orchestrator/tasks.db";
 
@@ -77,7 +71,7 @@ async fn cmd_mcp_serve(args: &[String]) -> Result<()> {
         .unwrap_or_else(relay::relay_socket_path);
     let agent = extract_named_arg(args, "--agent")
         .ok_or_else(|| anyhow::anyhow!("--agent required for mcp-serve"))?;
-    mcp::run_mcp_server(socket, agent).await
+    agent_orchestrator::mcp::run_mcp_server(socket, agent).await
 }
 
 fn print_usage() {
