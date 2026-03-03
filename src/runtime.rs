@@ -1,145 +1,81 @@
 //! Orchestrator runtime that manages agent lifecycle and state
 //!
 //! The runtime:
+//! - Creates the in-process message bus
 //! - Spawns and tracks agent processes
-//! - Handles runtime commands (CREW sizing, RELIEVE manager)
-//! - Maintains task log for manager briefings
+//! - Listens for runtime commands via its mailbox (CREW sizing, RELIEVE manager)
+//! - Persists task history via llm-tasks
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use tokio::sync::mpsc;
+use agent_bus::Bus;
+use anyhow::{Context, Result};
+use llm_tasks::db::Database;
 use tokio::task::JoinHandle;
+
+use crate::agent::{Agent, AgentConfig};
+use crate::types::{AgentId, AgentRole};
 
 const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
 
-use crate::agent::{Agent, AgentConfig};
-use crate::backend::AgentBackend;
-use crate::types::{AgentId, AgentRole};
-use crate::watcher::{SessionRegistry, WatcherConfig, spawn_watcher};
-
-/// Commands sent from agents to the runtime (not over the wire)
-#[derive(Debug)]
-pub enum RuntimeCommand {
-    /// Manager requests N developers (1-3)
-    SetCrewSize { count: u8 },
-    /// Scorer fires the manager
-    RelieveManager { reason: String },
-    /// Agent reports task status change
-    TaskUpdate {
-        agent: AgentId,
-        status: TaskStatus,
-        summary: String,
-    },
-}
-
-/// Status of a task tracked by the runtime
-#[derive(Debug, Clone)]
-pub enum TaskStatus {
-    InProgress,
-    Completed,
-    Blocked,
-}
-
-/// Record of a task for briefing new managers
-#[derive(Debug, Clone)]
-pub struct TaskRecord {
-    pub agent: AgentId,
-    pub status: TaskStatus,
-    pub summary: String,
-}
-
-/// Mutable state tracked by the runtime
 struct RuntimeState {
     developer_count: u8,
-    task_log: Vec<TaskRecord>,
     manager_generation: u32,
     last_relieve: Option<Instant>,
 }
 
-/// Core orchestrator that spawns agents and handles runtime commands
 pub struct OrchestratorRuntime {
     state: RuntimeState,
-    backend: Arc<dyn AgentBackend>,
-    base_path: PathBuf,
+    bus: Bus,
+    db: Database,
     working_dir: String,
-    command_tx: mpsc::Sender<RuntimeCommand>,
-    command_rx: mpsc::Receiver<RuntimeCommand>,
-    agent_handles: HashMap<AgentId, JoinHandle<()>>,
-    registry: Arc<Mutex<SessionRegistry>>,
-    watcher_config: Option<WatcherConfig>,
+    agent_handles: HashMap<String, JoinHandle<()>>,
 }
 
 impl OrchestratorRuntime {
-    pub fn new(
-        backend: Arc<dyn AgentBackend>,
-        base_path: PathBuf,
-        working_dir: String,
-        watcher_config: Option<WatcherConfig>,
-    ) -> Self {
-        let (command_tx, command_rx) = mpsc::channel(64);
+    pub async fn new(db_path: &Path, working_dir: String) -> Result<Self> {
+        let db = Database::open(db_path)
+            .await
+            .context("Failed to open task database")?;
 
-        Self {
+        Ok(Self {
             state: RuntimeState {
                 developer_count: 1,
-                task_log: Vec::new(),
                 manager_generation: 0,
                 last_relieve: None,
             },
-            backend,
-            base_path,
+            bus: Bus::new(),
+            db,
             working_dir,
-            command_tx,
-            command_rx,
             agent_handles: HashMap::new(),
-            registry: Arc::new(Mutex::new(SessionRegistry::new())),
-            watcher_config,
-        }
+        })
     }
 
-    /// Run the orchestrator: spawn initial agents, then process commands
-    pub async fn run(mut self) -> Result<()> {
-        self.spawn_initial_agents(None).await?;
-        self.start_watcher();
-        self.command_loop().await
+    pub async fn run(mut self, initial_task: Option<String>) -> Result<()> {
+        let mut mailbox = self
+            .bus
+            .register("runtime")
+            .map_err(|e| anyhow::anyhow!("Failed to register runtime: {}", e))?;
+
+        self.spawn_initial_agents(initial_task)?;
+        self.command_loop(&mut mailbox).await
     }
 
-    /// Run with an initial task: spawn agents with task queued for manager
-    pub async fn run_with_task(mut self, task: String) -> Result<()> {
-        self.spawn_initial_agents(Some(task)).await?;
-        self.start_watcher();
-        self.command_loop().await
-    }
-
-    /// Start the SSE watcher if configured (claudius backend only)
-    fn start_watcher(&mut self) {
-        if let Some(config) = self.watcher_config.take() {
-            spawn_watcher(
-                config,
-                self.registry.clone(),
-                self.command_tx.clone(),
-                self.base_path.clone(),
-            );
-        }
-    }
-
-    /// Process runtime commands until shutdown signal or all senders drop
-    async fn command_loop(&mut self) -> Result<()> {
-        let mut sigint = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        )?;
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )?;
+    async fn command_loop(&mut self, mailbox: &mut agent_bus::Mailbox) -> Result<()> {
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
         loop {
             tokio::select! {
-                cmd = self.command_rx.recv() => {
-                    match cmd {
-                        Some(cmd) => self.dispatch_command(cmd).await,
+                msg = mailbox.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            self.handle_message(&msg.kind, &msg.payload, &msg.from).await;
+                        }
                         None => break,
                     }
                 }
@@ -158,114 +94,88 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    async fn dispatch_command(&mut self, cmd: RuntimeCommand) {
-        tracing::info!("Runtime command: {:?}", cmd);
-        match cmd {
-            RuntimeCommand::SetCrewSize { count } => {
-                self.handle_crew_size(count).await;
+    async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
+        tracing::info!("Runtime received '{}' from {}", kind, from);
+        match kind {
+            "set_crew" => {
+                let count = payload_u8(payload, "count", 1);
+                self.handle_crew_size(count);
             }
-            RuntimeCommand::RelieveManager { reason } => {
+            "relieve_manager" => {
+                let reason = payload_str(payload, "reason");
                 self.handle_relieve_manager(&reason).await;
             }
-            RuntimeCommand::TaskUpdate {
-                agent,
-                status,
-                summary,
-            } => {
-                self.state.task_log.push(TaskRecord {
-                    agent,
-                    status,
-                    summary,
-                });
-            }
+            "task_complete" => self.record_task_event(from, payload).await,
+            "task_blocked" => self.record_task_event(from, payload).await,
+            _ => tracing::debug!("Runtime ignoring unknown kind: {}", kind),
         }
     }
 
-    /// Clean shutdown: abort all agents, remove socket files
+    async fn record_task_event(&self, from: &str, payload: &serde_json::Value) {
+        let content = payload_str(payload, "content");
+        let title = first_line(&content);
+        if let Err(e) = self.db.create_task(title, Some(&content), 0, from).await {
+            tracing::error!("Failed to record task event: {}", e);
+        }
+    }
+
     fn shutdown(&mut self) {
         tracing::info!("Shutting down {} agents", self.agent_handles.len());
-        for (id, handle) in self.agent_handles.drain() {
-            tracing::info!("Stopping {}", id);
+        for (name, handle) in self.agent_handles.drain() {
+            tracing::info!("Stopping {}", name);
             handle.abort();
         }
-        self.cleanup_sockets();
     }
 
-    /// Remove all socket files from the base path
-    fn cleanup_sockets(&self) {
-        if let Ok(entries) = std::fs::read_dir(&self.base_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "sock") {
-                    let _ = std::fs::remove_file(&path);
-                    tracing::debug!("Removed {}", path.display());
-                }
-            }
-        }
-    }
-
-    /// Spawn the four initial agents: manager, architect, scorer, developer-0
-    async fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
-        let mgr_id = AgentId::new_singleton(AgentRole::Manager);
-        self.spawn_agent(mgr_id, AgentRole::Manager.system_prompt().to_string(), manager_task)
-            .await?;
-
-        for role in [AgentRole::Architect, AgentRole::Scorer] {
-            let id = AgentId::new_singleton(role);
-            self.spawn_agent(id, role.system_prompt().to_string(), None)
-                .await?;
-        }
-
-        let dev_id = AgentId::new_developer(0);
-        self.spawn_agent(dev_id, AgentRole::Developer.system_prompt().to_string(), None)
-            .await?;
-
+    fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
+        self.spawn_agent(AgentRole::Manager, 0, manager_task)?;
+        self.spawn_agent(AgentRole::Architect, 0, None)?;
+        self.spawn_agent(AgentRole::Scorer, 0, None)?;
+        self.spawn_agent(AgentRole::Developer, 0, None)?;
         Ok(())
     }
 
-    /// Spawn a single agent and track its handle
-    async fn spawn_agent(
+    fn spawn_agent(
         &mut self,
-        agent_id: AgentId,
-        system_prompt: String,
+        role: AgentRole,
+        index: u8,
         initial_task: Option<String>,
     ) -> Result<()> {
-        let backend = self.backend.clone();
-        let base_path = self.base_path.clone();
-        let working_dir = self.working_dir.clone();
-        let command_tx = self.command_tx.clone();
-        let registry = self.registry.clone();
-        let id_for_log = agent_id.clone();
+        let agent_id = match role {
+            AgentRole::Developer => AgentId::new_developer(index),
+            _ => AgentId::new_singleton(role),
+        };
+        let config = AgentConfig {
+            agent_id: agent_id.clone(),
+            working_dir: self.working_dir.clone(),
+            system_prompt: role.system_prompt().to_string(),
+            initial_task,
+        };
+        self.spawn_agent_with_config(config)
+    }
 
+    fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
+        let bus_name = config.agent_id.bus_name();
+        let mailbox = self
+            .bus
+            .register(&bus_name)
+            .map_err(|e| anyhow::anyhow!("Failed to register {}: {}", bus_name, e))?;
+
+        let agent_id = config.agent_id.clone();
         let handle = tokio::spawn(async move {
-            let config = AgentConfig {
-                agent_id: id_for_log.clone(),
-                working_dir,
-                system_prompt,
-                initial_task,
-            };
-
-            match Agent::new(config, backend, &base_path, command_tx, registry).await {
-                Ok(agent) => {
-                    if let Err(e) = agent.run().await {
-                        tracing::error!("Agent {} error: {}", id_for_log, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create agent {}: {}", id_for_log, e);
-                }
+            let agent = Agent::new(config, mailbox);
+            if let Err(e) = agent.run().await {
+                tracing::error!("Agent {} error: {}", agent_id, e);
             }
         });
 
-        self.agent_handles.insert(agent_id, handle);
+        self.agent_handles.insert(bus_name, handle);
         Ok(())
     }
 
-    /// Adjust developer count: spawn or kill developers to match target
-    async fn handle_crew_size(&mut self, count: u8) {
+    fn handle_crew_size(&mut self, count: u8) {
         let count = count.clamp(1, 3);
         let current = self.state.developer_count;
-
         if count == current {
             return;
         }
@@ -273,45 +183,22 @@ impl OrchestratorRuntime {
         tracing::info!("CREW resize: {} -> {}", current, count);
 
         if count > current {
-            self.spawn_developers(current, count).await;
+            for i in current..count {
+                if let Err(e) = self.spawn_agent(AgentRole::Developer, i, None) {
+                    tracing::error!("Failed to spawn developer-{}: {}", i, e);
+                }
+            }
         } else {
-            self.kill_developers(count, current);
+            for i in count..current {
+                self.abort_agent(&format!("developer-{}", i));
+            }
         }
 
         self.state.developer_count = count;
     }
 
-    /// Spawn developers from index `from` to `to` (exclusive)
-    async fn spawn_developers(&mut self, from: u8, to: u8) {
-        for i in from..to {
-            let dev_id = AgentId::new_developer(i);
-            let prompt = AgentRole::Developer.system_prompt().to_string();
-            if let Err(e) = self.spawn_agent(dev_id.clone(), prompt, None).await {
-                tracing::error!("Failed to spawn {}: {}", dev_id, e);
-            }
-        }
-    }
-
-    /// Abort developers from index `from` to `to` (exclusive) and clean up
-    fn kill_developers(&mut self, from: u8, to: u8) {
-        for i in from..to {
-            let dev_id = AgentId::new_developer(i);
-            if let Some(handle) = self.agent_handles.remove(&dev_id) {
-                tracing::info!("Stopping {}", dev_id);
-                handle.abort();
-            }
-        }
-    }
-
-    /// Replace the current manager with a fresh instance briefed on state
     async fn handle_relieve_manager(&mut self, reason: &str) {
-        if let Some(last) = self.state.last_relieve
-            && last.elapsed() < RELIEVE_COOLDOWN
-        {
-            tracing::warn!(
-                "RELIEVE rejected: cooldown ({:.0}s remaining)",
-                (RELIEVE_COOLDOWN - last.elapsed()).as_secs_f64()
-            );
+        if !self.relieve_cooldown_elapsed(reason) {
             return;
         }
 
@@ -321,55 +208,89 @@ impl OrchestratorRuntime {
             reason
         );
 
-        self.abort_manager();
+        self.abort_agent("manager");
         self.state.manager_generation += 1;
         self.state.last_relieve = Some(Instant::now());
 
-        let briefing = self.build_manager_briefing(reason);
-        let prompt = format!("{}\n\n{}", AgentRole::Manager.system_prompt(), briefing);
+        let briefing = self.build_manager_briefing(reason).await;
+        self.spawn_replacement_manager(briefing);
+    }
 
-        if let Err(e) = self.spawn_agent(AgentId::new_singleton(AgentRole::Manager), prompt, None).await
+    fn relieve_cooldown_elapsed(&self, reason: &str) -> bool {
+        if let Some(last) = self.state.last_relieve
+            && last.elapsed() < RELIEVE_COOLDOWN
         {
+            tracing::warn!(
+                "RELIEVE rejected ({}): cooldown ({:.0}s remaining)",
+                reason,
+                (RELIEVE_COOLDOWN - last.elapsed()).as_secs_f64()
+            );
+            return false;
+        }
+        true
+    }
+
+    fn spawn_replacement_manager(&mut self, briefing: String) {
+        let prompt = format!("{}\n\n{}", AgentRole::Manager.system_prompt(), briefing);
+        let config = AgentConfig {
+            agent_id: AgentId::new_singleton(AgentRole::Manager),
+            working_dir: self.working_dir.clone(),
+            system_prompt: prompt,
+            initial_task: None,
+        };
+        if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);
         }
     }
 
-    /// Abort the current manager process
-    fn abort_manager(&mut self) {
-        let mgr_id = AgentId::new_singleton(AgentRole::Manager);
-        if let Some(handle) = self.agent_handles.remove(&mgr_id) {
+    fn abort_agent(&mut self, name: &str) {
+        if let Some(handle) = self.agent_handles.remove(name) {
+            tracing::info!("Stopping {}", name);
             handle.abort();
+            // Mailbox drop on the agent task handles deregistration
         }
     }
 
-    /// Build a state briefing for a replacement manager from the task log
-    fn build_manager_briefing(&self, relieve_reason: &str) -> String {
-        let mut briefing = String::from("## State Briefing (you are replacing the previous manager)\n\n");
-        briefing.push_str(&format!(
-            "**Reason for replacement:** {}\n\n",
-            relieve_reason
-        ));
-        briefing.push_str(&format!(
-            "**Manager generation:** {}\n",
-            self.state.manager_generation
-        ));
-        briefing.push_str(&format!(
+    async fn build_manager_briefing(&self, relieve_reason: &str) -> String {
+        let mut b = String::from("## State Briefing (you are replacing the previous manager)\n\n");
+        b.push_str(&format!("**Reason:** {}\n", relieve_reason));
+        b.push_str(&format!("**Generation:** {}\n", self.state.manager_generation));
+        b.push_str(&format!(
             "**Active developers:** {}\n\n",
             self.state.developer_count
         ));
 
-        if self.state.task_log.is_empty() {
-            briefing.push_str("No task history recorded.\n");
-        } else {
-            briefing.push_str("### Task History\n");
-            for record in &self.state.task_log {
-                briefing.push_str(&format!(
-                    "- [{}] {:?}: {}\n",
-                    record.agent, record.status, record.summary
-                ));
+        match self.db.list_tasks(None, None).await {
+            Ok(tasks) if tasks.is_empty() => b.push_str("No task history recorded.\n"),
+            Ok(tasks) => {
+                b.push_str("### Task History\n");
+                for task in &tasks {
+                    let who = task.assignee.as_deref().unwrap_or("unassigned");
+                    b.push_str(&format!("- [{}] {}: {}\n", who, task.status, task.title));
+                }
             }
+            Err(e) => b.push_str(&format!("Failed to load task history: {}\n", e)),
         }
 
-        briefing
+        b
     }
+}
+
+fn payload_str(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn payload_u8(payload: &serde_json::Value, key: &str, default: u8) -> u8 {
+    payload
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default as u64) as u8
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
 }

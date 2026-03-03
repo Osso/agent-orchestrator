@@ -56,7 +56,7 @@ impl AgentId {
         }
     }
 
-    pub fn socket_name(&self) -> String {
+    pub fn bus_name(&self) -> String {
         if self.role == AgentRole::Developer {
             format!("developer-{}", self.index)
         } else {
@@ -67,15 +67,6 @@ impl AgentId {
 
 impl std::fmt::Display for AgentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.socket_name())
+        write!(f, "{}", self.bus_name())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentStatus {
-    Idle,
-    Working,
-    WaitingForInput,
-    Interrupted,
 }

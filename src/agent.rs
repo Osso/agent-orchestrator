@@ -1,327 +1,209 @@
-//! Agent runtime that combines backend and transport
+//! Agent runtime that combines llm-sdk backend and agent-bus transport
 //!
 //! Each agent:
-//! 1. Listens on a Unix socket for inter-agent messages
-//! 2. Spawns an AI backend (Claude, Gemini, etc.) to process prompts
-//! 3. Parses output for structured messages (TASK:, APPROVED:, etc.)
-//! 4. Routes messages to other agents via their sockets
+//! 1. Registers on the in-process message bus
+//! 2. Waits for messages from other agents
+//! 3. Calls llm-sdk to get a completion
+//! 4. Parses output for structured messages (TASK:, APPROVED:, etc.)
+//! 5. Routes messages to other agents via the bus
 
-use anyhow::{Context, Result};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use agent_bus::Mailbox;
+use anyhow::Result;
+use llm_sdk::Backend;
+use llm_sdk::claude::Claude;
 
-use crate::backend::{AgentBackend, AgentOutput};
-use crate::runtime::{RuntimeCommand, TaskStatus};
-use crate::transport::{AgentConnection, AgentListener, AgentMessage, MessageKind};
 use crate::types::{AgentId, AgentRole};
-use crate::watcher::SessionRegistry;
 
 /// Configuration for an agent
 pub struct AgentConfig {
     pub agent_id: AgentId,
     pub working_dir: String,
     pub system_prompt: String,
-    /// Task to process immediately after session init (before accepting socket messages)
+    /// Task to process immediately after connecting (before accepting bus messages)
     pub initial_task: Option<String>,
 }
 
 /// Result of parsing an agent output section
 pub enum ParsedOutput {
-    /// Route a message to another agent
-    Message(AgentMessage),
-    /// Send a command to the runtime
-    Command(RuntimeCommand),
+    /// Route a message to another agent via the bus
+    Message {
+        to: String,
+        kind: String,
+        content: String,
+    },
+    /// Send a command to the runtime via the bus
+    Command {
+        kind: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// Running agent instance
 pub struct Agent {
     config: AgentConfig,
-    backend: Arc<dyn AgentBackend>,
-    listener: AgentListener,
-    base_path: std::path::PathBuf,
-    command_tx: mpsc::Sender<RuntimeCommand>,
-    registry: Arc<Mutex<SessionRegistry>>,
+    mailbox: Mailbox,
+    session_id: Option<String>,
 }
 
 impl Agent {
-    /// Create a new agent
-    pub async fn new(
-        config: AgentConfig,
-        backend: Arc<dyn AgentBackend>,
-        base_path: &Path,
-        command_tx: mpsc::Sender<RuntimeCommand>,
-        registry: Arc<Mutex<SessionRegistry>>,
-    ) -> Result<Self> {
-        let listener = AgentListener::bind(config.agent_id.clone(), base_path).await?;
-
-        Ok(Self {
+    pub fn new(config: AgentConfig, mailbox: Mailbox) -> Self {
+        Self {
             config,
-            backend,
-            listener,
-            base_path: base_path.to_path_buf(),
-            command_tx,
-            registry,
-        })
-    }
-
-    /// Initialize session and build pending task from config
-    async fn init(&mut self) -> (Option<String>, bool, Option<AgentMessage>) {
-        let title = format!("Orchestrator: {}", self.config.agent_id);
-        let perm_mode = permission_mode_for_role(self.config.agent_id.role);
-        let session_id = self
-            .backend
-            .init_session(
-                &self.config.working_dir,
-                Some(&title),
-                Some(&self.config.system_prompt),
-                Some(perm_mode),
-            )
-            .await
-            .unwrap_or(None);
-        let system_prompt_sent = session_id.is_some();
-        if system_prompt_sent {
-            tracing::info!("Agent {} session pre-created with system prompt", self.config.agent_id);
+            mailbox,
+            session_id: None,
         }
-
-        // Queue initial task to process before accepting socket messages.
-        // This avoids the race where socket injection arrives before init_session completes.
-        let pending = self.config.initial_task.take().map(|task| {
-            AgentMessage::new(
-                self.config.agent_id.clone(),
-                self.config.agent_id.clone(),
-                MessageKind::Info,
-                task,
-            )
-        });
-
-        (session_id, system_prompt_sent, pending)
     }
 
     /// Run the agent main loop
     pub async fn run(mut self) -> Result<()> {
-        tracing::info!("Agent {} starting", self.config.agent_id);
+        tracing::info!("Agent {} started", self.config.agent_id);
 
-        let outgoing_tx = spawn_outgoing_handler(
-            self.config.agent_id.clone(),
-            self.base_path.clone(),
-        );
+        if let Some(task) = self.config.initial_task.take() {
+            tracing::info!("Agent {} processing initial task", self.config.agent_id);
+            self.process_prompt(&task).await?;
+        }
 
-        let title = format!("Orchestrator: {}", self.config.agent_id);
+        while let Some(msg) = self.mailbox.recv().await {
+            tracing::info!(
+                "Agent {} received '{}' from {}",
+                self.config.agent_id,
+                msg.kind,
+                msg.from
+            );
+            let content = extract_content(&msg.payload);
+
+            if let Err(e) = self.process_prompt(&content).await {
+                tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
+                if matches!(
+                    e.downcast_ref::<llm_sdk::Error>(),
+                    Some(llm_sdk::Error::SessionExpired)
+                ) {
+                    tracing::warn!("Session expired, resetting");
+                    self.session_id = None;
+                }
+            }
+        }
+
+        tracing::info!("Agent {} stopped", self.config.agent_id);
+        Ok(())
+    }
+
+    async fn process_prompt(&mut self, content: &str) -> Result<()> {
+        let prompt = self.build_prompt(content);
+        let claude = self.build_claude()?;
+        let output = claude.complete(&prompt).await?;
+
+        if output.session_id.is_some() {
+            self.session_id = output.session_id.clone();
+        }
+        log_completion(&self.config.agent_id, &output);
+        self.dispatch_output(&output.text);
+        Ok(())
+    }
+
+    fn build_prompt(&self, content: &str) -> String {
+        if self.session_id.is_none() {
+            format!("{}\n\n{}", self.config.system_prompt, content)
+        } else {
+            content.to_string()
+        }
+    }
+
+    fn build_claude(&self) -> Result<Claude, llm_sdk::Error> {
         let perm_mode = permission_mode_for_role(self.config.agent_id.role);
-        let (mut session_id, mut system_prompt_sent, mut pending_task) = self.init().await;
+        let mut claude = Claude::new()?;
 
-        // Register session in the watcher registry
-        if let Some(sid) = &session_id {
-            self.registry.lock().unwrap().sessions.insert(sid.clone(), self.config.agent_id.clone());
-        }
+        claude = match &self.session_id {
+            Some(sid) => claude.resume(sid),
+            None => claude.system_prompt(&self.config.system_prompt),
+        };
 
-        loop {
-            let msg = match pending_task.take() {
-                Some(m) => {
-                    tracing::info!("Agent {} processing initial task", self.config.agent_id);
-                    m
-                }
-                None => self.accept_message().await?,
-            };
-
-            let prompt = if system_prompt_sent {
-                format_task_content(&msg)
-            } else {
-                system_prompt_sent = true;
-                format_prompt_for_agent(&msg, &self.config)
-            };
-
-            // Mark session busy before sending (save for idle marking after)
-            let busy_sid = session_id.clone();
-            if let Some(sid) = &busy_sid {
-                self.registry.lock().unwrap().busy.insert(sid.clone());
-            }
-
-            let (mut handle, mut output_rx) = self
-                .backend
-                .spawn(&prompt, &self.config.working_dir, session_id.clone(), Some(&title), Some(perm_mode))
-                .await
-                .context("Failed to spawn backend")?;
-
-            let (new_session_id, message_id) = process_output(
-                &mut output_rx,
-                session_id,
-                &self.config.agent_id,
-                &outgoing_tx,
-                &self.command_tx,
-            )
-            .await;
-
-            session_id = new_session_id;
-
-            // Mark session idle and record processed message
-            if let Some(sid) = &busy_sid {
-                let mut reg = self.registry.lock().unwrap();
-                reg.busy.remove(sid);
-                if let Some(mid) = message_id {
-                    reg.processed.insert(mid);
-                }
-            }
-
-            let _ = handle.wait().await;
-        }
+        Ok(claude
+            .permission_mode(perm_mode)
+            .working_dir(&self.config.working_dir))
     }
 
-    /// Accept and validate an incoming message
-    async fn accept_message(&self) -> Result<AgentMessage> {
-        loop {
-            let (mut conn, creds) = self.listener.accept().await?;
-            tracing::debug!("Agent {} got connection from pid={}", self.config.agent_id, creds.pid);
-
-            match conn.recv().await {
-                Ok(msg) => {
-                    tracing::info!(
-                        "Agent {} received {:?} from {}",
-                        self.config.agent_id, msg.kind, msg.from
-                    );
-                    return Ok(msg);
+    fn dispatch_output(&self, text: &str) {
+        for parsed in parse_agent_output(&self.config.agent_id, text) {
+            match parsed {
+                ParsedOutput::Message { to, kind, content } => {
+                    tracing::info!("{} -> {} ({})", self.config.agent_id, to, kind);
+                    let payload = serde_json::json!({ "content": content });
+                    if let Err(e) = self.mailbox.send(&to, &kind, payload) {
+                        tracing::error!("Failed to send to {}: {}", to, e);
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to receive message: {}", e);
-                    continue;
+                ParsedOutput::Command { kind, payload } => {
+                    tracing::info!("{} -> runtime ({})", self.config.agent_id, kind);
+                    if let Err(e) = self.mailbox.send("runtime", &kind, payload) {
+                        tracing::error!("Failed to send command to runtime: {}", e);
+                    }
                 }
             }
         }
     }
 }
 
-/// Spawn a task that forwards outgoing messages to their target agents
-fn spawn_outgoing_handler(
-    agent_id: AgentId,
-    base_path: std::path::PathBuf,
-) -> mpsc::Sender<AgentMessage> {
-    let (tx, mut rx) = mpsc::channel::<AgentMessage>(64);
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = send_to_agent(&msg, &base_path).await {
-                tracing::error!("Failed to send message to {}: {}", msg.to, e);
-            }
-        }
-        tracing::debug!("Outgoing message handler for {} stopped", agent_id);
-    });
-    tx
-}
-
-/// Process output stream: log text, route parsed messages, capture session_id and message_id
-async fn process_output(
-    output_rx: &mut mpsc::Receiver<AgentOutput>,
-    mut session_id: Option<String>,
-    from_id: &AgentId,
-    outgoing_tx: &mpsc::Sender<AgentMessage>,
-    cmd_tx: &mpsc::Sender<RuntimeCommand>,
-) -> (Option<String>, Option<String>) {
-    let mut message_id = None;
-
-    while let Some(output) = output_rx.recv().await {
-        match &output {
-            AgentOutput::System { session_id: sid @ Some(_) } => {
-                session_id = sid.clone();
-            }
-            AgentOutput::Result { session_id: sid, message_id: mid, .. } => {
-                if sid.is_some() {
-                    session_id = sid.clone();
-                }
-                message_id = mid.clone();
-            }
-            _ => {}
-        }
-        if let Some(text) = output.text() {
-            if !text.is_empty() {
-                tracing::info!("[{}] {}", from_id, text);
-            }
-        }
-        if let AgentOutput::Text(ref text) = output {
-            dispatch_parsed(from_id, text, outgoing_tx, cmd_tx).await;
-        }
-        if output.is_final() {
-            break;
-        }
+fn log_completion(agent_id: &AgentId, output: &llm_sdk::Output) {
+    if let Some(ref usage) = output.usage {
+        tracing::debug!(
+            "Agent {} tokens: in={} out={}",
+            agent_id,
+            usage.input_tokens,
+            usage.output_tokens
+        );
     }
-    (session_id, message_id)
-}
-
-/// Dispatch all parsed outputs from a text block to the appropriate channels
-pub async fn dispatch_parsed(
-    from: &AgentId,
-    text: &str,
-    outgoing_tx: &mpsc::Sender<AgentMessage>,
-    cmd_tx: &mpsc::Sender<RuntimeCommand>,
-) {
-    for parsed in parse_agent_output(from, text) {
-        match parsed {
-            ParsedOutput::Message(msg) => {
-                tracing::info!("{} -> {} ({:?})", from, msg.to, msg.kind);
-                let _ = outgoing_tx.send(msg).await;
-            }
-            ParsedOutput::Command(cmd) => {
-                tracing::info!("{} -> runtime ({:?})", from, cmd);
-                let _ = cmd_tx.send(cmd).await;
-            }
-        }
+    if !output.text.is_empty() {
+        tracing::info!("[{}] {}", agent_id, first_line(&output.text));
     }
 }
 
-/// Format incoming message as a prompt for the AI (includes system prompt)
-fn format_prompt_for_agent(msg: &AgentMessage, config: &AgentConfig) -> String {
-    format!("{}\n\n{}", config.system_prompt, format_task_content(msg))
-}
-
-/// Format just the task content (without system prompt, for subsequent messages)
-fn format_task_content(msg: &AgentMessage) -> String {
-    let context = match msg.kind {
-        MessageKind::TaskAssignment => "NEW TASK",
-        MessageKind::TaskComplete => "TASK COMPLETE",
-        MessageKind::TaskGiveUp => "TASK BLOCKED",
-        MessageKind::Interrupt => "INTERRUPT",
-        MessageKind::ArchitectReview => "ARCHITECT REVIEW",
-        MessageKind::Info => "INFO",
-        MessageKind::Evaluation => "EVALUATION",
-        MessageKind::Observation => "OBSERVATION",
-    };
-
-    format!(
-        "{} from {}: {}\n\nTask ID: {:?}",
-        context, msg.from, msg.content, msg.task_id
-    )
+fn extract_content(payload: &serde_json::Value) -> String {
+    payload
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 // --- Multi-line section-based output parsing ---
 
-/// All recognized output prefixes
 const ALL_PREFIXES: &[&str] = &[
-    "CREW:", "RELIEVE:", "TASK:", "APPROVED:", "REJECTED:",
-    "COMPLETE:", "BLOCKED:", "INTERRUPT:", "EVALUATION:", "OBSERVATION:",
+    "CREW:",
+    "RELIEVE:",
+    "TASK:",
+    "APPROVED:",
+    "REJECTED:",
+    "COMPLETE:",
+    "BLOCKED:",
+    "INTERRUPT:",
+    "EVALUATION:",
+    "OBSERVATION:",
 ];
 
-/// Prefixes whose content is only the remainder of the same line
 const SINGLE_LINE_PREFIXES: &[&str] = &["CREW:", "RELIEVE:"];
 
 /// Message routing table: (prefix, target_role, kind, require_from_role)
-const ROUTES: &[(&str, AgentRole, MessageKind, Option<AgentRole>)] = &[
-    ("TASK:", AgentRole::Architect, MessageKind::TaskAssignment, None),
-    ("REJECTED:", AgentRole::Manager, MessageKind::ArchitectReview, None),
-    ("INTERRUPT:", AgentRole::Developer, MessageKind::Interrupt, Some(AgentRole::Architect)),
+const ROUTES: &[(&str, AgentRole, &str, Option<AgentRole>)] = &[
+    ("TASK:", AgentRole::Architect, "task_assignment", None),
+    ("REJECTED:", AgentRole::Manager, "architect_review", None),
+    (
+        "INTERRUPT:",
+        AgentRole::Developer,
+        "interrupt",
+        Some(AgentRole::Architect),
+    ),
 ];
 
-/// Strip leading markdown bold markers (e.g. "**TASK:" → "TASK:")
 fn strip_markdown_bold(line: &str) -> &str {
     line.strip_prefix("**").unwrap_or(line)
 }
 
-/// Check if a line starts with a recognized prefix (ignoring markdown bold)
 fn recognized_prefix(line: &str) -> Option<&'static str> {
     let clean = strip_markdown_bold(line);
     ALL_PREFIXES.iter().find(|&&p| clean.starts_with(p)).copied()
 }
 
-/// Extract structured sections from multi-line agent output.
-/// Returns (prefix, content) pairs where content includes continuation lines.
 fn extract_sections(text: &str) -> Vec<(&'static str, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut sections = Vec::new();
@@ -330,28 +212,9 @@ fn extract_sections(text: &str) -> Vec<(&'static str, String)> {
     while i < lines.len() {
         let line = lines[i].trim_start();
         if let Some(prefix) = recognized_prefix(line) {
-            let clean = strip_markdown_bold(line);
-            let first = clean[prefix.len()..].trim().trim_end_matches("**");
-
-            if SINGLE_LINE_PREFIXES.contains(&prefix) {
-                sections.push((prefix, first.to_string()));
-                i += 1;
-                continue;
-            }
-
-            // Multi-line: collect until next prefix or end
-            let mut content = first.to_string();
-            i += 1;
-            while i < lines.len() {
-                if recognized_prefix(lines[i].trim_start()).is_some() {
-                    break;
-                }
-                content.push('\n');
-                content.push_str(lines[i]);
-                i += 1;
-            }
-
-            sections.push((prefix, content.trim_end().to_string()));
+            let (content, next_i) = collect_section(&lines, i, prefix);
+            sections.push((prefix, content));
+            i = next_i;
         } else {
             i += 1;
         }
@@ -360,7 +223,25 @@ fn extract_sections(text: &str) -> Vec<(&'static str, String)> {
     sections
 }
 
-/// Parse multi-line agent output into messages and runtime commands
+fn collect_section(lines: &[&str], start: usize, prefix: &str) -> (String, usize) {
+    let clean = strip_markdown_bold(lines[start].trim_start());
+    let first = clean[prefix.len()..].trim().trim_end_matches("**");
+
+    if SINGLE_LINE_PREFIXES.contains(&prefix) {
+        return (first.to_string(), start + 1);
+    }
+
+    let mut content = first.to_string();
+    let mut i = start + 1;
+    while i < lines.len() && recognized_prefix(lines[i].trim_start()).is_none() {
+        content.push('\n');
+        content.push_str(lines[i]);
+        i += 1;
+    }
+
+    (content.trim_end().to_string(), i)
+}
+
 pub fn parse_agent_output(from: &AgentId, text: &str) -> Vec<ParsedOutput> {
     extract_sections(text)
         .into_iter()
@@ -368,101 +249,106 @@ pub fn parse_agent_output(from: &AgentId, text: &str) -> Vec<ParsedOutput> {
         .collect()
 }
 
-/// Parse a single extracted section into a ParsedOutput
 fn parse_section(from: &AgentId, prefix: &str, content: &str) -> Option<ParsedOutput> {
     match prefix {
-        "CREW:" => {
-            if from.role != AgentRole::Manager { return None; }
-            let count: u8 = content.trim().parse().ok()?;
-            Some(ParsedOutput::Command(RuntimeCommand::SetCrewSize { count }))
-        }
-        "RELIEVE:" => {
-            if from.role != AgentRole::Scorer { return None; }
-            Some(ParsedOutput::Command(RuntimeCommand::RelieveManager {
-                reason: content.to_string(),
-            }))
-        }
-        "APPROVED:" => {
-            let target = parse_developer_target(content);
-            Some(ParsedOutput::Message(AgentMessage::new(
-                from.clone(), target, MessageKind::TaskAssignment, content.to_string(),
-            )))
-        }
-        "COMPLETE:" | "BLOCKED:" => parse_completion_section(from, prefix, content),
+        "CREW:" => parse_crew_command(from, content),
+        "RELIEVE:" => parse_relieve_command(from, content),
+        "APPROVED:" => parse_approved_section(content),
+        "COMPLETE:" => parse_completion_message(from, "task_complete", content),
+        "BLOCKED:" => parse_completion_message(from, "task_blocked", content),
         "EVALUATION:" | "OBSERVATION:" => {
-            if from.role == AgentRole::Scorer {
-                tracing::info!("[SCORER {}] {}", prefix.trim_end_matches(':'), first_line(content));
-            }
+            log_scorer_output(from, prefix, content);
             None
         }
         _ => parse_routed_section(from, prefix, content),
     }
 }
 
-/// Parse COMPLETE:/BLOCKED: into a message back to the manager
-fn parse_completion_section(from: &AgentId, prefix: &str, content: &str) -> Option<ParsedOutput> {
-    let (status, kind) = if prefix == "COMPLETE:" {
-        (TaskStatus::Completed, MessageKind::TaskComplete)
-    } else {
-        (TaskStatus::Blocked, MessageKind::TaskGiveUp)
-    };
-    tracing::info!("[TASK {:?}] from {}: {}", status, from, first_line(content));
-    Some(ParsedOutput::Message(AgentMessage::new(
-        from.clone(),
-        AgentId::new_singleton(AgentRole::Manager),
-        kind,
-        content.to_string(),
-    )))
+fn parse_crew_command(from: &AgentId, content: &str) -> Option<ParsedOutput> {
+    if from.role != AgentRole::Manager {
+        return None;
+    }
+    let count: u8 = content.trim().parse().ok()?;
+    Some(ParsedOutput::Command {
+        kind: "set_crew".to_string(),
+        payload: serde_json::json!({ "count": count }),
+    })
 }
 
-/// Route a section via the routing table (TASK:, REJECTED:, INTERRUPT:)
+fn parse_relieve_command(from: &AgentId, content: &str) -> Option<ParsedOutput> {
+    if from.role != AgentRole::Scorer {
+        return None;
+    }
+    Some(ParsedOutput::Command {
+        kind: "relieve_manager".to_string(),
+        payload: serde_json::json!({ "reason": content }),
+    })
+}
+
+fn parse_approved_section(content: &str) -> Option<ParsedOutput> {
+    let target = parse_developer_target(content);
+    Some(ParsedOutput::Message {
+        to: target,
+        kind: "task_assignment".to_string(),
+        content: content.to_string(),
+    })
+}
+
+fn parse_completion_message(from: &AgentId, kind: &str, content: &str) -> Option<ParsedOutput> {
+    tracing::info!("[{}] from {}: {}", kind.to_uppercase(), from, first_line(content));
+    Some(ParsedOutput::Message {
+        to: AgentId::new_singleton(AgentRole::Manager).bus_name(),
+        kind: kind.to_string(),
+        content: content.to_string(),
+    })
+}
+
+fn log_scorer_output(from: &AgentId, prefix: &str, content: &str) {
+    if from.role == AgentRole::Scorer {
+        tracing::info!(
+            "[SCORER {}] {}",
+            prefix.trim_end_matches(':'),
+            first_line(content)
+        );
+    }
+}
+
 fn parse_routed_section(from: &AgentId, prefix: &str, content: &str) -> Option<ParsedOutput> {
     for &(route_prefix, target_role, kind, require_from) in ROUTES {
-        if prefix != route_prefix { continue; }
+        if prefix != route_prefix {
+            continue;
+        }
         if let Some(required) = require_from
             && from.role != required
         {
             continue;
         }
-        return Some(ParsedOutput::Message(AgentMessage::new(
-            from.clone(),
-            AgentId::new_singleton(target_role),
-            kind,
-            content.to_string(),
-        )));
+        return Some(ParsedOutput::Message {
+            to: AgentId::new_singleton(target_role).bus_name(),
+            kind: kind.to_string(),
+            content: content.to_string(),
+        });
     }
     None
 }
 
-/// Extract `developer-N` from text prefix, default to developer-0
-fn parse_developer_target(text: &str) -> AgentId {
+fn parse_developer_target(text: &str) -> String {
     if let Some(rest) = text.strip_prefix("developer-")
         && let Some(digit) = rest.chars().next()
-        && let Some(idx) = digit.to_digit(10)
+        && digit.is_ascii_digit()
     {
-        return AgentId::new_developer(idx as u8);
+        return format!("developer-{}", digit);
     }
-    AgentId::new_developer(0)
+    "developer-0".to_string()
 }
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
-/// Map agent role to permission mode.
-/// Developers auto-accept edits. Others use dontAsk mode which auto-denies
-/// tool uses that aren't pre-approved (read-only tools work without approval).
 fn permission_mode_for_role(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Developer => "acceptEdits",
         AgentRole::Manager | AgentRole::Architect | AgentRole::Scorer => "dontAsk",
     }
-}
-
-/// Send a message to another agent via their socket
-pub async fn send_to_agent(msg: &AgentMessage, base_path: &Path) -> Result<()> {
-    let mut conn = AgentConnection::connect(&msg.to, base_path).await?;
-    conn.send(msg).await?;
-    tracing::info!("Delivered {:?} to {} from {}", msg.kind, msg.to, msg.from);
-    Ok(())
 }
