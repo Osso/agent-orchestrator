@@ -51,6 +51,12 @@ struct ReportParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct GoalCompleteParams {
+    /// Summary of what was accomplished
+    summary: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct MergeRequestParams {
     /// Branch name to merge (e.g. "agent/developer-0")
     branch: String,
@@ -127,6 +133,18 @@ impl OrchestratorMcp {
         };
         match self.client.call("send_message", args).await {
             Ok(_) => "Message sent".to_string(),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    #[tool(description = "Declare the user's goal fully achieved. Triggers orchestrator shutdown. Manager only.")]
+    async fn goal_complete(&self, Parameters(params): Parameters<GoalCompleteParams>) -> String {
+        let args = match serde_json::to_value(&params) {
+            Ok(v) => v,
+            Err(e) => return format!("Error serializing params: {}", e),
+        };
+        match self.client.call("goal_complete", args).await {
+            Ok(_) => "Goal marked complete. Orchestrator shutting down.".to_string(),
             Err(e) => format!("Error: {}", e),
         }
     }

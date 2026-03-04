@@ -10,6 +10,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use llm_sdk::session::SessionStore;
 
+// Re-export test utilities
+mod test_scenario;
+pub use test_scenario::{TestScenario, TestOutcome, AuditFinding, PerformanceMetrics};
+
 /// Test completer that returns pre-configured responses.
 pub struct FakeCompleter {
     responses: Arc<Mutex<VecDeque<Result<llm_sdk::Output, llm_sdk::Error>>>>,
@@ -27,6 +31,19 @@ impl FakeCompleter {
     pub fn with_texts(texts: Vec<&str>) -> Self {
         let responses = texts.into_iter().map(|t| Ok(fake_output(t))).collect();
         Self::new(responses)
+    }
+
+    pub fn with_errors(errors: Vec<llm_sdk::Error>) -> Self {
+        let responses = errors.into_iter().map(|e| Err(e)).collect();
+        Self::new(responses)
+    }
+
+    pub fn with_mixed_responses(responses: Vec<Result<&str, &str>>) -> Self {
+        let results = responses.into_iter().map(|r| match r {
+            Ok(text) => Ok(fake_output(text)),
+            Err(msg) => Err(llm_sdk::Error::Parse(msg.to_string())),
+        }).collect();
+        Self::new(results)
     }
 }
 
@@ -104,4 +121,139 @@ pub async fn test_runtime(
     let rt = OrchestratorRuntime::new_test(bus, "/tmp/test-project", factory, BackendKind::Claude)
         .await?;
     Ok((rt, calls))
+}
+
+/// Test utilities for benchmarking and performance testing
+pub struct TestBench {
+    start_time: std::time::Instant,
+    operations: usize,
+}
+
+impl TestBench {
+    pub fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            operations: 0,
+        }
+    }
+
+    pub fn record_operation(&mut self) {
+        self.operations += 1;
+    }
+
+    pub fn throughput(&self) -> f64 {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            self.operations as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start_time.elapsed()
+    }
+}
+
+impl Default for TestBench {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Helper for creating test agents with specific behaviors
+pub struct TestAgentBuilder {
+    role: AgentRole,
+    index: u8,
+    responses: Vec<String>,
+    initial_task: Option<String>,
+    should_fail: bool,
+}
+
+impl TestAgentBuilder {
+    pub fn new(role: AgentRole) -> Self {
+        Self {
+            role,
+            index: 0,
+            responses: vec!["ok".to_string()],
+            initial_task: None,
+            should_fail: false,
+        }
+    }
+
+    pub fn with_index(mut self, index: u8) -> Self {
+        self.index = index;
+        self
+    }
+
+    pub fn with_responses(mut self, responses: Vec<&str>) -> Self {
+        self.responses = responses.into_iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_initial_task(mut self, task: &str) -> Self {
+        self.initial_task = Some(task.to_string());
+        self
+    }
+
+    pub fn should_fail(mut self, fail: bool) -> Self {
+        self.should_fail = fail;
+        self
+    }
+
+    pub fn build(self, bus: &Bus) -> Result<Agent> {
+        let config = test_config(self.role, self.index, self.initial_task.as_deref());
+        let mailbox = bus.register(&config.agent_id.bus_name()).unwrap();
+        
+        let completer = if self.should_fail {
+            FakeCompleter::with_mixed_responses(vec![
+                Err("simulated failure"),
+                Ok("recovered"),
+            ])
+        } else {
+            FakeCompleter::with_texts(self.responses.iter().map(|s| s.as_str()).collect())
+        };
+
+        Ok(Agent::with_completer(config, mailbox, Box::new(completer)))
+    }
+}
+
+/// Assertion helpers for testing
+pub fn assert_agent_registered(bus: &Bus, agent_name: &str) {
+    let registered = bus.list_registered();
+    assert!(
+        registered.contains(&agent_name.to_string()),
+        "Agent '{}' should be registered. Found: {:?}",
+        agent_name,
+        registered
+    );
+}
+
+pub fn assert_agent_not_registered(bus: &Bus, agent_name: &str) {
+    let registered = bus.list_registered();
+    assert!(
+        !registered.contains(&agent_name.to_string()),
+        "Agent '{}' should not be registered. Found: {:?}",
+        agent_name,
+        registered
+    );
+}
+
+pub fn assert_message_count_gte(counter: &Arc<AtomicUsize>, expected: usize) {
+    let actual = counter.load(Ordering::SeqCst);
+    assert!(
+        actual >= expected,
+        "Expected at least {} messages, got {}",
+        expected,
+        actual
+    );
+}
+
+pub fn assert_elapsed_within(elapsed: std::time::Duration, max: std::time::Duration) {
+    assert!(
+        elapsed <= max,
+        "Operation took {:?}, should be within {:?}",
+        elapsed,
+        max
+    );
 }

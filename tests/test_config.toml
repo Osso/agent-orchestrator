@@ -1,0 +1,87 @@
+# Test Configuration for Agent Orchestrator
+# This file defines settings for different test environments and scenarios
+
+[default]
+timeout_seconds = 10
+max_agents = 5
+log_level = "debug"
+temp_dir = "/tmp/agent-orchestrator-tests"
+
+[unit_tests]
+# Configuration for isolated unit tests
+timeout_seconds = 5
+parallel = true
+quick_fail = true
+
+[integration_tests]
+# Configuration for cross-component integration tests  
+timeout_seconds = 30
+max_agents = 10
+simulate_network_delays = false
+enable_audit_checks = true
+
+[performance_tests]
+# Configuration for load and performance testing
+timeout_seconds = 60
+max_agents = 20
+message_burst_size = 100
+target_throughput = 50.0  # messages per second
+memory_limit_mb = 512
+
+[chaos_tests]
+# Configuration for chaos engineering and failure simulation
+failure_rate = 0.2  # 20% failure rate
+network_partition = false
+random_delays = true
+timeout_seconds = 45
+
+[regression_tests]
+# Configuration for regression testing against known issues
+strict_mode = true
+timeout_seconds = 15
+verify_backwards_compatibility = true
+
+# Test environment configurations
+[environments.ci]
+# Continuous Integration environment
+timeout_seconds = 20
+parallel = true
+coverage_threshold = 0.8
+
+[environments.local]
+# Local development environment
+timeout_seconds = 60
+verbose = true
+save_logs = true
+
+[environments.staging]
+# Staging environment (closer to production)
+timeout_seconds = 120
+max_agents = 50
+realistic_delays = true
+
+# Agent-specific test settings
+[agent_configs.developer]
+max_instances = 3
+response_timeout = 5.0
+simulate_code_review = true
+
+[agent_configs.manager]
+max_instances = 1
+coordination_timeout = 10.0
+crew_size_limits = [1, 5]
+
+[agent_configs.architect]
+max_instances = 1
+design_review_timeout = 8.0
+quality_gates = ["security", "performance", "maintainability"]
+
+[agent_configs.auditor]
+max_instances = 1
+audit_interval = 30.0
+relieve_cooldown = 60.0
+
+[agent_configs.merger]
+max_instances = 1
+merge_timeout = 15.0
+require_approval = true

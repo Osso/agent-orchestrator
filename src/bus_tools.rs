@@ -26,6 +26,9 @@ pub fn bus_tools_for_role(role: AgentRole, mailbox: Arc<Mailbox>) -> llm_sdk::to
             set = set.add(SetCrewTool {
                 mailbox: mailbox.clone(),
             });
+            set = set.add(GoalCompleteTool {
+                mailbox: mailbox.clone(),
+            });
         }
         AgentRole::Auditor => {
             set = set.add(RelieveManagerTool {
@@ -145,6 +148,49 @@ impl ToolDef for SetCrewTool {
         let payload = serde_json::json!({ "count": count });
         match self.mailbox.send("runtime", "set_crew", payload) {
             Ok(_) => "Crew size updated".into(),
+            Err(e) => format!("Send failed: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// goal_complete
+// ---------------------------------------------------------------------------
+
+struct GoalCompleteTool {
+    mailbox: Arc<Mailbox>,
+}
+
+#[async_trait::async_trait]
+impl ToolDef for GoalCompleteTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "goal_complete".into(),
+            description: "Declare the user's goal fully achieved. Triggers orchestrator shutdown. \
+                Manager only."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string", "description": "Summary of what was accomplished" }
+                },
+                "required": ["summary"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: &str) -> String {
+        let args: serde_json::Value = match serde_json::from_str(arguments) {
+            Ok(v) => v,
+            Err(e) => return format!("Invalid arguments: {e}"),
+        };
+        let summary = args["summary"].as_str().unwrap_or("Goal complete");
+        let payload = serde_json::json!({ "summary": summary });
+        match self.mailbox.send("runtime", "goal_complete", payload) {
+            Ok(_) => {
+                tracing::info!("bus_tool goal_complete: {}", summary);
+                "Goal marked complete. Orchestrator shutting down.".into()
+            }
             Err(e) => format!("Send failed: {e}"),
         }
     }

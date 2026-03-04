@@ -183,7 +183,10 @@ impl OrchestratorRuntime {
                 msg = mailbox.recv() => {
                     match msg {
                         Some(msg) => {
-                            self.handle_message(&msg.kind, &msg.payload, &msg.from).await;
+                            let should_exit = self.handle_message(&msg.kind, &msg.payload, &msg.from).await;
+                            if should_exit {
+                                break;
+                            }
                             if msg.kind == "task_complete" || msg.kind == "task_blocked" {
                                 self.notify_manager_task_state(mailbox).await;
                             }
@@ -259,9 +262,20 @@ impl OrchestratorRuntime {
         snap
     }
 
-    pub async fn handle_message(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
+    /// Returns true if the orchestrator should shut down (goal_complete).
+    pub async fn handle_message(
+        &mut self,
+        kind: &str,
+        payload: &serde_json::Value,
+        from: &str,
+    ) -> bool {
         tracing::info!("Runtime received '{}' from {}", kind, from);
         match kind {
+            "goal_complete" => {
+                let summary = payload_str(payload, "summary");
+                tracing::info!("GOAL COMPLETE: {}", summary);
+                return true;
+            }
             "set_crew" => {
                 let count = payload_u8(payload, "count", 1);
                 self.handle_crew_size(count);
@@ -274,6 +288,7 @@ impl OrchestratorRuntime {
             "task_blocked" => self.record_task_event(from, payload).await,
             _ => tracing::debug!("Runtime ignoring unknown kind: {}", kind),
         }
+        false
     }
 
     async fn record_task_event(&self, from: &str, payload: &serde_json::Value) {

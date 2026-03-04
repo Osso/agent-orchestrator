@@ -264,12 +264,12 @@ fn disallowed_tools_blocks_file_and_bash_for_non_devs() {
 }
 
 #[test]
-fn bus_tools_manager_gets_send_message_and_set_crew() {
+fn bus_tools_manager_gets_send_message_set_crew_and_goal_complete() {
     let bus = Bus::new();
     let mailbox = std::sync::Arc::new(bus.register("test-mgr").unwrap());
     let set = bus_tools_for_role(AgentRole::Manager, mailbox);
     let names = tool_names(&set);
-    assert_eq!(names, vec!["send_message", "set_crew"]);
+    assert_eq!(names, vec!["goal_complete", "send_message", "set_crew"]);
 }
 
 #[test]

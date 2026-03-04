@@ -101,6 +101,8 @@ pub struct Agent {
     mailbox: Mailbox,
     completer: Box<dyn Completer>,
     fresh_ctx: Option<FreshCtx>,
+    /// Last task_assignment content received (for completion verification).
+    last_task: Option<String>,
 }
 
 impl Agent {
@@ -112,6 +114,7 @@ impl Agent {
             mailbox,
             completer,
             fresh_ctx,
+            last_task: None,
         })
     }
 
@@ -126,6 +129,7 @@ impl Agent {
             mailbox,
             completer,
             fresh_ctx: None,
+            last_task: None,
         }
     }
 
@@ -133,10 +137,7 @@ impl Agent {
     pub async fn run(mut self) -> Result<()> {
         tracing::info!("Agent {} started", self.config.agent_id);
 
-        if let Some(task) = self.config.initial_task.take() {
-            tracing::info!("Agent {} processing initial task", self.config.agent_id);
-            let _ = self.process_prompt(&task).await;
-        }
+        self.process_initial_task().await;
 
         while let Some(msg) = self.mailbox.recv().await {
             tracing::info!(
@@ -149,6 +150,7 @@ impl Agent {
             let is_task = msg.kind == "task_assignment";
             if is_task {
                 self.reset_completer_for_task();
+                self.last_task = Some(extract_content(&msg.payload));
             }
 
             let content = extract_content(&msg.payload);
@@ -169,6 +171,21 @@ impl Agent {
 
         tracing::info!("Agent {} stopped", self.config.agent_id);
         Ok(())
+    }
+
+    async fn process_initial_task(&mut self) {
+        let Some(task) = self.config.initial_task.take() else {
+            return;
+        };
+        tracing::info!("Agent {} processing initial task", self.config.agent_id);
+        self.last_task = Some(task.clone());
+        match self.process_prompt(&task).await {
+            Ok(output) => self.auto_report_completion(&output.text),
+            Err(e) => {
+                tracing::error!("Agent {} initial task failed: {}", self.config.agent_id, e);
+                self.auto_report_blocked(&e.to_string());
+            }
+        }
     }
 
     fn reset_completer_for_task(&mut self) {
@@ -196,18 +213,29 @@ impl Agent {
         tracing::info!("Agent {} fresh completer for task", self.config.agent_id);
     }
 
-    /// Auto-send task_complete to manager if the developer didn't do it via tool.
+    /// Route completion through architect for verification.
     fn auto_report_completion(&self, text: &str) {
-        let summary = if text.is_empty() {
-            "Task completed".to_string()
+        let output = if text.is_empty() {
+            "Task completed (no output)".to_string()
         } else {
-            first_line(text).to_string()
+            truncate(text, 2000)
         };
-        let payload = serde_json::json!({ "content": summary });
-        if let Err(e) = self.mailbox.send("manager", "task_complete", payload.clone()) {
-            tracing::warn!("Auto task_complete send failed: {}", e);
+        let task_desc = self.last_task.as_deref().unwrap_or("unknown task");
+        let developer = self.config.agent_id.bus_name();
+        let content = format!(
+            "## Verify Completion\n\n\
+             **Developer:** {developer}\n\n\
+             **Original task:**\n{task_desc}\n\n\
+             **Developer output:**\n{output}"
+        );
+        let payload = serde_json::json!({ "content": content });
+        if let Err(e) = self.mailbox.send("architect", "verify_completion", payload.clone()) {
+            tracing::warn!("verify_completion send to architect failed, falling back to manager: {}", e);
+            let _ = self.mailbox.send("manager", "task_complete", payload);
         }
-        let _ = self.mailbox.send("runtime", "task_complete", payload);
+        // Still notify runtime for DB recording
+        let summary_payload = serde_json::json!({ "content": first_line(text) });
+        let _ = self.mailbox.send("runtime", "task_complete", summary_payload);
     }
 
     /// Auto-send task_blocked to manager on completion failure.
@@ -331,15 +359,26 @@ fn log_completion(agent_id: &AgentId, output: &llm_sdk::Output) {
 }
 
 fn extract_content(payload: &serde_json::Value) -> String {
-    payload
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string()
+    // Prefer "content" field, fall back to full JSON (for merge_request etc.)
+    if let Some(content) = payload.get("content").and_then(|c| c.as_str()) {
+        if !content.is_empty() {
+            return content.to_string();
+        }
+    }
+    serde_json::to_string_pretty(payload).unwrap_or_default()
 }
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{}...(truncated)", truncated)
+    }
 }
 
 pub fn permission_mode_for_role(role: AgentRole) -> &'static str {

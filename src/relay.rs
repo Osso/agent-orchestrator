@@ -32,8 +32,16 @@ pub struct RelayResponse {
 }
 
 /// Returns the canonical path for the relay Unix socket.
+/// Uses ~/.claude/orchestrator/ so the socket is visible inside bwrap sandboxes
+/// (which bind-mount ~/.claude writable but overlay /tmp with tmpfs).
 pub fn relay_socket_path() -> PathBuf {
-    PathBuf::from("/tmp/claude/orchestrator/relay.sock")
+    home_dir().join(".claude/orchestrator/relay.sock")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
 pub struct RelayServer {
@@ -132,6 +140,7 @@ fn handle_tool_call(mailbox: &Mailbox, agent_name: &str, req: &RelayRequest) -> 
     let result = match req.tool.as_str() {
         "send_message" => handle_send_message(mailbox, agent_name, &req.args),
         "set_crew" => handle_set_crew(mailbox, agent_name, &req.args),
+        "goal_complete" => handle_goal_complete(mailbox, agent_name, &req.args),
         "relieve_manager" => handle_relieve_manager(mailbox, agent_name, &req.args),
         "report" => handle_report(mailbox, agent_name, &req.args),
         "merge_request" => handle_merge_request(mailbox, agent_name, &req.args),
@@ -198,6 +207,27 @@ fn handle_set_crew(
 
     mailbox
         .send("runtime", "set_crew", payload)
+        .map(|_| serde_json::json!({"ok": true}))
+        .map_err(|e| format!("send failed: {}", e))
+}
+
+fn handle_goal_complete(
+    mailbox: &Mailbox,
+    agent_name: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if role_from_agent_name(agent_name) != Some(AgentRole::Manager) {
+        return Err(format!(
+            "'{}' is not allowed to declare goal complete",
+            agent_name
+        ));
+    }
+
+    let summary = args["summary"].as_str().ok_or("missing 'summary'")?;
+    let payload = serde_json::json!({ "summary": summary, "from_agent": agent_name });
+
+    mailbox
+        .send("runtime", "goal_complete", payload)
         .map(|_| serde_json::json!({"ok": true}))
         .map_err(|e| format!("send failed: {}", e))
 }

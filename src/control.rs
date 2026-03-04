@@ -4,7 +4,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-const CONTROL_SOCKET: &str = "/tmp/claude/orchestrator/control.sock";
+/// Returns the path for the control Unix socket.
+/// Uses ~/.claude/orchestrator/ so it's accessible inside bwrap sandboxes.
+fn control_socket_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    home.join(".claude/orchestrator/control.sock")
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ControlRequest {
@@ -33,14 +40,15 @@ pub async fn run_control_server(
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let server = match Server::bind(CONTROL_SOCKET) {
+    let socket_path = control_socket_path();
+    let server = match Server::bind(&socket_path) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to bind control socket: {e}");
             return;
         }
     };
-    info!("Control socket listening on {CONTROL_SOCKET}");
+    info!("Control socket listening on {}", socket_path.display());
 
     loop {
         tokio::select! {

@@ -50,6 +50,15 @@ async fn cmd_run(args: &[String], opts: &Opts) -> Result<()> {
     }
     let working_dir = &args[2];
     let task = args[3..].join(" ");
+
+    // Fresh start for each run — clean DB and sessions from previous goals
+    let db_path = opts
+        .db_path
+        .clone()
+        .unwrap_or_else(|| db_path_for_project(working_dir));
+    let _ = std::fs::remove_file(&db_path);
+    clean_sessions(working_dir);
+
     run_orchestrator(working_dir, Some(task), opts).await
 }
 
@@ -181,6 +190,22 @@ async fn run_orchestrator(working_dir: &str, task: Option<String>, opts: &Opts) 
         OrchestratorRuntime::new(&db_path, working_dir.to_string(), backend, opts.no_sandbox)
             .await?;
     runtime.run(task).await
+}
+
+/// Remove session store for a project so agents start fresh.
+fn clean_sessions(working_dir: &str) {
+    let project = std::path::Path::new(working_dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    // Match llm-sdk's SessionStore::new which uses dirs::data_dir()
+    let base = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".local/share"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let session_dir = base.join("agent-orchestrator").join(project);
+    if session_dir.exists() {
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
 }
 
 fn send_message(to: &str, content: &str) -> Result<()> {

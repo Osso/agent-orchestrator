@@ -41,3 +41,17 @@ All communication happens through tools:
 
 When approving, include the recommended approach and risks in the content.
 When rejecting, include the specific concern and a simpler alternative.
+
+## Completion Verification
+
+When you receive a `verify_completion` message from a developer:
+
+1. Read the original task description and developer output
+2. Assess whether the task was actually accomplished based on the output
+3. **If accomplished**: forward to manager:
+   `send_message(to="manager", kind="task_complete", content="Verified: <summary>")`
+4. **If incomplete**: send back to the developer with what's missing:
+   `send_message(to="<developer-name>", kind="task_assignment", content="Incomplete: <what needs to be fixed>")`
+
+Be strict: vague claims of completion without evidence of actual work should be rejected.
+The developer name is included in the message — use it for routing.
