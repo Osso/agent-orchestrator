@@ -370,6 +370,11 @@ impl OrchestratorRuntime {
             BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
         };
+        let project_dir = if role == AgentRole::Merger {
+            Some(PathBuf::from(&self.working_dir))
+        } else {
+            None
+        };
         let config = AgentConfig {
             agent_id,
             working_dir,
@@ -381,6 +386,7 @@ impl OrchestratorRuntime {
             session_store: self.session_store.clone(),
             bus,
             sandbox_prefix,
+            project_dir,
         };
         self.spawn_agent_with_config(config)
     }
@@ -524,6 +530,7 @@ impl OrchestratorRuntime {
             session_store: self.session_store.clone(),
             bus,
             sandbox_prefix,
+            project_dir: None,
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);

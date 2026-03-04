@@ -91,6 +91,7 @@ pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> Ag
         session_store: test_session_store(),
         bus: None,
         sandbox_prefix: Vec::new(),
+        project_dir: None,
     }
 }
 
