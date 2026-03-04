@@ -24,11 +24,14 @@ use crate::types::{AgentId, AgentRole};
 use crate::worktree::{self, WorktreeConfig};
 
 pub const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
+pub const NUDGE_INTERVAL: Duration = Duration::from_secs(120);
+pub const NUDGE_IDLE_THRESHOLD: Duration = Duration::from_secs(90);
 
 pub struct RuntimeState {
     pub developer_count: u8,
     pub manager_generation: u32,
     pub last_relieve: Option<Instant>,
+    pub last_activity: Instant,
 }
 
 /// Factory function that creates an Agent from config + mailbox.
@@ -74,6 +77,7 @@ impl OrchestratorRuntime {
                 developer_count: 1,
                 manager_generation: 0,
                 last_relieve: None,
+                last_activity: Instant::now(),
             },
             bus: Bus::new(),
             db,
@@ -113,6 +117,7 @@ impl OrchestratorRuntime {
                 developer_count: 1,
                 manager_generation: 0,
                 last_relieve: None,
+                last_activity: Instant::now(),
             },
             bus,
             db,
@@ -163,6 +168,23 @@ impl OrchestratorRuntime {
         tokio::spawn(control::run_control_server(bus, project, shutdown_tx, shutdown_rx));
     }
 
+    /// Process a single bus message. Returns true if the orchestrator should exit.
+    async fn process_bus_message(
+        &mut self,
+        msg: Option<agent_bus::BusMessage>,
+        mailbox: &Mailbox,
+    ) -> Option<bool> {
+        let msg = msg?;
+        self.state.last_activity = Instant::now();
+        let should_exit = self
+            .handle_message(&msg.kind, &msg.payload, &msg.from)
+            .await;
+        if msg.kind == "task_complete" || msg.kind == "task_blocked" {
+            self.notify_manager_task_state(mailbox).await;
+        }
+        Some(should_exit)
+    }
+
     async fn command_loop(
         &mut self,
         mailbox: &mut agent_bus::Mailbox,
@@ -172,39 +194,28 @@ impl OrchestratorRuntime {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
         let mut audit_timer = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(60),
             Duration::from_secs(600),
+        );
+        let mut nudge_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + NUDGE_INTERVAL,
+            NUDGE_INTERVAL,
         );
 
         loop {
             tokio::select! {
                 msg = mailbox.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            let should_exit = self.handle_message(&msg.kind, &msg.payload, &msg.from).await;
-                            if should_exit {
-                                break;
-                            }
-                            if msg.kind == "task_complete" || msg.kind == "task_blocked" {
-                                self.notify_manager_task_state(mailbox).await;
-                            }
-                        }
+                    match self.process_bus_message(msg, mailbox).await {
+                        Some(true) => break,
                         None => break,
+                        _ => {}
                     }
                 }
-                _ = audit_timer.tick() => {
-                    self.send_audit_snapshot(mailbox).await;
-                }
-                _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT, shutting down");
-                    break;
-                }
-                _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM, shutting down");
-                    break;
-                }
+                _ = nudge_timer.tick() => self.maybe_nudge_manager(mailbox).await,
+                _ = audit_timer.tick() => self.send_audit_snapshot(mailbox).await,
+                _ = sigint.recv() => { tracing::info!("Received SIGINT, shutting down"); break; }
+                _ = sigterm.recv() => { tracing::info!("Received SIGTERM, shutting down"); break; }
             }
         }
 
@@ -236,6 +247,28 @@ impl OrchestratorRuntime {
         let payload = serde_json::json!({ "content": snapshot });
         if let Err(e) = mailbox.send("auditor", "patrol_snapshot", payload) {
             tracing::warn!("Failed to send audit snapshot: {}", e);
+        }
+    }
+
+    async fn maybe_nudge_manager(&self, mailbox: &Mailbox) {
+        if self.state.last_activity.elapsed() < NUDGE_IDLE_THRESHOLD {
+            return;
+        }
+        let has_tasks = matches!(self.db.list_tasks(None, None).await, Ok(t) if !t.is_empty());
+        if !has_tasks {
+            return;
+        }
+        let snapshot = self.build_task_snapshot().await;
+        let idle_secs = self.state.last_activity.elapsed().as_secs();
+        let payload = serde_json::json!({
+            "content": format!(
+                "NUDGE: No activity for {}s. Tasks exist but none are being processed.\n\n{}",
+                idle_secs, snapshot
+            )
+        });
+        tracing::info!("Nudging manager (idle {}s with pending tasks)", idle_secs);
+        if let Err(e) = mailbox.send("manager", "nudge", payload) {
+            tracing::debug!("Failed to nudge manager: {}", e);
         }
     }
 
@@ -360,34 +393,27 @@ impl OrchestratorRuntime {
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
-        if matches!(role, AgentRole::Developer | AgentRole::Merger) {
+        let worktree_result = if matches!(role, AgentRole::Developer | AgentRole::Merger) {
             let cfg = WorktreeConfig {
                 project_dir: project_path.clone(),
                 agent_name: bus_name.to_string(),
             };
             match worktree::create_worktree(&cfg) {
-                Ok(wt_path) => {
-                    let prefix = if use_sandbox {
-                        llm_sdk::sandbox::developer_prefix(&wt_path, &project_path)
-                    } else {
-                        Vec::new()
-                    };
-                    return (wt_path.to_string_lossy().into_owned(), prefix);
+                Ok(wt_path) => Ok(wt_path),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create worktree for {}, using project dir: {}",
+                        bus_name,
+                        e
+                    );
+                    Err(e)
                 }
-                Err(e) => tracing::warn!(
-                    "Failed to create worktree for {}, using project dir: {}",
-                    bus_name,
-                    e
-                ),
             }
-        }
-
-        let prefix = if use_sandbox {
-            llm_sdk::sandbox::readonly_prefix()
         } else {
-            Vec::new()
+            Err(anyhow::anyhow!("not a developer role"))
         };
-        (self.working_dir.clone(), prefix)
+
+        resolve_sandbox(role, &project_path, worktree_result, use_sandbox)
     }
 
     fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
@@ -479,9 +505,17 @@ impl OrchestratorRuntime {
             BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
         };
+        let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
+        let project_path = PathBuf::from(&self.working_dir);
+        let (working_dir, sandbox_prefix) = if use_sandbox {
+            let prefix = llm_sdk::sandbox::readonly_prefix(&project_path);
+            (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix)
+        } else {
+            (self.working_dir.clone(), Vec::new())
+        };
         let config = AgentConfig {
             agent_id: AgentId::new_singleton(AgentRole::Manager),
-            working_dir: self.working_dir.clone(),
+            working_dir,
             system_prompt: prompt,
             initial_task: None,
             mcp_config: Some(build_mcp_config("manager")),
@@ -489,11 +523,7 @@ impl OrchestratorRuntime {
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
             bus,
-            sandbox_prefix: if !self.no_sandbox && llm_sdk::sandbox::is_available() {
-                llm_sdk::sandbox::readonly_prefix()
-            } else {
-                Vec::new()
-            },
+            sandbox_prefix,
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);
@@ -544,6 +574,36 @@ impl OrchestratorRuntime {
         }
 
         b
+    }
+}
+
+/// Determine working directory and sandbox prefix for an agent.
+///
+/// Developer/Merger agents always get a writable sandbox — either the worktree
+/// (if creation succeeded) or the project directory as fallback.
+/// Non-developer agents get a read-only sandbox.
+pub fn resolve_sandbox(
+    role: AgentRole,
+    project_path: &Path,
+    worktree_result: Result<PathBuf>,
+    use_sandbox: bool,
+) -> (String, Vec<String>) {
+    let is_dev = matches!(role, AgentRole::Developer | AgentRole::Merger);
+
+    if is_dev {
+        let dev_path = worktree_result.unwrap_or_else(|_| project_path.to_path_buf());
+        if use_sandbox {
+            let prefix = llm_sdk::sandbox::developer_prefix(&dev_path);
+            return (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix);
+        }
+        return (dev_path.to_string_lossy().into_owned(), Vec::new());
+    }
+
+    if use_sandbox {
+        let prefix = llm_sdk::sandbox::readonly_prefix(project_path);
+        (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix)
+    } else {
+        (project_path.to_string_lossy().into_owned(), Vec::new())
     }
 }
 

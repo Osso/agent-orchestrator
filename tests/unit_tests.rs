@@ -7,6 +7,7 @@ use std::time::Duration;
 use agent_bus::Bus;
 use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools};
 use agent_orchestrator::bus_tools::bus_tools_for_role;
+use agent_orchestrator::runtime::resolve_sandbox;
 use agent_orchestrator::types::{AgentId, AgentRole};
 use support::{test_config, TestAgentBuilder, TestBench, assert_agent_registered};
 
@@ -263,8 +264,131 @@ fn singleton_role_characteristics() {
 #[test]
 fn merger_role_characteristics() {
     assert!(role_has_tools(AgentRole::Merger));
-    
+
     let config = test_config(AgentRole::Merger, 0, None);
     assert_eq!(config.agent_id.bus_name(), "merger");
     assert_eq!(config.agent_id.index, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox Resolution Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn developer_gets_writable_sandbox_when_worktree_fails() {
+    use std::path::PathBuf;
+
+    let project = PathBuf::from("/tmp/test-project");
+    let worktree_result: Result<PathBuf, anyhow::Error> =
+        Err(anyhow::anyhow!("git worktree add failed"));
+
+    let (working_dir, prefix) =
+        resolve_sandbox(AgentRole::Developer, &project, worktree_result, true);
+
+    // Developer must get writable sandbox even when worktree fails
+    assert_eq!(working_dir, llm_sdk::sandbox::REPO_MOUNT);
+    // Must use developer_prefix (--bind), not readonly_prefix (--ro-bind)
+    // Check that /tmp/test-project is mounted writable (--bind), not read-only
+    let bind_positions: Vec<usize> = prefix
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == "--bind")
+        .map(|(i, _)| i)
+        .collect();
+    let project_bound = bind_positions
+        .iter()
+        .any(|&i| prefix.get(i + 1).map(|s| s.as_str()) == Some("/tmp/test-project"));
+    assert!(
+        project_bound,
+        "Project dir should be --bind (writable), not --ro-bind. Got: {:?}",
+        prefix
+    );
+}
+
+#[test]
+fn developer_gets_worktree_sandbox_when_worktree_succeeds() {
+    use std::path::PathBuf;
+
+    let project = PathBuf::from("/tmp/test-project");
+    let worktree_path = PathBuf::from("/tmp/test-project/.worktrees/developer-0");
+    let worktree_result: Result<PathBuf, anyhow::Error> = Ok(worktree_path);
+
+    let (working_dir, prefix) =
+        resolve_sandbox(AgentRole::Developer, &project, worktree_result, true);
+
+    assert_eq!(working_dir, llm_sdk::sandbox::REPO_MOUNT);
+    // Worktree path should be bound writable
+    let bind_positions: Vec<usize> = prefix
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == "--bind")
+        .map(|(i, _)| i)
+        .collect();
+    let worktree_bound = bind_positions.iter().any(|&i| {
+        prefix.get(i + 1).map(|s| s.as_str())
+            == Some("/tmp/test-project/.worktrees/developer-0")
+    });
+    assert!(
+        worktree_bound,
+        "Worktree should be --bind (writable). Got: {:?}",
+        prefix
+    );
+}
+
+#[test]
+fn non_developer_gets_readonly_sandbox() {
+    use std::path::PathBuf;
+
+    let project = PathBuf::from("/tmp/test-project");
+
+    let (working_dir, prefix) =
+        resolve_sandbox(AgentRole::Manager, &project, Err(anyhow::anyhow!("n/a")), true);
+
+    assert_eq!(working_dir, llm_sdk::sandbox::REPO_MOUNT);
+    // Project should be --ro-bind (read-only)
+    let ro_bind_positions: Vec<usize> = prefix
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == "--ro-bind")
+        .map(|(i, _)| i)
+        .collect();
+    let project_ro = ro_bind_positions
+        .iter()
+        .any(|&i| prefix.get(i + 1).map(|s| s.as_str()) == Some("/tmp/test-project"));
+    assert!(
+        project_ro,
+        "Non-developer project dir should be --ro-bind. Got: {:?}",
+        prefix
+    );
+}
+
+#[test]
+fn developer_no_sandbox_uses_worktree_path() {
+    use std::path::PathBuf;
+
+    let project = PathBuf::from("/tmp/test-project");
+    let worktree_path = PathBuf::from("/tmp/test-project/.worktrees/developer-0");
+
+    let (working_dir, prefix) =
+        resolve_sandbox(AgentRole::Developer, &project, Ok(worktree_path), false);
+
+    assert_eq!(working_dir, "/tmp/test-project/.worktrees/developer-0");
+    assert!(prefix.is_empty(), "No sandbox prefix without sandbox");
+}
+
+#[test]
+fn developer_no_sandbox_worktree_fails_uses_project_dir() {
+    use std::path::PathBuf;
+
+    let project = PathBuf::from("/tmp/test-project");
+
+    let (working_dir, prefix) = resolve_sandbox(
+        AgentRole::Developer,
+        &project,
+        Err(anyhow::anyhow!("worktree failed")),
+        false,
+    );
+
+    assert_eq!(working_dir, "/tmp/test-project");
+    assert!(prefix.is_empty(), "No sandbox prefix without sandbox");
 }
