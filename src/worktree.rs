@@ -24,6 +24,7 @@ impl WorktreeConfig {
 }
 
 pub fn create_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
+    ensure_git_repo(&cfg.project_dir)?;
     ensure_head_exists(&cfg.project_dir)?;
     prune_stale_worktrees(&cfg.project_dir);
     let path = cfg.path();
@@ -53,6 +54,27 @@ fn prune_stale_worktrees(project_dir: &std::path::Path) {
         .args(["worktree", "prune"])
         .current_dir(project_dir)
         .status();
+}
+
+/// Initialize a git repo if the project directory isn't one.
+fn ensure_git_repo(project_dir: &std::path::Path) -> Result<()> {
+    let status = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("failed to run git rev-parse")?;
+    if status.success() {
+        return Ok(());
+    }
+    tracing::info!("Initializing git repo in {}", project_dir.display());
+    Command::new("git")
+        .args(["init"])
+        .current_dir(project_dir)
+        .status()
+        .context("failed to run git init")?;
+    Ok(())
 }
 
 /// Create an initial empty commit if the repo has no commits yet.
