@@ -370,11 +370,6 @@ impl OrchestratorRuntime {
             BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
         };
-        let project_dir = if role == AgentRole::Merger {
-            Some(PathBuf::from(&self.working_dir))
-        } else {
-            None
-        };
         let config = AgentConfig {
             agent_id,
             working_dir,
@@ -386,7 +381,6 @@ impl OrchestratorRuntime {
             session_store: self.session_store.clone(),
             bus,
             sandbox_prefix,
-            project_dir,
         };
         self.spawn_agent_with_config(config)
     }
@@ -399,7 +393,7 @@ impl OrchestratorRuntime {
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
-        let worktree_result = if matches!(role, AgentRole::Developer | AgentRole::Merger) {
+        let worktree_result = if matches!(role, AgentRole::Developer) {
             let cfg = WorktreeConfig {
                 project_dir: project_path.clone(),
                 agent_name: bus_name.to_string(),
@@ -530,7 +524,6 @@ impl OrchestratorRuntime {
             session_store: self.session_store.clone(),
             bus,
             sandbox_prefix,
-            project_dir: None,
         };
         if let Err(e) = self.spawn_agent_with_config(config) {
             tracing::error!("Failed to spawn replacement manager: {}", e);
@@ -651,5 +644,5 @@ fn first_line(text: &str) -> &str {
 }
 
 fn is_worktree_role(bus_name: &str) -> bool {
-    bus_name.starts_with("developer-") || bus_name == "merger"
+    bus_name.starts_with("developer-")
 }

@@ -5,7 +5,6 @@
 //! 2. Waits for messages from other agents
 //! 3. Calls llm-sdk to get a completion (with MCP tools for outbound communication)
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_bus::{Bus, Mailbox};
@@ -15,7 +14,6 @@ use llm_sdk::claude::Claude;
 use llm_sdk::session::{Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
-use crate::worktree;
 
 /// Tools blocked for non-developer agents (managers, architects, auditors).
 const DISALLOWED_TOOLS: &[&str] = &[
@@ -95,8 +93,6 @@ pub struct AgentConfig {
     pub bus: Option<Bus>,
     /// Bwrap command prefix for sandboxing (empty = no sandbox).
     pub sandbox_prefix: Vec<String>,
-    /// Main project directory (for merger agent to run git operations).
-    pub project_dir: Option<PathBuf>,
 }
 
 /// Running agent instance
@@ -151,14 +147,6 @@ impl Agent {
                 msg.from
             );
 
-            // Merger: handle merge_request programmatically (no LLM needed)
-            if msg.kind == "merge_request"
-                && self.config.agent_id.role == AgentRole::Merger
-            {
-                self.handle_merge_request(&msg.payload);
-                continue;
-            }
-
             let is_task = msg.kind == "task_assignment";
             if is_task {
                 self.reset_completer_for_task();
@@ -197,57 +185,6 @@ impl Agent {
                 tracing::error!("Agent {} initial task failed: {}", self.config.agent_id, e);
                 self.auto_report_blocked(&e.to_string());
             }
-        }
-    }
-
-    fn handle_merge_request(&self, payload: &serde_json::Value) {
-        let branch = payload["branch"].as_str().unwrap_or("");
-        let from = payload["from_developer"].as_str().unwrap_or("");
-        let description = payload["description"].as_str().unwrap_or("");
-
-        if branch.is_empty() || from.is_empty() {
-            tracing::error!("merge_request missing branch or from_developer");
-            if !from.is_empty() {
-                self.send_merge_result(from, branch, false, "missing branch in payload");
-            }
-            return;
-        }
-
-        let project_dir = match &self.config.project_dir {
-            Some(p) => p,
-            None => {
-                tracing::error!("merger has no project_dir configured");
-                self.send_merge_result(from, branch, false, "merger misconfigured: no project_dir");
-                return;
-            }
-        };
-
-        tracing::info!("Merging branch {} from {} ({})", branch, from, description);
-        match worktree::merge_branch(project_dir, branch) {
-            worktree::MergeResult::Success => {
-                tracing::info!("Merge succeeded: {} -> master", branch);
-                self.send_merge_result(from, branch, true, description);
-            }
-            worktree::MergeResult::Conflict(reason) => {
-                tracing::warn!("Merge failed for {}: {}", branch, reason);
-                self.send_merge_result(from, branch, false, &reason);
-            }
-        }
-    }
-
-    fn send_merge_result(&self, developer: &str, branch: &str, success: bool, detail: &str) {
-        let (kind, content) = if success {
-            ("merge_success", format!("Merged {branch} into master: {detail}"))
-        } else {
-            ("merge_failed", format!("Merge of {branch} failed: {detail}"))
-        };
-        let payload = serde_json::json!({ "content": content });
-        if let Err(e) = self.mailbox.send(developer, kind, payload.clone()) {
-            tracing::error!("Failed to send {kind} to {developer}: {e}");
-        }
-        // Notify manager too
-        if let Err(e) = self.mailbox.send("manager", kind, payload) {
-            tracing::debug!("Failed to send {kind} to manager: {e}");
         }
     }
 
