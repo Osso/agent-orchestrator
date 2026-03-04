@@ -1,4 +1,5 @@
 use agent_orchestrator::agent::BackendKind;
+use agent_orchestrator::control;
 use agent_orchestrator::relay;
 use agent_orchestrator::runtime::OrchestratorRuntime;
 
@@ -209,11 +210,17 @@ fn clean_sessions(working_dir: &str) {
 }
 
 fn send_message(to: &str, content: &str) -> Result<()> {
-    bail!(
-        "Cannot send to '{}': the bus is in-process. \
-         Use 'run' or 'orchestrate' to start agents with a task.\n\
-         Message was: {}",
-        to,
-        content
-    );
+    use control::{ControlRequest, ControlResponse};
+    let socket = control::control_socket_path();
+    let request = ControlRequest::SendMessage {
+        to: to.to_string(),
+        content: content.to_string(),
+    };
+    let response: ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
+    match response {
+        ControlResponse::Ok => println!("Sent to {to}"),
+        ControlResponse::Error { message } => bail!("Error: {message}"),
+        _ => {}
+    }
+    Ok(())
 }

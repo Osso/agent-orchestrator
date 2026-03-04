@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 /// Returns the path for the control Unix socket.
 /// Uses ~/.claude/orchestrator/ so it's accessible inside bwrap sandboxes.
-fn control_socket_path() -> std::path::PathBuf {
+pub fn control_socket_path() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));

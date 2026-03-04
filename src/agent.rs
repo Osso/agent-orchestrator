@@ -136,48 +136,42 @@ impl Agent {
     /// Run the agent main loop
     pub async fn run(mut self) -> Result<()> {
         tracing::info!("Agent {} started", self.config.agent_id);
-
         self.process_initial_task().await;
-
         while let Some(msg) = self.mailbox.recv().await {
-            tracing::info!(
-                "Agent {} received '{}' from {}",
-                self.config.agent_id,
-                msg.kind,
-                msg.from
-            );
-
-            let is_task = msg.kind == "task_assignment";
-            if is_task {
-                self.reset_completer_for_task();
-                self.last_task = Some(extract_content(&msg.payload));
-            }
-
-            // For non-task messages, prefix with message kind so the LLM
-            // knows what it's receiving (e.g. "merge_success", "interrupt").
-            let content = if is_task {
-                extract_content(&msg.payload)
-            } else {
-                format!("[{}] {}", msg.kind, extract_content(&msg.payload))
-            };
-            let is_developer = self.config.agent_id.role == AgentRole::Developer;
-            match self.process_prompt(&content).await {
-                Ok(output) if is_task && !is_developer => {
-                    self.auto_report_completion(&output.text);
-                }
-                Err(e) if is_task => {
-                    tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
-                    self.auto_report_blocked(&e.to_string());
-                }
-                Err(e) => {
-                    tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
-                }
-                _ => {}
-            }
+            self.handle_bus_message(msg).await;
         }
-
         tracing::info!("Agent {} stopped", self.config.agent_id);
         Ok(())
+    }
+
+    async fn handle_bus_message(&mut self, msg: agent_bus::BusMessage) {
+        tracing::info!("Agent {} received '{}' from {}", self.config.agent_id, msg.kind, msg.from);
+        let is_task = msg.kind == "task_assignment";
+        if is_task {
+            self.reset_completer_for_task();
+            self.last_task = Some(extract_content(&msg.payload));
+        }
+        let content = format_prompt(&msg, is_task);
+        tracing::info!("Agent {} processing '{}' ({} bytes)", self.config.agent_id, msg.kind, content.len());
+        self.dispatch_completion(&content, is_task).await;
+    }
+
+    async fn dispatch_completion(&mut self, content: &str, is_task: bool) {
+        match self.process_prompt(content).await {
+            Ok(output) if is_task => {
+                self.auto_report_completion(&output.text);
+            }
+            Ok(output) => {
+                tracing::info!("Agent {} responded ({} bytes)", self.config.agent_id, output.text.len());
+            }
+            Err(e) if is_task => {
+                tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
+                self.auto_report_blocked(&e.to_string());
+            }
+            Err(e) => {
+                tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
+            }
+        }
     }
 
     async fn process_initial_task(&mut self) {
@@ -235,10 +229,11 @@ impl Agent {
         );
         let payload = serde_json::json!({ "content": content });
         if let Err(e) = self.mailbox.send("architect", "verify_completion", payload.clone()) {
-            tracing::warn!("verify_completion send to architect failed, falling back to manager: {}", e);
-            let _ = self.mailbox.send("manager", "task_complete", payload);
+            tracing::warn!("verify_completion send to architect failed: {}", e);
         }
-        // Still notify runtime for DB recording
+        // Always notify manager with the result
+        let _ = self.mailbox.send("manager", "task_complete", payload);
+        // Notify runtime for DB recording
         let summary_payload = serde_json::json!({ "content": first_line(text) });
         let _ = self.mailbox.send("runtime", "task_complete", summary_payload);
     }
@@ -360,6 +355,14 @@ fn log_completion(agent_id: &AgentId, output: &llm_sdk::Output) {
     }
     if !output.text.is_empty() {
         tracing::info!("[{}] {}", agent_id, first_line(&output.text));
+    }
+}
+
+fn format_prompt(msg: &agent_bus::BusMessage, is_task: bool) -> String {
+    if is_task {
+        extract_content(&msg.payload)
+    } else {
+        format!("[{}] {}", msg.kind, extract_content(&msg.payload))
     }
 }
 
