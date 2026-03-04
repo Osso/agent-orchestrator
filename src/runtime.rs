@@ -138,6 +138,7 @@ impl OrchestratorRuntime {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+        llm_sdk::sandbox::ensure_state_dirs();
         self.start_relay();
         self.start_control_server(shutdown_tx.clone(), shutdown_rx);
         // Brief pause for relay and control to bind their sockets before agents connect
