@@ -153,9 +153,16 @@ impl Agent {
                 self.last_task = Some(extract_content(&msg.payload));
             }
 
-            let content = extract_content(&msg.payload);
+            // For non-task messages, prefix with message kind so the LLM
+            // knows what it's receiving (e.g. "merge_success", "interrupt").
+            let content = if is_task {
+                extract_content(&msg.payload)
+            } else {
+                format!("[{}] {}", msg.kind, extract_content(&msg.payload))
+            };
+            let is_developer = self.config.agent_id.role == AgentRole::Developer;
             match self.process_prompt(&content).await {
-                Ok(output) if is_task => {
+                Ok(output) if is_task && !is_developer => {
                     self.auto_report_completion(&output.text);
                 }
                 Err(e) if is_task => {
@@ -179,12 +186,10 @@ impl Agent {
         };
         tracing::info!("Agent {} processing initial task", self.config.agent_id);
         self.last_task = Some(task.clone());
-        match self.process_prompt(&task).await {
-            Ok(output) => self.auto_report_completion(&output.text),
-            Err(e) => {
-                tracing::error!("Agent {} initial task failed: {}", self.config.agent_id, e);
-                self.auto_report_blocked(&e.to_string());
-            }
+        // No auto_report here — the manager (only role with initial_task)
+        // handles its own lifecycle via goal_complete MCP tool.
+        if let Err(e) = self.process_prompt(&task).await {
+            tracing::error!("Agent {} initial task failed: {}", self.config.agent_id, e);
         }
     }
 

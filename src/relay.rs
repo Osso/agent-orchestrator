@@ -299,10 +299,6 @@ fn handle_merge_request(
         "branch": branch,
         "description": description,
         "from_developer": agent_name,
-        "content": format!(
-            "Merge request from {}: branch `{}` — {}",
-            agent_name, branch, description
-        ),
     });
 
     mailbox

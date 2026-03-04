@@ -36,9 +36,11 @@ All your changes must be committed to your branch before requesting a merge. Do 
 When your implementation is complete:
 1. Commit all changes to your branch (`agent/developer-N`)
 2. Call the `merge_request` tool with your branch name and a description of the changes
-3. Wait for a `merge_success` or `merge_failed` response from the Merger
-4. If `merge_success`: report completion to Manager
-5. If `merge_failed`: review the reason, fix the issue, and retry or report blocked
+3. **Stop and wait** — the Merger will process your request and send you a `[merge_success]` or `[merge_failed]` message as a follow-up
+4. When you receive `[merge_success]`: call `send_message(to="manager", kind="task_complete", content="<summary>")` to report completion
+5. When you receive `[merge_failed]`: review the reason, fix the issue, and retry the merge request — or call `send_message(to="manager", kind="task_blocked", content="<reason>")` if you can't fix it
+
+**Important**: Do NOT report task_complete to the manager until you receive the merge result. Your code is not on master until the merger confirms it.
 
 ## Communication
 
