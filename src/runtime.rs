@@ -221,7 +221,7 @@ impl OrchestratorRuntime {
         }
 
         let _ = shutdown_tx.send(true);
-        self.shutdown();
+        self.shutdown().await;
         Ok(())
     }
 
@@ -333,16 +333,31 @@ impl OrchestratorRuntime {
         }
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         tracing::info!("Shutting down {} agents", self.agent_handles.len());
+
+        // Extract merger handle — it needs time to finish current merge
+        let merger_handle = self.agent_handles.remove("merger");
+
         let names: Vec<String> = self.agent_handles.keys().cloned().collect();
         for (name, handle) in self.agent_handles.drain() {
             tracing::info!("Stopping {}", name);
             handle.abort();
         }
+
+        // Wait for merger to finish before cleaning up
+        if let Some(handle) = merger_handle {
+            tracing::info!("Waiting for merger to finish (30s timeout)");
+            match tokio::time::timeout(Duration::from_secs(30), handle).await {
+                Ok(_) => tracing::info!("Merger finished cleanly"),
+                Err(_) => tracing::warn!("Merger timed out, aborting"),
+            }
+        }
+
         for name in &names {
             self.try_remove_worktree(name);
         }
+        self.try_remove_worktree("merger");
     }
 
     fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
