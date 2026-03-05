@@ -103,12 +103,12 @@ src/
 ## Usage
 
 ```bash
-# Run agents on a task
-agent-orchestrator run ~/my-project "Add login button"
+# Run as daemon (reads project config)
+agent-orchestrator daemon
 
-# Start agents, wait for messages
-agent-orchestrator orchestrate ~/my-project
+# Send a message to a running agent
+agent-orchestrator send --project my-project manager "Add a login button"
 
-# Options
-agent-orchestrator --db /path/to/tasks.db run ~/project "task"
+# Notify runtime about a new task
+agent-orchestrator notify --project my-project <task-id>
 ```
