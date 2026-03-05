@@ -52,12 +52,7 @@ async fn cmd_run(args: &[String], opts: &Opts) -> Result<()> {
     let working_dir = &args[2];
     let task = args[3..].join(" ");
 
-    // Fresh start for each run — clean DB and sessions from previous goals
-    let db_path = opts
-        .db_path
-        .clone()
-        .unwrap_or_else(|| db_path_for_project(working_dir));
-    let _ = std::fs::remove_file(&db_path);
+    // Clean sessions so agents start fresh, but keep the task DB for history
     clean_sessions(working_dir);
 
     run_orchestrator(working_dir, Some(task), opts).await
