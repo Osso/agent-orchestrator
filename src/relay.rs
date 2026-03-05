@@ -345,6 +345,12 @@ mod tests {
     use super::*;
     use agent_bus::Bus;
 
+    async fn test_db() -> Database {
+        let tmp = std::env::temp_dir().join(format!("relay-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&tmp);
+        Database::open(&tmp.join("tasks.db")).await.unwrap()
+    }
+
     // --- Wire protocol serialization ---
 
     #[test]
@@ -412,35 +418,37 @@ mod tests {
 
     // --- handle_tool_call dispatch ---
 
-    #[test]
-    fn handle_tool_call_unknown_tool_returns_error() {
+    #[tokio::test]
+    async fn handle_tool_call_unknown_tool_returns_error() {
         let bus = Bus::new();
         let mailbox = bus.register("relay-manager").unwrap();
         let _runtime = bus.register("runtime").unwrap();
+        let db = test_db().await;
         let req = RelayRequest {
             id: "r1".to_string(),
             from: "manager".to_string(),
             tool: "nonexistent_tool".to_string(),
             args: serde_json::json!({}),
         };
-        let resp = handle_tool_call(&mailbox, "manager", &req);
+        let resp = handle_tool_call(&mailbox, &db, "manager", &req).await;
         assert_eq!(resp.id, "r1");
         assert!(resp.error.is_some());
         assert!(resp.error.unwrap().contains("unknown tool"));
     }
 
-    #[test]
-    fn handle_tool_call_known_tool_dispatches() {
+    #[tokio::test]
+    async fn handle_tool_call_known_tool_dispatches() {
         let bus = Bus::new();
         let mailbox = bus.register("relay-manager").unwrap();
         let mut runtime = bus.register("runtime").unwrap();
+        let db = test_db().await;
         let req = RelayRequest {
             id: "r2".to_string(),
             from: "manager".to_string(),
             tool: "set_crew".to_string(),
             args: serde_json::json!({"count": 2}),
         };
-        let resp = handle_tool_call(&mailbox, "manager", &req);
+        let resp = handle_tool_call(&mailbox, &db, "manager", &req).await;
         assert_eq!(resp.id, "r2");
         assert!(resp.error.is_none());
         assert!(runtime.try_recv().is_some());
@@ -619,7 +627,8 @@ mod tests {
 
     async fn spawn_relay_server(socket_path: &std::path::Path) {
         let bus = Bus::new();
-        let server = RelayServer::new(bus.clone());
+        let db = Arc::new(test_db().await);
+        let server = RelayServer::new(bus.clone(), db);
         let path_clone = socket_path.to_path_buf();
         // Register runtime inside the task so the Mailbox stays alive with the task.
         tokio::spawn(async move {
