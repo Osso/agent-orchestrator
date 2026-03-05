@@ -17,6 +17,7 @@ pub fn control_socket_path() -> std::path::PathBuf {
 pub enum ControlRequest {
     SendMessage { to: String, content: String },
     StartTask { task: String },
+    SetDevelopers { count: u8 },
     Abort,
     Status,
 }
@@ -97,6 +98,9 @@ fn handle_request(
     match request {
         ControlRequest::SendMessage { to, content } => send_to_agent(bus, &to, &content),
         ControlRequest::StartTask { task } => send_to_agent(bus, "manager", &task),
+        ControlRequest::SetDevelopers { count } => {
+            send_bus_message(bus, "runtime", "set_crew", serde_json::json!({ "count": count }))
+        }
         ControlRequest::Abort => {
             let _ = shutdown_tx.send(true);
             ControlResponse::Ok
@@ -120,12 +124,14 @@ fn handle_request(
 }
 
 fn send_to_agent(bus: &Bus, to: &str, content: &str) -> ControlResponse {
-    // Use a unique name so we don't conflict with other control connections
+    send_bus_message(bus, to, "external_message", serde_json::json!({ "content": content }))
+}
+
+fn send_bus_message(bus: &Bus, to: &str, kind: &str, payload: serde_json::Value) -> ControlResponse {
     let name = format!("control-{}", std::process::id());
     let mailbox = match bus.register(&name) {
         Ok(m) => m,
         Err(_) => {
-            // If name taken, try with timestamp suffix
             let name = format!("control-{}-{}", std::process::id(), timestamp_suffix());
             match bus.register(&name) {
                 Ok(m) => m,
@@ -133,11 +139,10 @@ fn send_to_agent(bus: &Bus, to: &str, content: &str) -> ControlResponse {
             }
         }
     };
-    match mailbox.send(to, "external_message", serde_json::json!({ "content": content })) {
+    match mailbox.send(to, kind, payload) {
         Ok(_) => ControlResponse::Ok,
         Err(e) => ControlResponse::Error { message: format!("Send failed: {e}") },
     }
-    // mailbox dropped here → auto-deregisters from bus
 }
 
 fn role_from_name(name: &str) -> &str {

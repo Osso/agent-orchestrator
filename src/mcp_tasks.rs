@@ -14,6 +14,8 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 
+use crate::control;
+
 // --- Param types ---
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -76,6 +78,12 @@ struct RemoveDependencyParams {
     task_id: String,
     /// Task it depends on (blocker)
     depends_on: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetDevelopersParams {
+    /// Number of developer agents (1-3)
+    count: u8,
 }
 
 // --- MCP server ---
@@ -172,6 +180,25 @@ impl TasksMcp {
         match self.db.remove_dependency(&p.task_id, &p.depends_on).await {
             Ok(()) => "Dependency removed".to_string(),
             Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Set the number of developer agents (1-3). Requires a running orchestrator.")]
+    async fn set_developers(&self, Parameters(p): Parameters<SetDevelopersParams>) -> String {
+        let count = p.count.clamp(1, 3);
+        let socket_path = control::control_socket_path();
+        let req = control::ControlRequest::SetDevelopers { count };
+        match tokio::task::spawn_blocking(move || {
+            peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
+                &socket_path, &req,
+            )
+        })
+        .await
+        {
+            Ok(Ok(control::ControlResponse::Ok)) => format!("Developer count set to {count}"),
+            Ok(Ok(resp)) => format!("Unexpected response: {resp:?}"),
+            Ok(Err(e)) => format!("Error: {e} (is the orchestrator running?)"),
+            Err(e) => format!("Error: {e}"),
         }
     }
 }
