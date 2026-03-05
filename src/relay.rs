@@ -148,6 +148,13 @@ async fn handle_tool_call(
     req: &RelayRequest,
 ) -> RelayResponse {
     let role = role_from_agent_name(agent_name).unwrap_or(AgentRole::Developer);
+
+    // Notify runtime of developer activity for idle timeout tracking
+    if role == AgentRole::Developer {
+        let payload = serde_json::json!({ "developer": agent_name });
+        let _ = mailbox.send("runtime", "dev_heartbeat", payload);
+    }
+
     let result = dispatch_tool(mailbox, db, agent_name, role, req).await;
     match result {
         Ok(val) => RelayResponse { id: req.id.clone(), result: Some(val), error: None },

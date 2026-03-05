@@ -6,16 +6,25 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agent_bus::Mailbox;
 use llm_tasks::db::{Database, TaskUpdates};
+
+/// How long a developer can be idle before its task is reclaimed.
+pub const DEV_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+struct DevAssignment {
+    task_id: String,
+    last_activity: Instant,
+}
 
 /// Tracks task assignments and handles dispatch + state transitions.
 pub struct Dispatcher {
     db: Arc<Database>,
     mailbox: Mailbox,
-    /// developer bus_name → task_id
-    dev_tasks: HashMap<String, String>,
+    /// developer bus_name → assignment (task_id + last activity)
+    dev_tasks: HashMap<String, DevAssignment>,
 }
 
 impl Dispatcher {
@@ -25,16 +34,51 @@ impl Dispatcher {
 
     /// Developer signals task complete → set in_review, notify architect.
     pub async fn handle_dev_complete(&mut self, from: &str, content: &str) {
-        if let Some(task_id) = self.dev_tasks.remove(from) {
-            self.transition_to_review(&task_id, from, content).await;
+        if let Some(assignment) = self.dev_tasks.remove(from) {
+            self.transition_to_review(&assignment.task_id, from, content).await;
         }
     }
 
     /// Developer signals needs_info → set needs_info, notify manager.
     pub async fn handle_dev_needs_info(&mut self, from: &str, content: &str) {
-        if let Some(task_id) = self.dev_tasks.remove(from) {
-            self.transition_to_needs_info(&task_id, from, content).await;
+        if let Some(assignment) = self.dev_tasks.remove(from) {
+            self.transition_to_needs_info(&assignment.task_id, from, content).await;
         }
+    }
+
+    /// Record activity from a developer (called on every relay tool call).
+    pub fn record_activity(&mut self, dev_name: &str) {
+        if let Some(assignment) = self.dev_tasks.get_mut(dev_name) {
+            assignment.last_activity = Instant::now();
+        }
+    }
+
+    /// Check for timed-out developers. Returns names of developers that timed out
+    /// so the runtime can abort their agents.
+    pub async fn check_timeouts(&mut self) -> Vec<String> {
+        let timed_out: Vec<(String, String)> = self
+            .dev_tasks
+            .iter()
+            .filter(|(_, a)| a.last_activity.elapsed() > DEV_IDLE_TIMEOUT)
+            .map(|(name, a)| (name.clone(), a.task_id.clone()))
+            .collect();
+
+        let mut aborted = Vec::new();
+        for (dev_name, task_id) in timed_out {
+            tracing::warn!(
+                "Developer {} timed out on task {} (idle {:?})",
+                dev_name,
+                task_id,
+                self.dev_tasks[&dev_name].last_activity.elapsed(),
+            );
+            let updates = TaskUpdates { status: Some("ready"), assignee: Some(""), ..Default::default() };
+            if let Err(e) = self.db.update_task(&task_id, updates, "runtime").await {
+                tracing::error!("Failed to reclaim task {} from {}: {}", task_id, dev_name, e);
+            }
+            self.dev_tasks.remove(&dev_name);
+            aborted.push(dev_name);
+        }
+        aborted
     }
 
     async fn transition_to_review(&self, task_id: &str, dev: &str, summary: &str) {
@@ -88,7 +132,10 @@ impl Dispatcher {
             tracing::warn!("Failed to claim task {} for {}: {}", task.id, dev, e);
             return;
         }
-        self.dev_tasks.insert(dev.to_string(), task.id.clone());
+        self.dev_tasks.insert(dev.to_string(), DevAssignment {
+            task_id: task.id.clone(),
+            last_activity: Instant::now(),
+        });
         let desc = task.description.as_deref().unwrap_or("");
         let content = format!("## Task {}\n\n{}\n\n{}", task.id, task.title, desc);
         let payload = serde_json::json!({"content": content, "task_id": task.id});
@@ -107,7 +154,7 @@ impl Dispatcher {
 
 fn find_idle_developers(
     developer_count: u8,
-    dev_tasks: &HashMap<String, String>,
+    dev_tasks: &HashMap<String, DevAssignment>,
     active_handles: &HashMap<String, tokio::task::JoinHandle<()>>,
 ) -> Vec<String> {
     (0..developer_count)

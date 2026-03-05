@@ -181,32 +181,21 @@ impl OrchestratorRuntime {
         mailbox: &mut agent_bus::Mailbox,
         shutdown_tx: tokio::sync::watch::Sender<bool>,
     ) -> Result<()> {
-        let mut sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let mut audit_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(60),
-            Duration::from_secs(600),
-        );
-        let mut nudge_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + NUDGE_INTERVAL,
-            NUDGE_INTERVAL,
-        );
+        let mut timers = CommandTimers::new()?;
 
         loop {
             tokio::select! {
                 msg = mailbox.recv() => {
                     match self.process_bus_message(msg).await {
-                        Some(true) => break,
-                        None => break,
+                        Some(true) | None => break,
                         _ => {}
                     }
                 }
-                _ = nudge_timer.tick() => self.maybe_nudge_manager(mailbox).await,
-                _ = audit_timer.tick() => self.send_audit_snapshot(mailbox).await,
-                _ = sigint.recv() => { tracing::info!("Received SIGINT, shutting down"); break; }
-                _ = sigterm.recv() => { tracing::info!("Received SIGTERM, shutting down"); break; }
+                _ = timers.timeout.tick() => self.check_dev_timeouts().await,
+                _ = timers.nudge.tick() => self.maybe_nudge_manager(mailbox).await,
+                _ = timers.audit.tick() => self.send_audit_snapshot(mailbox).await,
+                _ = timers.sigint.recv() => { tracing::info!("Received SIGINT, shutting down"); break; }
+                _ = timers.sigterm.recv() => { tracing::info!("Received SIGTERM, shutting down"); break; }
             }
         }
 
@@ -252,6 +241,17 @@ impl OrchestratorRuntime {
         tracing::info!("Nudging manager (idle {}s with pending tasks)", idle_secs);
         if let Err(e) = mailbox.send("manager", "nudge", payload) {
             tracing::debug!("Failed to nudge manager: {}", e);
+        }
+    }
+
+    async fn check_dev_timeouts(&mut self) {
+        let timed_out = self.dispatcher.check_timeouts().await;
+        for dev_name in &timed_out {
+            tracing::warn!("Aborting timed-out developer {}", dev_name);
+            self.abort_agent(dev_name);
+        }
+        if !timed_out.is_empty() {
+            self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
         }
     }
 
@@ -312,6 +312,12 @@ impl OrchestratorRuntime {
                 let content = payload_str(payload, "content");
                 self.dispatcher.handle_dev_needs_info(from, &content).await;
                 self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+            }
+            "dev_heartbeat" => {
+                let dev = payload_str(payload, "developer");
+                if !dev.is_empty() {
+                    self.dispatcher.record_activity(&dev);
+                }
             }
             _ => tracing::debug!("Runtime ignoring unknown kind: {}", kind),
         }
@@ -623,6 +629,27 @@ fn build_mcp_config(agent_name: &str) -> String {
         }
     })
     .to_string()
+}
+
+struct CommandTimers {
+    audit: tokio::time::Interval,
+    nudge: tokio::time::Interval,
+    timeout: tokio::time::Interval,
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl CommandTimers {
+    fn new() -> Result<Self> {
+        let now = tokio::time::Instant::now();
+        Ok(Self {
+            audit: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(600)),
+            nudge: tokio::time::interval_at(now + NUDGE_INTERVAL, NUDGE_INTERVAL),
+            timeout: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(60)),
+            sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
 }
 
 fn default_state() -> RuntimeState {

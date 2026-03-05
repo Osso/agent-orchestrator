@@ -87,6 +87,11 @@ pub async fn handle_complete_task(
         .await
         .map_err(|e| format!("DB error: {e}"))?;
     let _ = mailbox.send("runtime", "task_done", serde_json::json!({"task_id": id}));
+    let _ = mailbox.send(
+        "manager",
+        "task_done",
+        serde_json::json!({"content": format!("Task {} completed: {}", id, task.title), "task_id": id}),
+    );
     Ok(serde_json::json!({"ok": true, "status": "completed"}))
 }
 
@@ -111,6 +116,11 @@ pub async fn handle_reject_completion(
         .await
         .map_err(|e| format!("DB error: {e}"))?;
     notify_developer_rejection(mailbox, &task, id, reason);
+    let _ = mailbox.send(
+        "manager",
+        "task_rejected",
+        serde_json::json!({"content": format!("Task {} rejected: {}", id, reason), "task_id": id}),
+    );
     Ok(serde_json::json!({"ok": true, "status": "in_progress"}))
 }
 
