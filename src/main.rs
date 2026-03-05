@@ -29,6 +29,7 @@ async fn dispatch(args: &[String], opts: &Opts) -> Result<()> {
         "orchestrate" => cmd_orchestrate(args, opts).await,
         "send" => cmd_send(args),
         "mcp-serve" => cmd_mcp_serve(args).await,
+        "mcp-tasks" => cmd_mcp_tasks(args).await,
         _ => {
             print_usage();
             Ok(())
@@ -81,6 +82,14 @@ async fn cmd_mcp_serve(args: &[String]) -> Result<()> {
     agent_orchestrator::mcp::run_mcp_server(socket, agent).await
 }
 
+async fn cmd_mcp_tasks(args: &[String]) -> Result<()> {
+    let project = extract_named_arg(args, "--project")
+        .or_else(|| std::env::var("CLAUDE_CODE_TASK_LIST_ID").ok())
+        .ok_or_else(|| anyhow::anyhow!("--project or CLAUDE_CODE_TASK_LIST_ID required"))?;
+    let db_path = db_path_for_project(&project);
+    agent_orchestrator::mcp_tasks::run(&db_path).await
+}
+
 fn print_usage() {
     eprintln!(
         r#"Agent Orchestrator - Multi-agent coordination for AI coding assistants
@@ -99,6 +108,7 @@ COMMANDS:
     orchestrate [dir]                           Start agents and wait for messages
     send <to> <message>                         Send a message to a running agent
     mcp-serve --agent <name> [--socket <path>]  Run MCP stdio server for an agent
+    mcp-tasks [--project <name>]                Task DB MCP for Claude Code (uses CLAUDE_CODE_TASK_LIST_ID)
 
 EXAMPLES:
     agent-orchestrator run ~/my-project "Add a login button"

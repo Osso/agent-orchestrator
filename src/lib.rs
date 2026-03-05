@@ -3,6 +3,7 @@ pub mod bus_tools;
 pub mod control;
 pub mod dispatch;
 pub mod mcp;
+pub mod mcp_tasks;
 pub mod relay;
 pub mod runtime;
 pub mod task_tools;
