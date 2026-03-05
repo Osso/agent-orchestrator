@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_DB_DIR: &str = "/tmp/claude/orchestrator";
+const APP_NAME: &str = "agent-orchestrator";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -89,7 +89,7 @@ USAGE:
     agent-orchestrator [OPTIONS] <COMMAND>
 
 OPTIONS:
-    --db <path>         Task database path (default: per-project under {DEFAULT_DB_DIR}/)
+    --db <path>         Task database path (default: ~/.local/share/agent-orchestrator/<project>/tasks.db)
     --backend <name>    Backend to use: claude (default) or openrouter
     --model <name>      Model name (required for --backend openrouter)
     --no-sandbox        Disable bwrap sandboxing
@@ -143,12 +143,14 @@ fn extract_opts(args: &mut Vec<String>) -> Opts {
 }
 
 /// Derive a project-specific DB path from the working directory.
+/// Uses ~/.local/share/agent-orchestrator/{project}/tasks.db (same base as session store).
 fn db_path_for_project(working_dir: &str) -> PathBuf {
     let project = std::path::Path::new(working_dir)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("default");
-    PathBuf::from(DEFAULT_DB_DIR).join(project).join("tasks.db")
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(APP_NAME).join(project).join("tasks.db")
 }
 
 fn extract_named_arg(args: &[String], flag: &str) -> Option<String> {
@@ -188,20 +190,17 @@ async fn run_orchestrator(working_dir: &str, task: Option<String>, opts: &Opts) 
     runtime.run(task).await
 }
 
-/// Remove session store for a project so agents start fresh.
+/// Remove session data for a project so agents start fresh.
+/// Removes sessions.json and message_logs/ but preserves the task DB.
 fn clean_sessions(working_dir: &str) {
     let project = std::path::Path::new(working_dir)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("default");
-    // Match llm-sdk's SessionStore::new which uses dirs::data_dir()
-    let base = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".local/share"))
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let session_dir = base.join("agent-orchestrator").join(project);
-    if session_dir.exists() {
-        let _ = std::fs::remove_dir_all(&session_dir);
-    }
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let project_dir = base.join(APP_NAME).join(project);
+    let _ = std::fs::remove_file(project_dir.join("sessions.json"));
+    let _ = std::fs::remove_dir_all(project_dir.join("message_logs"));
 }
 
 fn send_message(to: &str, content: &str) -> Result<()> {

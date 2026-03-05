@@ -22,7 +22,14 @@ peercred-ipc = { git = "https://github.com/Osso/peercred-ipc.git" }
 llm-sdk = { git = "https://github.com/Osso/llm-sdk.git" }
 agent-bus = { git = "https://github.com/Osso/agent-bus.git" }
 llm-tasks = { git = "https://github.com/Osso/llm-tasks.git" }
+dirs = "6"
 dotenvy = "0.15.7"
 
 [dev-dependencies]
 glob = "0.3.3"
+
+[patch."https://github.com/Osso/llm-sdk.git"]
+llm-sdk = { path = "../../lib/llm-sdk" }
+
+[patch."https://github.com/Osso/llm-tasks.git"]
+llm-tasks = { path = "../llm-tasks" }

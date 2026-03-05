@@ -66,6 +66,7 @@ dependencies = [
  "agent-bus",
  "anyhow",
  "async-trait",
+ "dirs",
  "dotenvy",
  "glob",
  "llm-sdk",
@@ -1425,7 +1426,6 @@ dependencies = [
 [[package]]
 name = "llm-tasks"
 version = "0.1.0"
-source = "git+https://github.com/Osso/llm-tasks.git#c348fa667d919f274dec5b8f645703b93c766b63"
 dependencies = [
  "anyhow",
  "chrono",
