@@ -28,25 +28,43 @@ pub fn create_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
     ensure_head_exists(&cfg.project_dir)?;
     prune_stale_worktrees(&cfg.project_dir);
     let path = cfg.path();
+
+    if let Some(reused) = try_reuse_worktree(cfg, &path) {
+        return Ok(reused);
+    }
+    add_fresh_worktree(cfg, &path)
+}
+
+fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Option<PathBuf> {
+    if !path.join(".git").exists() {
+        return None;
+    }
+    tracing::info!("Reusing existing worktree at {}", path.display());
+    let ok = Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok {
+        return Some(path.clone());
+    }
+    tracing::warn!("Reset failed, removing and recreating worktree");
+    let _ = remove_worktree(cfg);
+    None
+}
+
+fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
     let branch = cfg.branch();
+    let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
     let status = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            "--force",
-            "-B",
-            &branch,
-            path.to_str().context("worktree path is not valid UTF-8")?,
-            "HEAD",
-        ])
+        .args(["worktree", "add", "--force", "-B", &branch, path_str, "HEAD"])
         .current_dir(&cfg.project_dir)
         .status()
         .context("failed to run git worktree add")?;
-
     if !status.success() {
         anyhow::bail!("git worktree add failed with status {}", status);
     }
-    Ok(path)
+    Ok(path.clone())
 }
 
 fn prune_stale_worktrees(project_dir: &std::path::Path) {

@@ -28,6 +28,7 @@ async fn dispatch(args: &[String], opts: &Opts) -> Result<()> {
         "run" => cmd_run(args, opts).await,
         "orchestrate" => cmd_orchestrate(args, opts).await,
         "send" => cmd_send(args),
+        "notify" => cmd_notify(args),
         "mcp-serve" => cmd_mcp_serve(args).await,
         "mcp-tasks" => cmd_mcp_tasks(args).await,
         _ => {
@@ -211,6 +212,21 @@ fn clean_sessions(working_dir: &str) {
     let project_dir = base.join(APP_NAME).join(project);
     let _ = std::fs::remove_file(project_dir.join("sessions.json"));
     let _ = std::fs::remove_dir_all(project_dir.join("message_logs"));
+}
+
+fn cmd_notify(args: &[String]) -> Result<()> {
+    if args.len() < 3 {
+        bail!("Usage: agent-orchestrator notify <task-id>");
+    }
+    let socket = control::control_socket_path();
+    let request = control::ControlRequest::NotifyTaskCreated { task_id: args[2].clone() };
+    let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
+    match response {
+        control::ControlResponse::Ok => println!("Notified runtime about {}", args[2]),
+        control::ControlResponse::Error { message } => bail!("Error: {message}"),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn send_message(to: &str, content: &str) -> Result<()> {

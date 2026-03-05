@@ -120,10 +120,13 @@ impl TasksMcp {
         }))
     }
 
-    #[tool(description = "Add a new task. Starts as 'pending'.")]
+    #[tool(description = "Add a new task. Auto-dispatches to an idle developer if the orchestrator is running.")]
     async fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> String {
         match self.db.create_task(&p.title, p.description.as_deref(), p.priority.unwrap_or(0), "user").await {
-            Ok(task) => to_json(&task),
+            Ok(task) => {
+                notify_runtime(&task.id);
+                to_json(&task)
+            }
             Err(e) => err(e),
         }
     }
@@ -228,6 +231,16 @@ fn to_json<T: Serialize>(val: &T) -> String {
 
 fn err(e: impl std::fmt::Display) -> String {
     format!("Error: {e}")
+}
+
+/// Notify the running orchestrator that a task was created.
+/// Silently fails if no orchestrator is running.
+fn notify_runtime(task_id: &str) {
+    let socket_path = control::control_socket_path();
+    let req = control::ControlRequest::NotifyTaskCreated { task_id: task_id.to_string() };
+    let _ = peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
+        &socket_path, &req,
+    );
 }
 
 pub async fn run(db_path: &std::path::Path) -> Result<()> {

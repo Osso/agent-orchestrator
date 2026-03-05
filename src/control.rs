@@ -18,6 +18,7 @@ pub enum ControlRequest {
     SendMessage { to: String, content: String },
     StartTask { task: String },
     SetDevelopers { count: u8 },
+    NotifyTaskCreated { task_id: String },
     Abort,
     Status,
 }
@@ -100,6 +101,9 @@ fn handle_request(
         ControlRequest::StartTask { task } => send_to_agent(bus, "manager", &task),
         ControlRequest::SetDevelopers { count } => {
             send_bus_message(bus, "runtime", "set_crew", serde_json::json!({ "count": count }))
+        }
+        ControlRequest::NotifyTaskCreated { task_id } => {
+            send_bus_message(bus, "runtime", "task_created", serde_json::json!({ "task_id": task_id }))
         }
         ControlRequest::Abort => {
             let _ = shutdown_tx.send(true);
