@@ -50,6 +50,7 @@ pub struct OrchestratorRuntime {
     db: Arc<Database>,
     session_store: SessionStore,
     working_dir: String,
+    project: String,
     agent_handles: HashMap<String, JoinHandle<()>>,
     agent_factory: AgentFactory,
     pub backend: BackendKind,
@@ -71,8 +72,9 @@ impl OrchestratorRuntime {
         let project = Path::new(&working_dir)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("default");
-        let session_store = SessionStore::new("agent-orchestrator", project);
+            .unwrap_or("default")
+            .to_string();
+        let session_store = SessionStore::new("agent-orchestrator", &project);
 
         let db = Arc::new(db);
         let bus = Bus::new();
@@ -87,6 +89,7 @@ impl OrchestratorRuntime {
             db,
             session_store,
             working_dir,
+            project,
             agent_handles: HashMap::new(),
             agent_factory: default_agent_factory(),
             backend,
@@ -116,6 +119,7 @@ impl OrchestratorRuntime {
             db,
             session_store,
             working_dir: working_dir.to_string(),
+            project: "test".to_string(),
             agent_handles: HashMap::new(),
             agent_factory: factory,
             backend,
@@ -145,7 +149,7 @@ impl OrchestratorRuntime {
 
     fn start_relay(&self) {
         let relay = RelayServer::new(self.bus.clone(), self.db.clone());
-        let socket_path = relay::relay_socket_path();
+        let socket_path = relay::relay_socket_path(&self.project);
         tokio::spawn(async move {
             if let Err(e) = relay.run(&socket_path).await {
                 tracing::error!("Relay server error: {}", e);
@@ -159,7 +163,7 @@ impl OrchestratorRuntime {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         let bus = self.bus.clone();
-        let project = self.working_dir.clone();
+        let project = self.project.clone();
         tokio::spawn(control::run_control_server(bus, project, shutdown_tx, shutdown_rx));
     }
 
@@ -382,7 +386,7 @@ impl OrchestratorRuntime {
             working_dir,
             system_prompt: role.system_prompt().to_string(),
             initial_task,
-            mcp_config: Some(build_mcp_config(&bus_name)),
+            mcp_config: Some(build_mcp_config(&bus_name, &self.project)),
             fresh_session_per_task: fresh,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
@@ -525,7 +529,7 @@ impl OrchestratorRuntime {
             working_dir,
             system_prompt: prompt,
             initial_task: None,
-            mcp_config: Some(build_mcp_config("manager")),
+            mcp_config: Some(build_mcp_config("manager", &self.project)),
             fresh_session_per_task: false,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
@@ -614,8 +618,8 @@ pub fn resolve_sandbox(
     }
 }
 
-fn build_mcp_config(agent_name: &str) -> String {
-    let socket_path = relay::relay_socket_path();
+fn build_mcp_config(agent_name: &str, project: &str) -> String {
+    let socket_path = relay::relay_socket_path(project);
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("agent-orchestrator"))
         .to_string_lossy()

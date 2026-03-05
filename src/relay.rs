@@ -34,10 +34,10 @@ pub struct RelayResponse {
 }
 
 /// Returns the canonical path for the relay Unix socket.
-/// Uses ~/.claude/orchestrator/ so the socket is visible inside bwrap sandboxes
+/// Uses ~/.claude/orchestrator/{project}/ so the socket is visible inside bwrap sandboxes
 /// (which bind-mount ~/.claude writable but overlay /tmp with tmpfs).
-pub fn relay_socket_path() -> PathBuf {
-    home_dir().join(".claude/orchestrator/relay.sock")
+pub fn relay_socket_path(project: &str) -> PathBuf {
+    home_dir().join(".claude/orchestrator").join(project).join("relay.sock")
 }
 
 fn home_dir() -> PathBuf {

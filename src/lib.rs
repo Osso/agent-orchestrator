@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod bus_tools;
+pub mod config;
 pub mod control;
+pub mod daemon;
 pub mod dispatch;
 pub mod mcp;
 pub mod mcp_tasks;

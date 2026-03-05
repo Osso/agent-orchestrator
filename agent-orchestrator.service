@@ -1,0 +1,12 @@
+[Unit]
+Description=Agent Orchestrator Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-orchestrator daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

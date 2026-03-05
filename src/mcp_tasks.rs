@@ -90,6 +90,7 @@ struct SetDevelopersParams {
 
 struct TasksMcp {
     db: Arc<Database>,
+    project: String,
     tool_router: ToolRouter<Self>,
 }
 
@@ -124,7 +125,7 @@ impl TasksMcp {
     async fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> String {
         match self.db.create_task(&p.title, p.description.as_deref(), p.priority.unwrap_or(0), "user").await {
             Ok(task) => {
-                notify_runtime(&task.id);
+                notify_runtime(&self.project, &task.id);
                 to_json(&task)
             }
             Err(e) => err(e),
@@ -189,7 +190,8 @@ impl TasksMcp {
     #[tool(description = "Set the number of developer agents (1-3). Requires a running orchestrator.")]
     async fn set_developers(&self, Parameters(p): Parameters<SetDevelopersParams>) -> String {
         let count = p.count.clamp(1, 3);
-        let socket_path = control::control_socket_path();
+        let socket_path = control::control_socket_path(&self.project);
+
         let req = control::ControlRequest::SetDevelopers { count };
         match tokio::task::spawn_blocking(move || {
             peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
@@ -235,18 +237,19 @@ fn err(e: impl std::fmt::Display) -> String {
 
 /// Notify the running orchestrator that a task was created.
 /// Silently fails if no orchestrator is running.
-fn notify_runtime(task_id: &str) {
-    let socket_path = control::control_socket_path();
+fn notify_runtime(project: &str, task_id: &str) {
+    let socket_path = control::control_socket_path(project);
     let req = control::ControlRequest::NotifyTaskCreated { task_id: task_id.to_string() };
     let _ = peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
         &socket_path, &req,
     );
 }
 
-pub async fn run(db_path: &std::path::Path) -> Result<()> {
+pub async fn run(db_path: &std::path::Path, project: &str) -> Result<()> {
     let db = Database::open(db_path).await?;
     let service = TasksMcp {
         db: Arc::new(db),
+        project: project.to_string(),
         tool_router: TasksMcp::tool_router(),
     };
     let server = service.serve(rmcp::transport::io::stdio()).await?;

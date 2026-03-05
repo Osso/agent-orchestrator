@@ -23,6 +23,7 @@ llm-sdk = { git = "https://github.com/Osso/llm-sdk.git" }
 agent-bus = { git = "https://github.com/Osso/agent-bus.git" }
 llm-tasks = { git = "https://github.com/Osso/llm-tasks.git" }
 dirs = "6"
+toml = "0.8"
 dotenvy = "0.15.7"
 
 [dev-dependencies]

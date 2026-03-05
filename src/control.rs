@@ -5,12 +5,12 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Returns the path for the control Unix socket.
-/// Uses ~/.claude/orchestrator/ so it's accessible inside bwrap sandboxes.
-pub fn control_socket_path() -> std::path::PathBuf {
+/// Uses ~/.claude/orchestrator/{project}/ so it's accessible inside bwrap sandboxes.
+pub fn control_socket_path(project: &str) -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    home.join(".claude/orchestrator/control.sock")
+    home.join(".claude/orchestrator").join(project).join("control.sock")
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -42,7 +42,7 @@ pub async fn run_control_server(
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let socket_path = control_socket_path();
+    let socket_path = control_socket_path(&project);
     let server = match Server::bind(&socket_path) {
         Ok(s) => s,
         Err(e) => {

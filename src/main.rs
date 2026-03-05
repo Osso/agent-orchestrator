@@ -1,6 +1,5 @@
 use agent_orchestrator::agent::BackendKind;
 use agent_orchestrator::control;
-use agent_orchestrator::relay;
 use agent_orchestrator::runtime::OrchestratorRuntime;
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +28,7 @@ async fn dispatch(args: &[String], opts: &Opts) -> Result<()> {
         "orchestrate" => cmd_orchestrate(args, opts).await,
         "send" => cmd_send(args),
         "notify" => cmd_notify(args),
+        "daemon" => cmd_daemon().await,
         "mcp-serve" => cmd_mcp_serve(args).await,
         "mcp-tasks" => cmd_mcp_tasks(args).await,
         _ => {
@@ -45,6 +45,11 @@ fn init_tracing() -> Result<()> {
         )
         .init();
     Ok(())
+}
+
+async fn cmd_daemon() -> Result<()> {
+    let backend = BackendKind::Claude;
+    agent_orchestrator::daemon::run(backend, false).await
 }
 
 async fn cmd_run(args: &[String], opts: &Opts) -> Result<()> {
@@ -66,18 +71,31 @@ async fn cmd_orchestrate(args: &[String], opts: &Opts) -> Result<()> {
 }
 
 fn cmd_send(args: &[String]) -> Result<()> {
-    if args.len() < 4 {
-        bail!("Usage: agent-orchestrator send <to> <message>");
+    let project = extract_named_arg(args, "--project")
+        .ok_or_else(|| anyhow::anyhow!("--project required for send"))?;
+    // Remaining positional args after removing binary, subcommand, --project, and its value
+    let positional: Vec<&String> = args.iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            *i > 1 && *a != "--project" && {
+                // Skip value after --project
+                *i == 0 || args.get(i.wrapping_sub(1)).map(|p| p.as_str()) != Some("--project")
+            }
+        })
+        .map(|(_, a)| a)
+        .collect();
+    if positional.len() < 2 {
+        bail!("Usage: agent-orchestrator send --project <name> <to> <message>");
     }
-    let to = &args[2];
-    let message = args[3..].join(" ");
-    send_message(to, &message)
+    let to = positional[0];
+    let message: String = positional[1..].iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+    send_message(&project, to, &message)
 }
 
 async fn cmd_mcp_serve(args: &[String]) -> Result<()> {
     let socket = extract_named_arg(args, "--socket")
         .map(PathBuf::from)
-        .unwrap_or_else(relay::relay_socket_path);
+        .ok_or_else(|| anyhow::anyhow!("--socket required for mcp-serve"))?;
     let agent = extract_named_arg(args, "--agent")
         .ok_or_else(|| anyhow::anyhow!("--agent required for mcp-serve"))?;
     agent_orchestrator::mcp::run_mcp_server(socket, agent).await
@@ -88,7 +106,7 @@ async fn cmd_mcp_tasks(args: &[String]) -> Result<()> {
         .or_else(|| std::env::var("CLAUDE_CODE_TASK_LIST_ID").ok())
         .ok_or_else(|| anyhow::anyhow!("--project or CLAUDE_CODE_TASK_LIST_ID required"))?;
     let db_path = db_path_for_project(&project);
-    agent_orchestrator::mcp_tasks::run(&db_path).await
+    agent_orchestrator::mcp_tasks::run(&db_path, &project).await
 }
 
 fn print_usage() {
@@ -107,15 +125,18 @@ OPTIONS:
 COMMANDS:
     run <dir> <task...>                         Run agents on a task (non-interactive)
     orchestrate [dir]                           Start agents and wait for messages
-    send <to> <message>                         Send a message to a running agent
-    mcp-serve --agent <name> [--socket <path>]  Run MCP stdio server for an agent
+    daemon                                      Run as daemon for all configured projects
+    send --project <name> <to> <message>        Send a message to a running agent
+    notify --project <name> <task-id>           Notify runtime about a new task
+    mcp-serve --agent <name> --socket <path>    Run MCP stdio server for an agent
     mcp-tasks [--project <name>]                Task DB MCP for Claude Code (uses CLAUDE_CODE_TASK_LIST_ID)
 
 EXAMPLES:
     agent-orchestrator run ~/my-project "Add a login button"
     agent-orchestrator orchestrate ~/my-project
+    agent-orchestrator daemon
     agent-orchestrator --backend openrouter --model anthropic/claude-3.5-sonnet run ~/my-project "task"
-    agent-orchestrator send manager "Add a login button"
+    agent-orchestrator send --project my-project manager "Add a login button"
 "#
     );
 }
@@ -215,23 +236,25 @@ fn clean_sessions(working_dir: &str) {
 }
 
 fn cmd_notify(args: &[String]) -> Result<()> {
-    if args.len() < 3 {
-        bail!("Usage: agent-orchestrator notify <task-id>");
-    }
-    let socket = control::control_socket_path();
-    let request = control::ControlRequest::NotifyTaskCreated { task_id: args[2].clone() };
+    let project = extract_named_arg(args, "--project")
+        .ok_or_else(|| anyhow::anyhow!("--project required for notify"))?;
+    let task_id = args.iter()
+        .find(|a| *a != "--project" && *a != &project && *a != "notify" && *a != &args[0])
+        .ok_or_else(|| anyhow::anyhow!("Usage: agent-orchestrator notify --project <name> <task-id>"))?;
+    let socket = control::control_socket_path(&project);
+    let request = control::ControlRequest::NotifyTaskCreated { task_id: task_id.clone() };
     let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
     match response {
-        control::ControlResponse::Ok => println!("Notified runtime about {}", args[2]),
+        control::ControlResponse::Ok => println!("Notified runtime about {}", task_id),
         control::ControlResponse::Error { message } => bail!("Error: {message}"),
         _ => {}
     }
     Ok(())
 }
 
-fn send_message(to: &str, content: &str) -> Result<()> {
+fn send_message(project: &str, to: &str, content: &str) -> Result<()> {
     use control::{ControlRequest, ControlResponse};
-    let socket = control::control_socket_path();
+    let socket = control::control_socket_path(project);
     let request = ControlRequest::SendMessage {
         to: to.to_string(),
         content: content.to_string(),
