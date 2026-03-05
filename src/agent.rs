@@ -212,38 +212,20 @@ impl Agent {
         tracing::info!("Agent {} fresh completer for task", self.config.agent_id);
     }
 
-    /// Route completion through architect for verification.
+    /// Signal task completion to the runtime (which handles DB transitions and routing).
     fn auto_report_completion(&self, text: &str) {
         let output = if text.is_empty() {
             "Task completed (no output)".to_string()
         } else {
             truncate(text, 2000)
         };
-        let task_desc = self.last_task.as_deref().unwrap_or("unknown task");
-        let developer = self.config.agent_id.bus_name();
-        let content = format!(
-            "## Verify Completion\n\n\
-             **Developer:** {developer}\n\n\
-             **Original task:**\n{task_desc}\n\n\
-             **Developer output:**\n{output}"
-        );
-        let payload = serde_json::json!({ "content": content });
-        if let Err(e) = self.mailbox.send("architect", "verify_completion", payload.clone()) {
-            tracing::warn!("verify_completion send to architect failed: {}", e);
-        }
-        // Always notify manager with the result
-        let _ = self.mailbox.send("manager", "task_complete", payload);
-        // Notify runtime for DB recording
-        let summary_payload = serde_json::json!({ "content": first_line(text) });
-        let _ = self.mailbox.send("runtime", "task_complete", summary_payload);
+        let payload = serde_json::json!({ "content": output });
+        let _ = self.mailbox.send("runtime", "task_complete", payload);
     }
 
-    /// Auto-send task_blocked to manager on completion failure.
+    /// Signal task blocked/needs_info to the runtime.
     fn auto_report_blocked(&self, error: &str) {
         let payload = serde_json::json!({ "content": format!("Task failed: {error}") });
-        if let Err(e) = self.mailbox.send("manager", "task_blocked", payload.clone()) {
-            tracing::warn!("Auto task_blocked send failed: {}", e);
-        }
         let _ = self.mailbox.send("runtime", "task_blocked", payload);
     }
 

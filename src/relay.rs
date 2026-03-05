@@ -4,9 +4,11 @@
 //! mcp-serve connects to this relay via Unix socket to route tool calls.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use agent_bus::{Bus, Mailbox};
 use anyhow::Result;
+use llm_tasks::db::Database;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -46,11 +48,12 @@ fn home_dir() -> PathBuf {
 
 pub struct RelayServer {
     bus: Bus,
+    db: Arc<Database>,
 }
 
 impl RelayServer {
-    pub fn new(bus: Bus) -> Self {
-        Self { bus }
+    pub fn new(bus: Bus, db: Arc<Database>) -> Self {
+        Self { bus, db }
     }
 
     pub async fn run(self, socket_path: &std::path::Path) -> Result<()> {
@@ -65,8 +68,9 @@ impl RelayServer {
         loop {
             let (stream, _) = listener.accept().await?;
             let bus = self.bus.clone();
+            let db = self.db.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(bus, stream).await {
+                if let Err(e) = handle_connection(bus, db, stream).await {
                     tracing::error!("Relay connection error: {}", e);
                 }
             });
@@ -74,7 +78,7 @@ impl RelayServer {
     }
 }
 
-async fn handle_connection(bus: Bus, stream: UnixStream) -> Result<()> {
+async fn handle_connection(bus: Bus, db: Arc<Database>, stream: UnixStream) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -89,7 +93,7 @@ async fn handle_connection(bus: Bus, stream: UnixStream) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to register relay mailbox {}: {}", relay_name, e))?;
 
     tracing::info!("Relay: agent '{}' connected", agent_name);
-    process_requests(&mailbox, &agent_name, &mut lines, &mut writer).await?;
+    process_requests(&mailbox, &db, &agent_name, &mut lines, &mut writer).await?;
     tracing::info!("Relay: agent '{}' disconnected", agent_name);
     Ok(())
 }
@@ -110,6 +114,7 @@ async fn read_hello(
 
 async fn process_requests(
     mailbox: &Mailbox,
+    db: &Database,
     agent_name: &str,
     lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
@@ -119,7 +124,7 @@ async fn process_requests(
             continue;
         }
         let response = match serde_json::from_str::<RelayRequest>(&line) {
-            Ok(request) => handle_tool_call(mailbox, agent_name, &request),
+            Ok(request) => handle_tool_call(mailbox, db, agent_name, &request).await,
             Err(e) => {
                 tracing::error!("Relay: bad request from {}: {}", agent_name, e);
                 RelayResponse {
@@ -136,28 +141,41 @@ async fn process_requests(
     Ok(())
 }
 
-fn handle_tool_call(mailbox: &Mailbox, agent_name: &str, req: &RelayRequest) -> RelayResponse {
-    let result = match req.tool.as_str() {
+async fn handle_tool_call(
+    mailbox: &Mailbox,
+    db: &Database,
+    agent_name: &str,
+    req: &RelayRequest,
+) -> RelayResponse {
+    let role = role_from_agent_name(agent_name).unwrap_or(AgentRole::Developer);
+    let result = dispatch_tool(mailbox, db, agent_name, role, req).await;
+    match result {
+        Ok(val) => RelayResponse { id: req.id.clone(), result: Some(val), error: None },
+        Err(msg) => RelayResponse { id: req.id.clone(), result: None, error: Some(msg) },
+    }
+}
+
+async fn dispatch_tool(
+    mailbox: &Mailbox,
+    db: &Database,
+    agent_name: &str,
+    role: AgentRole,
+    req: &RelayRequest,
+) -> Result<serde_json::Value, String> {
+    use crate::task_tools as tt;
+    match req.tool.as_str() {
         "send_message" => handle_send_message(mailbox, agent_name, &req.args),
         "set_crew" => handle_set_crew(mailbox, agent_name, &req.args),
         "goal_complete" => handle_goal_complete(mailbox, agent_name, &req.args),
         "relieve_manager" => handle_relieve_manager(mailbox, agent_name, &req.args),
         "report" => handle_report(mailbox, agent_name, &req.args),
         "merge_request" => handle_merge_request(mailbox, agent_name, &req.args),
+        "create_task" => tt::handle_create_task(db, mailbox, agent_name, role, &req.args).await,
+        "list_tasks" => tt::handle_list_tasks(db, &req.args).await,
+        "approve_task" => tt::handle_approve_task(db, mailbox, agent_name, role, &req.args).await,
+        "complete_task" => tt::handle_complete_task(db, mailbox, agent_name, role, &req.args).await,
+        "reject_completion" => tt::handle_reject_completion(db, mailbox, agent_name, role, &req.args).await,
         unknown => Err(format!("unknown tool: {}", unknown)),
-    };
-
-    match result {
-        Ok(val) => RelayResponse {
-            id: req.id.clone(),
-            result: Some(val),
-            error: None,
-        },
-        Err(msg) => RelayResponse {
-            id: req.id.clone(),
-            result: None,
-            error: Some(msg),
-        },
     }
 }
 

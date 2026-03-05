@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig, BackendKind};
 use crate::control;
+use crate::dispatch::Dispatcher;
 use crate::relay::{self, RelayServer};
 use crate::types::{AgentId, AgentRole};
 use crate::worktree::{self, WorktreeConfig};
@@ -46,13 +47,14 @@ fn default_agent_factory() -> AgentFactory {
 pub struct OrchestratorRuntime {
     pub state: RuntimeState,
     pub bus: Bus,
-    db: Database,
+    db: Arc<Database>,
     session_store: SessionStore,
     working_dir: String,
     agent_handles: HashMap<String, JoinHandle<()>>,
     agent_factory: AgentFactory,
     pub backend: BackendKind,
     no_sandbox: bool,
+    dispatcher: Dispatcher,
 }
 
 impl OrchestratorRuntime {
@@ -72,14 +74,16 @@ impl OrchestratorRuntime {
             .unwrap_or("default");
         let session_store = SessionStore::new("agent-orchestrator", project);
 
+        let db = Arc::new(db);
+        let bus = Bus::new();
+        let dispatch_mailbox = bus
+            .register("dispatcher")
+            .map_err(|e| anyhow::anyhow!("Failed to register dispatcher: {}", e))?;
+        let dispatcher = Dispatcher::new(db.clone(), dispatch_mailbox);
+
         Ok(Self {
-            state: RuntimeState {
-                developer_count: 1,
-                manager_generation: 0,
-                last_relieve: None,
-                last_activity: Instant::now(),
-            },
-            bus: Bus::new(),
+            state: default_state(),
+            bus,
             db,
             session_store,
             working_dir,
@@ -87,6 +91,7 @@ impl OrchestratorRuntime {
             agent_factory: default_agent_factory(),
             backend,
             no_sandbox,
+            dispatcher,
         })
     }
 
@@ -98,27 +103,15 @@ impl OrchestratorRuntime {
         factory: AgentFactory,
         backend: BackendKind,
     ) -> Result<Self> {
-        let tmp = std::env::temp_dir().join(format!(
-            "orch-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
-
-        let db_path = tmp.join("tasks.db");
-        let db = Database::open(&db_path)
-            .await
-            .context("Failed to open test database")?;
-
-        let session_store = SessionStore::load(tmp.join("sessions"));
+        let (db, session_store) = open_test_stores().await?;
+        let db = Arc::new(db);
+        let dispatch_mailbox = bus
+            .register("dispatcher")
+            .map_err(|e| anyhow::anyhow!("Failed to register dispatcher: {}", e))?;
+        let dispatcher = Dispatcher::new(db.clone(), dispatch_mailbox);
 
         Ok(Self {
-            state: RuntimeState {
-                developer_count: 1,
-                manager_generation: 0,
-                last_relieve: None,
-                last_activity: Instant::now(),
-            },
+            state: default_state(),
             bus,
             db,
             session_store,
@@ -127,6 +120,7 @@ impl OrchestratorRuntime {
             agent_factory: factory,
             backend,
             no_sandbox: true,
+            dispatcher,
         })
     }
 
@@ -150,7 +144,7 @@ impl OrchestratorRuntime {
     }
 
     fn start_relay(&self) {
-        let relay = RelayServer::new(self.bus.clone());
+        let relay = RelayServer::new(self.bus.clone(), self.db.clone());
         let socket_path = relay::relay_socket_path();
         tokio::spawn(async move {
             if let Err(e) = relay.run(&socket_path).await {
@@ -173,16 +167,12 @@ impl OrchestratorRuntime {
     async fn process_bus_message(
         &mut self,
         msg: Option<agent_bus::BusMessage>,
-        mailbox: &Mailbox,
     ) -> Option<bool> {
         let msg = msg?;
         self.state.last_activity = Instant::now();
         let should_exit = self
             .handle_message(&msg.kind, &msg.payload, &msg.from)
             .await;
-        if msg.kind == "task_complete" || msg.kind == "task_blocked" {
-            self.notify_manager_task_state(mailbox).await;
-        }
         Some(should_exit)
     }
 
@@ -207,7 +197,7 @@ impl OrchestratorRuntime {
         loop {
             tokio::select! {
                 msg = mailbox.recv() => {
-                    match self.process_bus_message(msg, mailbox).await {
+                    match self.process_bus_message(msg).await {
                         Some(true) => break,
                         None => break,
                         _ => {}
@@ -232,14 +222,6 @@ impl OrchestratorRuntime {
             Some(task)
         } else {
             Some(format!("{}\n\n## Your Task\n{}", snapshot, task))
-        }
-    }
-
-    async fn notify_manager_task_state(&self, mailbox: &Mailbox) {
-        let snapshot = self.build_task_snapshot().await;
-        let payload = serde_json::json!({ "content": snapshot });
-        if let Err(e) = mailbox.send("manager", "task_update", payload) {
-            tracing::debug!("Failed to send task update to manager: {}", e);
         }
     }
 
@@ -318,19 +300,22 @@ impl OrchestratorRuntime {
                 let reason = payload_str(payload, "reason");
                 self.handle_relieve_manager(&reason).await;
             }
-            "task_complete" => self.record_task_event(from, payload).await,
-            "task_blocked" => self.record_task_event(from, payload).await,
+            "task_created" | "task_ready" | "task_done" => {
+                self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+            }
+            "task_complete" => {
+                let content = payload_str(payload, "content");
+                self.dispatcher.handle_dev_complete(from, &content).await;
+                self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+            }
+            "task_blocked" => {
+                let content = payload_str(payload, "content");
+                self.dispatcher.handle_dev_needs_info(from, &content).await;
+                self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+            }
             _ => tracing::debug!("Runtime ignoring unknown kind: {}", kind),
         }
         false
-    }
-
-    async fn record_task_event(&self, from: &str, payload: &serde_json::Value) {
-        let content = payload_str(payload, "content");
-        let title = first_line(&content);
-        if let Err(e) = self.db.create_task(title, Some(&content), 0, from).await {
-            tracing::error!("Failed to record task event: {}", e);
-        }
     }
 
     async fn shutdown(&mut self) {
@@ -640,6 +625,28 @@ fn build_mcp_config(agent_name: &str) -> String {
     .to_string()
 }
 
+fn default_state() -> RuntimeState {
+    RuntimeState {
+        developer_count: 1,
+        manager_generation: 0,
+        last_relieve: None,
+        last_activity: Instant::now(),
+    }
+}
+
+async fn open_test_stores() -> Result<(Database, SessionStore)> {
+    let tmp = std::env::temp_dir().join(format!(
+        "orch-test-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let db = Database::open(&tmp.join("tasks.db"))
+        .await
+        .context("Failed to open test database")?;
+    Ok((db, SessionStore::load(tmp.join("sessions"))))
+}
+
 fn payload_str(payload: &serde_json::Value, key: &str) -> String {
     payload
         .get(key)
@@ -653,10 +660,6 @@ fn payload_u8(payload: &serde_json::Value, key: &str, default: u8) -> u8 {
         .get(key)
         .and_then(|v| v.as_u64())
         .unwrap_or(default as u64) as u8
-}
-
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("")
 }
 
 fn is_worktree_role(bus_name: &str) -> bool {

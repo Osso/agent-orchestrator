@@ -64,6 +64,38 @@ struct MergeRequestParams {
     description: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CreateTaskParams {
+    /// Task title (short, actionable)
+    title: String,
+    /// Detailed task description with context and acceptance criteria
+    description: Option<String>,
+    /// Priority (0=none, 1=low, 2=medium, 3=high)
+    priority: Option<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ListTasksParams {
+    /// Filter by status: pending, ready, in_progress, needs_info, in_review, completed
+    status: Option<String>,
+    /// Filter by assignee (e.g. "developer-0")
+    assignee: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct TaskIdParams {
+    /// Task ID (e.g. "lt-abc123")
+    id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct RejectCompletionParams {
+    /// Task ID (e.g. "lt-abc123")
+    id: String,
+    /// Reason for rejection — what needs to be fixed
+    reason: String,
+}
+
 struct BufStream {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
@@ -125,76 +157,59 @@ struct OrchestratorMcp {
 
 #[tool_router]
 impl OrchestratorMcp {
-    #[tool(description = "Send a message to another agent. Use kind 'task_assignment' for tasks, 'architect_review' for reviews, 'task_complete'/'task_blocked' for status updates, 'interrupt' to stop an agent.")]
+    #[tool(description = "Send a message to another agent. Use kind 'task_complete'/'task_blocked' for status updates, 'interrupt' to stop an agent.")]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> String {
-        let args = match serde_json::to_value(&params) {
-            Ok(v) => v,
-            Err(e) => return format!("Error serializing params: {}", e),
-        };
-        match self.client.call("send_message", args).await {
-            Ok(_) => "Message sent".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
+        relay_call(&self.client, "send_message", &params, "Message sent").await
     }
 
     #[tool(description = "Declare the user's goal fully achieved. Triggers orchestrator shutdown. Manager only.")]
     async fn goal_complete(&self, Parameters(params): Parameters<GoalCompleteParams>) -> String {
-        let args = match serde_json::to_value(&params) {
-            Ok(v) => v,
-            Err(e) => return format!("Error serializing params: {}", e),
-        };
-        match self.client.call("goal_complete", args).await {
-            Ok(_) => "Goal marked complete. Orchestrator shutting down.".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
+        relay_call(&self.client, "goal_complete", &params, "Goal marked complete. Orchestrator shutting down.").await
     }
 
     #[tool(description = "Set the number of developer agents (1-3). Manager only.")]
     async fn set_crew(&self, Parameters(params): Parameters<SetCrewParams>) -> String {
-        let args = match serde_json::to_value(&params) {
-            Ok(v) => v,
-            Err(e) => return format!("Error serializing params: {}", e),
-        };
-        match self.client.call("set_crew", args).await {
-            Ok(_) => "Crew size updated".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
+        relay_call(&self.client, "set_crew", &params, "Crew size updated").await
     }
 
     #[tool(description = "Relieve the current manager and spawn a replacement. Auditor only.")]
     async fn relieve_manager(&self, Parameters(params): Parameters<RelieveManagerParams>) -> String {
-        let args = match serde_json::to_value(&params) {
-            Ok(v) => v,
-            Err(e) => return format!("Error serializing params: {}", e),
-        };
-        match self.client.call("relieve_manager", args).await {
-            Ok(_) => "Manager relieved".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
+        relay_call(&self.client, "relieve_manager", &params, "Manager relieved").await
     }
 
     #[tool(description = "Submit a progress evaluation or observation. Auditor only.")]
     async fn report(&self, Parameters(params): Parameters<ReportParams>) -> String {
-        let args = match serde_json::to_value(&params) {
-            Ok(v) => v,
-            Err(e) => return format!("Error serializing params: {}", e),
-        };
-        match self.client.call("report", args).await {
-            Ok(_) => "Report submitted".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
+        relay_call(&self.client, "report", &params, "Report submitted").await
     }
 
     #[tool(description = "Request that your branch be merged into main. Developer only. Call after committing all changes. Wait for merge_success or merge_failed response via send_message before reporting COMPLETE or BLOCKED.")]
     async fn merge_request(&self, Parameters(params): Parameters<MergeRequestParams>) -> String {
-        let args = match serde_json::to_value(&params) {
-            Ok(v) => v,
-            Err(e) => return format!("Error serializing params: {}", e),
-        };
-        match self.client.call("merge_request", args).await {
-            Ok(_) => "Merge request submitted".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
+        relay_call(&self.client, "merge_request", &params, "Merge request submitted").await
+    }
+
+    #[tool(description = "Create a new task in the task database. Manager only. Tasks start as 'pending' and must be approved by the architect before dispatch.")]
+    async fn create_task(&self, Parameters(params): Parameters<CreateTaskParams>) -> String {
+        relay_call_json(&self.client, "create_task", &params).await
+    }
+
+    #[tool(description = "List tasks from the database. Optionally filter by status or assignee. All roles.")]
+    async fn list_tasks(&self, Parameters(params): Parameters<ListTasksParams>) -> String {
+        relay_call_json(&self.client, "list_tasks", &params).await
+    }
+
+    #[tool(description = "Approve a pending task, setting it to 'ready' for auto-dispatch to developers. Architect only.")]
+    async fn approve_task(&self, Parameters(params): Parameters<TaskIdParams>) -> String {
+        relay_call(&self.client, "approve_task", &params, "Task approved").await
+    }
+
+    #[tool(description = "Mark an in_review task as completed/done. Architect/validator only.")]
+    async fn complete_task(&self, Parameters(params): Parameters<TaskIdParams>) -> String {
+        relay_call(&self.client, "complete_task", &params, "Task completed").await
+    }
+
+    #[tool(description = "Reject a task completion, sending it back to the developer for more work. Architect only.")]
+    async fn reject_completion(&self, Parameters(params): Parameters<RejectCompletionParams>) -> String {
+        relay_call(&self.client, "reject_completion", &params, "Completion rejected").await
     }
 }
 
@@ -210,6 +225,28 @@ impl ServerHandler for OrchestratorMcp {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+}
+
+/// Call a relay tool and return a fixed success message or the error.
+async fn relay_call<T: Serialize>(client: &RelayClient, tool: &str, params: &T, ok_msg: &str) -> String {
+    match serde_json::to_value(params) {
+        Ok(args) => match client.call(tool, args).await {
+            Ok(_) => ok_msg.to_string(),
+            Err(e) => format!("Error: {}", e),
+        },
+        Err(e) => format!("Error serializing params: {}", e),
+    }
+}
+
+/// Call a relay tool and return the JSON result or the error.
+async fn relay_call_json<T: Serialize>(client: &RelayClient, tool: &str, params: &T) -> String {
+    match serde_json::to_value(params) {
+        Ok(args) => match client.call(tool, args).await {
+            Ok(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|_| "ok".into()),
+            Err(e) => format!("Error: {}", e),
+        },
+        Err(e) => format!("Error serializing params: {}", e),
     }
 }
 
