@@ -13,7 +13,7 @@ cargo clippy                   # Lint
 
 ## Architecture
 
-Multi-agent orchestration system that coordinates AI coding assistants via an in-process message bus. Each agent runs Claude Code CLI through `llm-sdk` and communicates with peers through `agent-bus`.
+Multi-agent orchestration system that coordinates AI coding assistants via an in-process message bus. Each agent runs Claude Code CLI through `llm-sdk` and communicates with peers through `agent-bus`. Task coordination happens through a shared task database (`llm-tasks`).
 
 ### Dependencies (local crates)
 
@@ -21,39 +21,47 @@ Multi-agent orchestration system that coordinates AI coding assistants via an in
 - **agent-bus** (`../agent-bus`) — In-process message bus with named mailboxes
 - **llm-tasks** (`../llm-tasks`) — Task persistence via Turso/SQLite
 
-### Agent Roles and Message Flow
+### Task-Queue Dispatch Model
+
+The runtime is the central state machine. Agents signal intent via tools, the runtime handles all status transitions and dispatch.
 
 ```
-User → Manager → Architect → Developer-0..2
-           ↑          ↓            ↓
-           ←──────────←────────────←
-
-       Auditor (patrol timer every 10min, can RELIEVE manager)
-       Runtime (spawns/kills agents, maintains state)
+User → Manager (creates tasks) → DB [pending]
+                                   ↓
+       Architect (reviews)      → DB [ready]
+                                   ↓
+       Runtime (auto-dispatches) → Developer [in_progress]
+                                   ↓
+       Developer (signals done) → DB [in_review]
+                                   ↓
+       Architect (validates)    → DB [done]
 ```
 
-- **Manager**: Receives user requests, breaks into tasks, decides crew size (1-3 devs)
-- **Architect**: Reviews task approaches for simplicity/safety, approves with developer target
-- **Developer-N**: Implements approved tasks, reports completion or blockers (N = 0-2)
-- **Auditor**: Wakes every 10 minutes via patrol timer, evaluates task snapshot, can fire manager via RELIEVE
-- **Runtime**: Spawns/kills agents, handles CREW/RELIEVE commands, maintains task log
+**Task statuses**: `pending` → `ready` → `in_progress` → `in_review` → `done` (or `needs_info` from developer)
 
-### Communication Protocol
+### Agent Roles
 
-Agents communicate via structured output lines that get parsed and routed:
+- **Manager**: Creates tasks via `create_task` tool. Never messages developers directly.
+- **Architect**: Reviews pending tasks (`approve_task`), validates completions (`complete_task`/`reject_completion`).
+- **Developer-N**: Receives auto-dispatched tasks, implements them, signals completion via bus messages.
+- **Auditor**: Wakes every 10 minutes, evaluates task snapshot, can fire manager via RELIEVE.
+- **Runtime**: State machine — dispatches ready tasks to idle developers, handles all DB transitions.
 
-| Prefix | From | To | Purpose |
-|--------|------|-----|---------|
-| `TASK:` | Manager | Architect | New task for review |
-| `APPROVED: developer-N` | Architect | Developer-N | Task approved, start work |
-| `REJECTED:` | Architect | Manager | Approach rejected |
-| `COMPLETE:` | Developer | Manager | Task finished |
-| `BLOCKED:` | Developer | Manager | Task stuck, needs help |
-| `INTERRUPT:` | Architect | Developer | Stop current work |
-| `CREW: N` | Manager | Runtime | Set developer count (1-3) |
-| `RELIEVE:` | Auditor | Runtime | Fire manager, spawn replacement |
-| `EVALUATION:` | Auditor | (logged) | Progress assessment |
-| `OBSERVATION:` | Auditor | (logged) | Issue noticed |
+### MCP Tools (via relay)
+
+| Tool | Roles | Purpose |
+|------|-------|---------|
+| `create_task` | Manager | Create task (pending) |
+| `list_tasks` | All | Query task DB |
+| `approve_task` | Architect | pending → ready |
+| `complete_task` | Architect | in_review → done |
+| `reject_completion` | Architect | in_review → in_progress (back to dev) |
+| `send_message` | All | Direct bus messages |
+| `set_crew` | Manager | Set developer count (1-3) |
+| `goal_complete` | Manager | Trigger shutdown |
+| `merge_request` | Developer | Request branch merge |
+| `relieve_manager` | Auditor | Fire manager |
+| `report` | Auditor | Submit evaluation |
 
 ### Module Structure
 
@@ -62,37 +70,35 @@ src/
 ├── types/
 │   ├── mod.rs
 │   └── agent.rs        # AgentRole, AgentId (role + index)
-├── agent.rs            # Agent struct, output parsing, message routing
+├── agent.rs            # Agent struct, completer abstraction, message handling
 ├── runtime.rs          # OrchestratorRuntime, agent lifecycle, state
+├── dispatch.rs         # Dispatcher: task→developer matching, DB transitions
+├── task_tools.rs       # Task DB tool handlers (create, approve, complete, etc.)
+├── relay.rs            # Unix socket relay: MCP subprocess → bus + DB
+├── mcp.rs              # MCP stdio server (spawned by Claude CLI)
+├── bus_tools.rs        # ToolDef impls for OpenRouter agents (bus-direct)
+├── control.rs          # Control socket for external commands
+├── worktree.rs         # Git worktree management for developers
 └── main.rs             # CLI entrypoint (run/orchestrate/send)
 ```
 
 ### Key Abstractions
 
-**Agent** (`agent.rs`):
-- Holds a `Session` (from llm-sdk) and a base `Claude` instance
-- `session.complete(&base_claude, content)` handles resume, expiry, retry
-- Parses structured output lines and routes via `agent-bus` mailbox
-- Base Claude is configured per-role (permission mode, working dir)
+**Dispatcher** (`dispatch.rs`):
+- Tracks developer→task assignments
+- `try_dispatch()`: matches ready tasks to idle developers, claims via DB, sends task_assignment
+- `handle_dev_complete()`: transitions task to in_review, notifies architect
+- `handle_dev_needs_info()`: transitions to needs_info, notifies manager
 
-**Session Persistence** (via `llm-sdk::session`):
-- `SessionStore::new("agent-orchestrator", project)` → `~/.local/share/agent-orchestrator/{project}/sessions.json`
-- Each agent gets a `Session` keyed by bus name (e.g. "manager", "developer-0")
-- Sessions resume across restarts; `SessionExpired` triggers automatic retry with fresh session
-- On manager RELIEVE, session is removed via `store.remove("manager")` so replacement starts fresh
+**Agent** (`agent.rs`):
+- Holds a `Completer` (Session+Claude or OpenRouter) and a bus `Mailbox`
+- On task_assignment: resets session, processes prompt, auto-reports completion/blocked to runtime
+- Base Claude is configured per-role (permission mode, working dir, sandbox)
 
 **OrchestratorRuntime** (`runtime.rs`):
-- Owns the `Bus`, `SessionStore`, and `Database`
+- Owns the `Bus`, `SessionStore`, `Database` (Arc-shared with relay), and `Dispatcher`
 - Spawns agents with `AgentConfig` + `Session` from the store
-- `CREW:` commands dynamically spawn/kill developer agents (1-3)
-- `RELIEVE:` fires manager, clears session, spawns replacement with state briefing (60s cooldown)
-- Records task events to llm-tasks database
-
-**Output Parsing** (`agent.rs`):
-- Section-based parser: scans for recognized prefixes, collects multi-line content until next prefix
-- Strips markdown bold (`**TASK:**` → `TASK:`) before matching
-- Routes via table: prefix → target role + message kind
-- Single-line prefixes: `CREW:`, `RELIEVE:` (no continuation lines)
+- Command loop handles bus messages and delegates to dispatcher for task events
 
 ## Usage
 
