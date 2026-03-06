@@ -280,6 +280,33 @@ impl OrchestratorRuntime {
         }
     }
 
+    async fn handle_task_event(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
+        match kind {
+            "task_created" => {
+                let task_id = support::payload_str(payload, "task_id");
+                let msg = serde_json::json!({"content": format!("Review pending task {}", task_id), "task_id": task_id});
+                let _ = self.dispatcher.notify("architect", "review_task", msg);
+            }
+            "task_complete" => {
+                self.ensure_agent(AgentRole::Merger, 0);
+                let content = support::payload_str(payload, "content");
+                self.dispatcher.handle_dev_complete(from, &content).await;
+            }
+            "task_blocked" => {
+                let content = support::payload_str(payload, "content");
+                self.dispatcher.handle_dev_needs_info(from, &content).await;
+            }
+            "dev_heartbeat" => {
+                let dev = support::payload_str(payload, "developer");
+                if !dev.is_empty() { self.dispatcher.record_activity(&dev); }
+                return;
+            }
+            _ => {}
+        }
+        self.ensure_developers();
+        self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+    }
+
     async fn check_dev_timeouts(&mut self) {
         let timed_out = self.dispatcher.check_timeouts().await;
         for dev_name in &timed_out {
@@ -343,26 +370,9 @@ impl OrchestratorRuntime {
                 let reason = support::payload_str(payload, "reason");
                 self.handle_relieve_manager(&reason).await;
             }
-            "task_created" | "task_ready" | "task_done" => {
-                self.ensure_developers();
-                self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
-            }
-            "task_complete" => {
-                self.ensure_agent(AgentRole::Merger, 0);
-                let content = support::payload_str(payload, "content");
-                self.dispatcher.handle_dev_complete(from, &content).await;
-                self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
-            }
-            "task_blocked" => {
-                let content = support::payload_str(payload, "content");
-                self.dispatcher.handle_dev_needs_info(from, &content).await;
-                self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
-            }
-            "dev_heartbeat" => {
-                let dev = support::payload_str(payload, "developer");
-                if !dev.is_empty() {
-                    self.dispatcher.record_activity(&dev);
-                }
+            "task_created" | "task_ready" | "task_done"
+            | "task_complete" | "task_blocked" | "dev_heartbeat" => {
+                self.handle_task_event(kind, payload, from).await;
             }
             _ => tracing::debug!("Runtime ignoring unknown kind: {}", kind),
         }

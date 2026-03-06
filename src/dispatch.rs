@@ -89,7 +89,7 @@ impl Dispatcher {
     pub async fn watchdog(&mut self) -> usize {
         let mut fixed = 0;
         fixed += self.reclaim_orphaned_in_progress().await;
-        fixed += self.clear_stale_ready_assignees().await;
+        fixed += self.clear_stale_assignees().await;
         if fixed > 0 {
             tracing::info!("Watchdog fixed {} stuck tasks", fixed);
         }
@@ -123,11 +123,19 @@ impl Dispatcher {
         count
     }
 
-    async fn clear_stale_ready_assignees(&self) -> usize {
-        let tasks = match self.db.list_tasks(Some("ready"), None).await {
+    async fn clear_stale_assignees(&self) -> usize {
+        let mut count = 0;
+        for status in &["pending", "ready"] {
+            count += self.clear_assignees_for_status(status).await;
+        }
+        count
+    }
+
+    async fn clear_assignees_for_status(&self, status: &str) -> usize {
+        let tasks = match self.db.list_tasks(Some(status), None).await {
             Ok(t) => t,
             Err(e) => {
-                tracing::error!("Failed to query ready tasks: {}", e);
+                tracing::error!("Failed to query {} tasks: {}", status, e);
                 return 0;
             }
         };
@@ -136,7 +144,7 @@ impl Dispatcher {
             if task.assignee.is_none() {
                 continue;
             }
-            tracing::warn!("Clearing stale assignee on ready task {} ({:?})", task.id, task.assignee);
+            tracing::warn!("Clearing stale assignee on {} task {} ({:?})", status, task.id, task.assignee);
             if let Err(e) = self.db.clear_assignee(&task.id, "runtime").await {
                 tracing::error!("Failed to clear assignee on task {}: {}", task.id, e);
             } else {
@@ -216,6 +224,11 @@ impl Dispatcher {
         } else {
             tracing::info!("Dispatched task {} to {}", task.id, dev);
         }
+    }
+
+    /// Send a message via the dispatcher's mailbox.
+    pub fn notify(&self, to: &str, kind: &str, payload: serde_json::Value) -> Result<(), String> {
+        self.mailbox.send(to, kind, payload).map(|_| ()).map_err(|e| e.to_string())
     }
 
     /// Remove a developer from tracking (e.g. when aborted).
