@@ -152,10 +152,16 @@ impl TasksMcp {
             assignee: None,
         };
         match self.db.update_task(&p.id, updates, "user").await {
-            Ok(()) => match self.db.get_task(&p.id).await {
-                Ok(task) => to_json(&task),
-                Err(e) => err(e),
-            },
+            Ok(()) => {
+                if is_dispatchable(p.status.as_deref()) {
+                    let _ = self.db.clear_assignee(&p.id, "user").await;
+                    notify_runtime(&self.project, &p.id);
+                }
+                match self.db.get_task(&p.id).await {
+                    Ok(task) => to_json(&task),
+                    Err(e) => err(e),
+                }
+            }
             Err(e) => err(e),
         }
     }
@@ -238,6 +244,10 @@ impl ServerHandler for TasksMcp {
             ..Default::default()
         }
     }
+}
+
+fn is_dispatchable(status: Option<&str>) -> bool {
+    matches!(status, Some("pending" | "ready"))
 }
 
 fn can_delete_immediately(status: &str) -> bool {
