@@ -242,6 +242,7 @@ async fn call_haiku(prompt: &str) -> Result<String, String> {
         .arg("--model")
         .arg("haiku")
         .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .output()
         .await
         .map_err(|e| format!("failed to run claude: {e}"))?;
@@ -288,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live claude-architect daemon + claude CLI
+    #[ignore] // requires live daemon + claude CLI (cannot run inside Claude Code session)
     async fn review_completion_returns_assessment() {
         assert!(daemon_available(), "claude-architect daemon not running");
         let result = review_completion(
