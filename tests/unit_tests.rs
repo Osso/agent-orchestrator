@@ -108,7 +108,6 @@ fn bus_tools_match_role_responsibilities() {
     let dev_tools = bus_tools_for_role(AgentRole::Developer, dev_mailbox);
     let dev_names: Vec<String> = dev_tools.definitions().iter().map(|d| d.name.clone()).collect();
     assert!(dev_names.contains(&"send_message".to_string()));
-    assert!(dev_names.contains(&"merge_request".to_string()));
 
     // Auditor: oversight tools
     let aud_mailbox = std::sync::Arc::new(bus.register("test-aud").unwrap());

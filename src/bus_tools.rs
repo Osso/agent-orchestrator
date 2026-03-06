@@ -36,9 +36,6 @@ pub fn bus_tools_for_role(role: AgentRole, mailbox: Arc<Mailbox>) -> llm_sdk::to
             });
             set = set.add(ReportTool { mailbox });
         }
-        AgentRole::Developer => {
-            set = set.add(MergeRequestTool { mailbox });
-        }
         _ => {}
     }
 
@@ -277,45 +274,3 @@ impl ToolDef for ReportTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// merge_request
-// ---------------------------------------------------------------------------
-
-struct MergeRequestTool {
-    mailbox: Arc<Mailbox>,
-}
-
-#[async_trait::async_trait]
-impl ToolDef for MergeRequestTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "merge_request".into(),
-            description: "Request that your branch be merged into main. Developer only.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "branch": { "type": "string", "description": "Branch name to merge" },
-                    "description": { "type": "string", "description": "Changes description" }
-                },
-                "required": ["branch", "description"]
-            }),
-        }
-    }
-
-    async fn execute(&self, arguments: &str) -> String {
-        let args: serde_json::Value = match serde_json::from_str(arguments) {
-            Ok(v) => v,
-            Err(e) => return format!("Invalid arguments: {e}"),
-        };
-        let branch = args["branch"].as_str().unwrap_or("");
-        let description = args["description"].as_str().unwrap_or("");
-        let payload = serde_json::json!({
-            "branch": branch,
-            "description": description,
-        });
-        match self.mailbox.send("merger", "merge_request", payload) {
-            Ok(_) => "Merge request submitted".into(),
-            Err(e) => format!("Send failed: {e}"),
-        }
-    }
-}

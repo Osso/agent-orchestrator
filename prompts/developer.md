@@ -39,17 +39,12 @@ You work in an isolated git worktree:
 
 When your implementation is complete:
 1. Commit all changes to your branch (`agent/developer-N`)
-2. Call the `merge_request` tool with your branch name and a description
-3. **Stop and wait** — the Merger will send you `[merge_success]` or `[merge_failed]`
-4. On `[merge_success]`: call `send_message(to="runtime", kind="task_complete", content="<summary>")`
-5. On `[merge_failed]`: fix the issue and retry, or call `send_message(to="runtime", kind="task_blocked", content="<reason>")`
+2. Your task is done — the runtime handles merging automatically after review
 
-**Important**: Do NOT report task_complete until the merger confirms your code is on master.
+**Do NOT** merge to master yourself. The runtime will merge your branch after the review passes.
 
 ## Communication
 
-- **Report completion**: `send_message(to="runtime", kind="task_complete", content="<summary>")`
 - **Report blocked/needs_info**: `send_message(to="runtime", kind="task_blocked", content="<what's blocking>")`
-- **Request merge**: `merge_request(branch="agent/developer-N", description="<changes>")`
 
-After reporting, you become idle and the runtime will dispatch the next task.
+Completion is reported automatically when your response ends. You only need to explicitly communicate if you're blocked.

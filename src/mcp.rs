@@ -57,14 +57,6 @@ struct GoalCompleteParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct MergeRequestParams {
-    /// Branch name to merge (e.g. "agent/developer-0")
-    branch: String,
-    /// Description of the changes in this branch
-    description: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CreateTaskParams {
     /// Task title (short, actionable)
     title: String,
@@ -167,11 +159,6 @@ impl OrchestratorMcp {
     #[tool(description = "Submit a progress evaluation or observation. Auditor only.")]
     async fn report(&self, Parameters(params): Parameters<ReportParams>) -> String {
         relay_call(&self.client, "report", &params, "Report submitted").await
-    }
-
-    #[tool(description = "Request that your branch be merged into main. Developer only. Call after committing all changes. Wait for merge_success or merge_failed response via send_message before reporting COMPLETE or BLOCKED.")]
-    async fn merge_request(&self, Parameters(params): Parameters<MergeRequestParams>) -> String {
-        relay_call(&self.client, "merge_request", &params, "Merge request submitted").await
     }
 
     #[tool(description = "Create a new task in the task database. Manager only. Tasks start as 'pending' and must be approved by the architect before dispatch.")]

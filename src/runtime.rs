@@ -310,11 +310,14 @@ impl OrchestratorRuntime {
                 self.spawn_architect_validation(&task_id).await;
             }
             "task_complete" => {
-                self.ensure_agent(AgentRole::Merger, 0);
                 let content = support::payload_str(payload, "content");
                 if let Some(task_id) = self.dispatcher.handle_dev_complete(from, &content).await {
                     self.spawn_completion_review(&task_id, &content);
                 }
+            }
+            "task_done" => {
+                let task_id = support::payload_str(payload, "task_id");
+                self.merge_developer_branch(&task_id).await;
             }
             "task_blocked" => {
                 let content = support::payload_str(payload, "content");
@@ -361,6 +364,31 @@ impl OrchestratorRuntime {
             self.db.clone(), self.bus.clone(),
             self.project.clone(), self.working_dir.clone(), task,
         );
+    }
+
+    /// Look up the task's assignee and send merge_request to the merger.
+    async fn merge_developer_branch(&mut self, task_id: &str) {
+        let assignee = match self.db.get_task(task_id).await {
+            Ok(t) => t.assignee.unwrap_or_default(),
+            Err(e) => {
+                tracing::error!("Failed to get task {task_id} for merge: {e}");
+                return;
+            }
+        };
+        if assignee.is_empty() || !assignee.starts_with("developer-") {
+            tracing::warn!("Task {task_id} has no developer assignee, skipping merge");
+            return;
+        }
+        self.ensure_agent(AgentRole::Merger, 0);
+        let branch = format!("agent/{}", assignee);
+        let payload = serde_json::json!({
+            "branch": branch,
+            "description": format!("Merge reviewed task {task_id}"),
+            "from_developer": assignee,
+        });
+        if let Err(e) = self.dispatcher.notify("merger", "merge_request", payload) {
+            tracing::error!("Failed to send merge_request for {task_id}: {e}");
+        }
     }
 
     fn spawn_completion_review(&self, task_id: &str, dev_output: &str) {

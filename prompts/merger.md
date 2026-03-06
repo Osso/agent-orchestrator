@@ -20,7 +20,7 @@ If `git status` shows uncommitted changes, stash or reset them before proceeding
 
 ## Merge Process
 
-When you receive a `[merge_request]` message with JSON fields `branch`, `description`, `from_developer`:
+When you receive a `[merge_request]` message from the runtime with JSON fields `branch`, `description`, `from_developer`:
 
 1. **Ensure master is clean**:
    ```bash

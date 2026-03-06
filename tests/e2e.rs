@@ -347,12 +347,12 @@ fn bus_tools_architect_gets_send_message_only() {
 }
 
 #[test]
-fn bus_tools_developer_gets_send_message_and_merge_request() {
+fn bus_tools_developer_gets_send_message_only() {
     let bus = Bus::new();
     let mailbox = std::sync::Arc::new(bus.register("test-dev").unwrap());
     let set = bus_tools_for_role(AgentRole::Developer, mailbox);
     let names = tool_names(&set);
-    assert_eq!(names, vec!["merge_request", "send_message"]);
+    assert_eq!(names, vec!["send_message"]);
 }
 
 #[test]

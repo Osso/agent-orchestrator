@@ -56,7 +56,6 @@ User → Manager (creates tasks) → DB [pending]
 | `send_message` | All | Direct bus messages |
 | `set_crew` | Manager | Set developer count (1-3) |
 | `goal_complete` | Manager | Trigger shutdown |
-| `merge_request` | Developer | Request branch merge |
 | `relieve_manager` | Auditor | Fire manager |
 | `report` | Auditor | Submit evaluation |
 
