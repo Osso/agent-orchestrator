@@ -15,6 +15,7 @@ use agent_bus::{Bus, Mailbox};
 use anyhow::{Context, Result};
 use llm_sdk::session::SessionStore;
 use llm_tasks::db::Database;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig, BackendKind};
@@ -128,18 +129,43 @@ impl OrchestratorRuntime {
         })
     }
 
-    pub async fn run(mut self, initial_task: Option<String>) -> Result<()> {
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// Run in standalone mode (creates its own control server).
+    pub async fn run(self, initial_task: Option<String>) -> Result<()> {
+        let registry = control::new_registry();
+        registry.write().unwrap().insert(self.project.clone(), self.bus.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(control::run_control_server(
+            registry,
+            shutdown_tx.clone(),
+            shutdown_rx,
+        ));
+
+        self.run_with_shutdown(initial_task, shutdown_tx).await
+    }
+
+    /// Run as part of a daemon (control server managed externally).
+    pub async fn run_managed(self, shutdown_tx: watch::Sender<bool>) -> Result<()> {
+        self.run_with_shutdown(None, shutdown_tx).await
+    }
+
+    async fn run_with_shutdown(
+        mut self,
+        initial_task: Option<String>,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> Result<()> {
         let mut mailbox = self
             .bus
             .register("runtime")
             .map_err(|e| anyhow::anyhow!("Failed to register runtime: {}", e))?;
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
         llm_sdk::sandbox::ensure_state_dirs();
         self.start_relay();
-        self.start_control_server(shutdown_tx.clone(), shutdown_rx);
-        // Brief pause for relay and control to bind their sockets before agents connect
+        // Brief pause for relay to bind its socket before agents connect
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let enriched_task = self.enrich_with_task_state(initial_task).await;
@@ -155,16 +181,6 @@ impl OrchestratorRuntime {
                 tracing::error!("Relay server error: {}", e);
             }
         });
-    }
-
-    fn start_control_server(
-        &self,
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
-        shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let bus = self.bus.clone();
-        let project = self.project.clone();
-        tokio::spawn(control::run_control_server(bus, project, shutdown_tx, shutdown_rx));
     }
 
     /// Process a single bus message. Returns true if the orchestrator should exit.
@@ -604,7 +620,8 @@ pub fn resolve_sandbox(
     if is_dev {
         let dev_path = worktree_result.unwrap_or_else(|_| project_path.to_path_buf());
         if use_sandbox {
-            let prefix = llm_sdk::sandbox::developer_prefix(&dev_path);
+            let git_dir = find_git_dir(project_path);
+            let prefix = llm_sdk::sandbox::developer_prefix(&dev_path, git_dir.as_deref());
             return (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix);
         }
         return (dev_path.to_string_lossy().into_owned(), Vec::new());
@@ -616,6 +633,30 @@ pub fn resolve_sandbox(
     } else {
         (project_path.to_string_lossy().into_owned(), Vec::new())
     }
+}
+
+/// Find the `.git` directory for a project (resolves worktree indirection).
+fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
+    let git_path = project_path.join(".git");
+    if git_path.is_dir() {
+        return Some(git_path);
+    }
+    // .git might be a file (worktree pointer): "gitdir: /path/to/.git/worktrees/name"
+    if git_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&git_path) {
+            if let Some(gitdir) = content.strip_prefix("gitdir: ") {
+                let gitdir = gitdir.trim();
+                // Walk up to find the actual .git dir (parent of worktrees/)
+                let p = Path::new(gitdir);
+                if let Some(parent) = p.parent().and_then(|p| p.parent()) {
+                    if parent.is_dir() {
+                        return Some(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn build_mcp_config(agent_name: &str, project: &str) -> String {

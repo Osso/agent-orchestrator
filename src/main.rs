@@ -81,6 +81,7 @@ async fn cmd_mcp_serve(args: &[String]) -> Result<()> {
 async fn cmd_mcp_tasks(args: &[String]) -> Result<()> {
     let project = extract_named_arg(args, "--project")
         .or_else(|| std::env::var("CLAUDE_CODE_TASK_LIST_ID").ok())
+        .or_else(|| project_from_cwd())
         .ok_or_else(|| anyhow::anyhow!("--project or CLAUDE_CODE_TASK_LIST_ID required"))?;
     let db_path = db_path_for_project(&project);
     agent_orchestrator::mcp_tasks::run(&db_path, &project).await
@@ -118,6 +119,15 @@ fn db_path_for_project(working_dir: &str) -> PathBuf {
     base.join(APP_NAME).join(project).join("tasks.db")
 }
 
+/// Derive project name from the current working directory basename.
+fn project_from_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()?
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+}
+
 fn extract_named_arg(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
@@ -130,8 +140,8 @@ fn cmd_notify(args: &[String]) -> Result<()> {
     let task_id = args.iter()
         .find(|a| *a != "--project" && *a != &project && *a != "notify" && *a != &args[0])
         .ok_or_else(|| anyhow::anyhow!("Usage: agent-orchestrator notify --project <name> <task-id>"))?;
-    let socket = control::control_socket_path(&project);
-    let request = control::ControlRequest::NotifyTaskCreated { task_id: task_id.clone() };
+    let socket = control::control_socket_path();
+    let request = control::ControlRequest::NotifyTaskCreated { project, task_id: task_id.clone() };
     let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
     match response {
         control::ControlResponse::Ok => println!("Notified runtime about {}", task_id),
@@ -143,8 +153,9 @@ fn cmd_notify(args: &[String]) -> Result<()> {
 
 fn send_message(project: &str, to: &str, content: &str) -> Result<()> {
     use control::{ControlRequest, ControlResponse};
-    let socket = control::control_socket_path(project);
+    let socket = control::control_socket_path();
     let request = ControlRequest::SendMessage {
+        project: project.to_string(),
         to: to.to_string(),
         content: content.to_string(),
     };

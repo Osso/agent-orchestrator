@@ -190,9 +190,8 @@ impl TasksMcp {
     #[tool(description = "Set the number of developer agents (1-3). Requires a running orchestrator.")]
     async fn set_developers(&self, Parameters(p): Parameters<SetDevelopersParams>) -> String {
         let count = p.count.clamp(1, 3);
-        let socket_path = control::control_socket_path(&self.project);
-
-        let req = control::ControlRequest::SetDevelopers { count };
+        let socket_path = control::control_socket_path();
+        let req = control::ControlRequest::SetDevelopers { project: self.project.clone(), count };
         match tokio::task::spawn_blocking(move || {
             peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
                 &socket_path, &req,
@@ -238,8 +237,8 @@ fn err(e: impl std::fmt::Display) -> String {
 /// Notify the running orchestrator that a task was created.
 /// Silently fails if no orchestrator is running.
 fn notify_runtime(project: &str, task_id: &str) {
-    let socket_path = control::control_socket_path(project);
-    let req = control::ControlRequest::NotifyTaskCreated { task_id: task_id.to_string() };
+    let socket_path = control::control_socket_path();
+    let req = control::ControlRequest::NotifyTaskCreated { project: project.to_string(), task_id: task_id.to_string() };
     let _ = peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
         &socket_path, &req,
     );
