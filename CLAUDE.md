@@ -55,7 +55,7 @@ User → Manager (creates tasks) → DB [pending]
 | `list_tasks` | All | Query task DB |
 | `approve_task` | Architect | pending → ready |
 | `complete_task` | Architect | in_review → done |
-| `reject_completion` | Architect | in_review → in_progress (back to dev) |
+| `reject_completion` | Architect | in_review → ready (re-dispatch) |
 | `send_message` | All | Direct bus messages |
 | `set_crew` | Manager | Set developer count (1-3) |
 | `goal_complete` | Manager | Trigger shutdown |

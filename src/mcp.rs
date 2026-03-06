@@ -207,7 +207,7 @@ impl OrchestratorMcp {
         relay_call(&self.client, "complete_task", &params, "Task completed").await
     }
 
-    #[tool(description = "Reject a task completion, sending it back to the developer for more work. Architect only.")]
+    #[tool(description = "Reject a task completion. Task returns to ready for re-dispatch. Architect only.")]
     async fn reject_completion(&self, Parameters(params): Parameters<RejectCompletionParams>) -> String {
         relay_call(&self.client, "reject_completion", &params, "Completion rejected").await
     }

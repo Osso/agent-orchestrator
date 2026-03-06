@@ -111,31 +111,15 @@ pub async fn handle_reject_completion(
     if task.status != "in_review" {
         return Err(format!("Cannot reject task {}: status is {}", id, task.status));
     }
-    let updates = TaskUpdates { status: Some("in_progress"), ..Default::default() };
+    let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
     db.update_task(id, updates, agent_name)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
-    notify_developer_rejection(mailbox, &task, id, reason);
     let _ = mailbox.send(
         "manager",
         "task_rejected",
         serde_json::json!({"content": format!("Task {} rejected: {}", id, reason), "task_id": id}),
     );
-    Ok(serde_json::json!({"ok": true, "status": "in_progress"}))
+    Ok(serde_json::json!({"ok": true, "status": "ready"}))
 }
 
-fn notify_developer_rejection(
-    mailbox: &Mailbox,
-    task: &llm_tasks::db::Task,
-    id: &str,
-    reason: &str,
-) {
-    if let Some(assignee) = &task.assignee {
-        let content = format!(
-            "Completion rejected for task {}: {}\n\nOriginal task: {}",
-            id, reason, task.title
-        );
-        let payload = serde_json::json!({"content": content, "task_id": id});
-        let _ = mailbox.send(assignee, "task_assignment", payload);
-    }
-}
