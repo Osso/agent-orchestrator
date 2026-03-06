@@ -630,6 +630,9 @@ impl OrchestratorRuntime {
         if let Some(handle) = self.agent_handles.remove(name) {
             tracing::info!("Stopping {}", name);
             handle.abort();
+            // Clean up relay mailbox so the next spawn can register it
+            let relay_name = format!("relay-{}", name);
+            self.bus.deregister(&relay_name);
             self.try_remove_worktree(name);
         }
     }

@@ -12,7 +12,8 @@ use agent_bus::Mailbox;
 use llm_tasks::db::{Database, TaskUpdates};
 
 /// How long a developer can be idle before its task is reclaimed.
-pub const DEV_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Long timeout because Claude API turns can take 10+ minutes for complex code generation.
+pub const DEV_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 struct DevAssignment {
     task_id: String,
