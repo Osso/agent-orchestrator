@@ -111,7 +111,7 @@ pub async fn handle_reject_completion(
     if task.status != "in_review" {
         return Err(format!("Cannot reject task {}: status is {}", id, task.status));
     }
-    let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
+    let updates = TaskUpdates { status: Some("ready"), assignee: Some(""), ..Default::default() };
     db.update_task(id, updates, agent_name)
         .await
         .map_err(|e| format!("DB error: {e}"))?;

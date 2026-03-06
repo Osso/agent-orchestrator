@@ -81,6 +81,34 @@ impl Dispatcher {
         aborted
     }
 
+    /// Reclaim tasks that are in_progress but not tracked by any developer.
+    /// Returns number of tasks reclaimed.
+    pub async fn reclaim_orphaned_tasks(&mut self) -> usize {
+        let tasks = match self.db.list_tasks(Some("in_progress"), None).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to query in_progress tasks: {}", e);
+                return 0;
+            }
+        };
+        let tracked_task_ids: Vec<&str> =
+            self.dev_tasks.values().map(|a| a.task_id.as_str()).collect();
+        let mut reclaimed = 0;
+        for task in &tasks {
+            if tracked_task_ids.contains(&task.id.as_str()) {
+                continue;
+            }
+            tracing::warn!("Reclaiming orphaned task {} (assignee: {:?})", task.id, task.assignee);
+            let updates = TaskUpdates { status: Some("ready"), assignee: Some(""), ..Default::default() };
+            if let Err(e) = self.db.update_task(&task.id, updates, "runtime").await {
+                tracing::error!("Failed to reclaim orphaned task {}: {}", task.id, e);
+            } else {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
     async fn transition_to_review(&self, task_id: &str, dev: &str, summary: &str) {
         let updates = TaskUpdates { status: Some("in_review"), ..Default::default() };
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {

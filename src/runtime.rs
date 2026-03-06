@@ -270,7 +270,8 @@ impl OrchestratorRuntime {
             tracing::warn!("Aborting timed-out developer {}", dev_name);
             self.abort_agent(dev_name);
         }
-        if !timed_out.is_empty() {
+        let orphaned = self.dispatcher.reclaim_orphaned_tasks().await;
+        if !timed_out.is_empty() || orphaned > 0 {
             self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
         }
     }
