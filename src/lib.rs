@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod mcp_tasks;
 pub mod relay;
 pub mod runtime;
+pub mod runtime_support;
 pub mod task_tools;
 pub mod types;
 pub mod worktree;

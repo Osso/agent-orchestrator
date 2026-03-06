@@ -22,6 +22,7 @@ use crate::agent::{Agent, AgentConfig, BackendKind};
 use crate::control;
 use crate::dispatch::Dispatcher;
 use crate::relay::{self, RelayServer};
+use crate::runtime_support::{self as support, CommandTimers};
 use crate::types::{AgentId, AgentRole};
 use crate::worktree::{self, WorktreeConfig};
 
@@ -85,7 +86,7 @@ impl OrchestratorRuntime {
         let dispatcher = Dispatcher::new(db.clone(), dispatch_mailbox);
 
         Ok(Self {
-            state: default_state(),
+            state: support::default_state(),
             bus,
             db,
             session_store,
@@ -107,7 +108,7 @@ impl OrchestratorRuntime {
         factory: AgentFactory,
         backend: BackendKind,
     ) -> Result<Self> {
-        let (db, session_store) = open_test_stores().await?;
+        let (db, session_store) = support::open_test_stores().await?;
         let db = Arc::new(db);
         let dispatch_mailbox = bus
             .register("dispatcher")
@@ -115,7 +116,7 @@ impl OrchestratorRuntime {
         let dispatcher = Dispatcher::new(db.clone(), dispatch_mailbox);
 
         Ok(Self {
-            state: default_state(),
+            state: support::default_state(),
             bus,
             db,
             session_store,
@@ -211,6 +212,7 @@ impl OrchestratorRuntime {
                         _ => {}
                     }
                 }
+                _ = timers.poll.tick() => self.poll_dispatch().await,
                 _ = timers.timeout.tick() => self.check_dev_timeouts().await,
                 _ = timers.nudge.tick() => self.maybe_nudge_manager(mailbox).await,
                 _ = timers.audit.tick() => self.send_audit_snapshot(mailbox).await,
@@ -235,7 +237,8 @@ impl OrchestratorRuntime {
         }
     }
 
-    async fn send_audit_snapshot(&self, mailbox: &Mailbox) {
+    async fn send_audit_snapshot(&mut self, mailbox: &Mailbox) {
+        self.ensure_agent(AgentRole::Auditor, 0);
         let snapshot = self.build_task_snapshot().await;
         let payload = serde_json::json!({ "content": snapshot });
         if let Err(e) = mailbox.send("auditor", "patrol_snapshot", payload) {
@@ -247,8 +250,9 @@ impl OrchestratorRuntime {
         if self.state.last_activity.elapsed() < NUDGE_IDLE_THRESHOLD {
             return;
         }
-        let has_tasks = matches!(self.db.list_tasks(None, None).await, Ok(t) if !t.is_empty());
-        if !has_tasks {
+        let has_active = matches!(self.db.list_tasks(None, None).await,
+            Ok(t) if t.iter().any(|t| !matches!(t.status.as_str(), "completed" | "done" | "closed")));
+        if !has_active {
             return;
         }
         let snapshot = self.build_task_snapshot().await;
@@ -262,6 +266,17 @@ impl OrchestratorRuntime {
         tracing::info!("Nudging manager (idle {}s with pending tasks)", idle_secs);
         if let Err(e) = mailbox.send("manager", "nudge", payload) {
             tracing::debug!("Failed to nudge manager: {}", e);
+        }
+    }
+
+    async fn poll_dispatch(&mut self) {
+        self.ensure_developers();
+        self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+    }
+
+    fn ensure_developers(&mut self) {
+        for i in 0..self.state.developer_count {
+            self.ensure_agent(AgentRole::Developer, i);
         }
     }
 
@@ -316,33 +331,35 @@ impl OrchestratorRuntime {
         tracing::info!("Runtime received '{}' from {}", kind, from);
         match kind {
             "goal_complete" => {
-                let summary = payload_str(payload, "summary");
+                let summary = support::payload_str(payload, "summary");
                 tracing::info!("GOAL COMPLETE: {}", summary);
                 return true;
             }
             "set_crew" => {
-                let count = payload_u8(payload, "count", 1);
+                let count = support::payload_u8(payload, "count", 1);
                 self.handle_crew_size(count);
             }
             "relieve_manager" => {
-                let reason = payload_str(payload, "reason");
+                let reason = support::payload_str(payload, "reason");
                 self.handle_relieve_manager(&reason).await;
             }
             "task_created" | "task_ready" | "task_done" => {
+                self.ensure_developers();
                 self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
             }
             "task_complete" => {
-                let content = payload_str(payload, "content");
+                self.ensure_agent(AgentRole::Merger, 0);
+                let content = support::payload_str(payload, "content");
                 self.dispatcher.handle_dev_complete(from, &content).await;
                 self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
             }
             "task_blocked" => {
-                let content = payload_str(payload, "content");
+                let content = support::payload_str(payload, "content");
                 self.dispatcher.handle_dev_needs_info(from, &content).await;
                 self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
             }
             "dev_heartbeat" => {
-                let dev = payload_str(payload, "developer");
+                let dev = support::payload_str(payload, "developer");
                 if !dev.is_empty() {
                     self.dispatcher.record_activity(&dev);
                 }
@@ -354,17 +371,12 @@ impl OrchestratorRuntime {
 
     async fn shutdown(&mut self) {
         tracing::info!("Shutting down {} agents", self.agent_handles.len());
-
-        // Extract merger handle — it needs time to finish current merge
         let merger_handle = self.agent_handles.remove("merger");
-
         let names: Vec<String> = self.agent_handles.keys().cloned().collect();
         for (name, handle) in self.agent_handles.drain() {
             tracing::info!("Stopping {}", name);
             handle.abort();
         }
-
-        // Wait for merger to finish before cleaning up
         if let Some(handle) = merger_handle {
             tracing::info!("Waiting for merger to finish (30s timeout)");
             match tokio::time::timeout(Duration::from_secs(30), handle).await {
@@ -372,7 +384,6 @@ impl OrchestratorRuntime {
                 Err(_) => tracing::warn!("Merger timed out, aborting"),
             }
         }
-
         for name in &names {
             self.try_remove_worktree(name);
         }
@@ -382,10 +393,22 @@ impl OrchestratorRuntime {
     fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
         self.spawn_agent(AgentRole::Manager, 0, manager_task)?;
         self.spawn_agent(AgentRole::Architect, 0, None)?;
-        self.spawn_agent(AgentRole::Auditor, 0, None)?;
-        self.spawn_agent(AgentRole::Merger, 0, None)?;
-        self.spawn_agent(AgentRole::Developer, 0, None)?;
         Ok(())
+    }
+
+    fn ensure_agent(&mut self, role: AgentRole, index: u8) {
+        let id = match role {
+            AgentRole::Developer => AgentId::new_developer(index),
+            _ => AgentId::new_singleton(role),
+        };
+        let name = id.bus_name();
+        if self.agent_handles.get(&name).is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        tracing::info!("Lazy-spawning {} (on demand)", name);
+        if let Err(e) = self.spawn_agent(role, index, None) {
+            tracing::error!("Failed to spawn {}: {}", name, e);
+        }
     }
 
     pub fn spawn_agent(
@@ -410,7 +433,7 @@ impl OrchestratorRuntime {
             working_dir,
             system_prompt: role.system_prompt().to_string(),
             initial_task,
-            mcp_config: Some(build_mcp_config(&bus_name, &self.project)),
+            mcp_config: Some(support::build_mcp_config(&bus_name, &self.project)),
             fresh_session_per_task: fresh,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
@@ -420,11 +443,7 @@ impl OrchestratorRuntime {
         self.spawn_agent_with_config(config)
     }
 
-    fn working_dir_and_sandbox(
-        &self,
-        role: AgentRole,
-        bus_name: &str,
-    ) -> (String, Vec<String>) {
+    fn working_dir_and_sandbox(&self, role: AgentRole, bus_name: &str) -> (String, Vec<String>) {
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
@@ -438,8 +457,7 @@ impl OrchestratorRuntime {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to create worktree for {}, using project dir: {}",
-                        bus_name,
-                        e
+                        bus_name, e
                     );
                     Err(e)
                 }
@@ -448,7 +466,7 @@ impl OrchestratorRuntime {
             Err(anyhow::anyhow!("not a developer role"))
         };
 
-        resolve_sandbox(role, &project_path, worktree_result, use_sandbox)
+        support::resolve_sandbox(role, &project_path, worktree_result, use_sandbox)
     }
 
     fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
@@ -481,9 +499,7 @@ impl OrchestratorRuntime {
         if count == current {
             return;
         }
-
         tracing::info!("CREW resize: {} -> {}", current, count);
-
         if count > current {
             for i in current..count {
                 if let Err(e) = self.spawn_agent(AgentRole::Developer, i, None) {
@@ -495,7 +511,6 @@ impl OrchestratorRuntime {
                 self.abort_agent(&format!("developer-{}", i));
             }
         }
-
         self.state.developer_count = count;
     }
 
@@ -503,19 +518,15 @@ impl OrchestratorRuntime {
         if !self.relieve_cooldown_elapsed(reason) {
             return;
         }
-
         tracing::warn!(
             "RELIEVE: firing manager gen {} — {}",
-            self.state.manager_generation,
-            reason
+            self.state.manager_generation, reason
         );
-
         self.abort_agent("manager");
         self.session_store.remove("manager");
         self.session_store.remove_message_log("manager");
         self.state.manager_generation += 1;
         self.state.last_relieve = Some(Instant::now());
-
         let briefing = self.build_manager_briefing(reason).await;
         self.spawn_replacement_manager(briefing);
     }
@@ -553,7 +564,7 @@ impl OrchestratorRuntime {
             working_dir,
             system_prompt: prompt,
             initial_task: None,
-            mcp_config: Some(build_mcp_config("manager", &self.project)),
+            mcp_config: Some(support::build_mcp_config("manager", &self.project)),
             fresh_session_per_task: false,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
@@ -569,13 +580,12 @@ impl OrchestratorRuntime {
         if let Some(handle) = self.agent_handles.remove(name) {
             tracing::info!("Stopping {}", name);
             handle.abort();
-            // Mailbox drop on the agent task handles deregistration
             self.try_remove_worktree(name);
         }
     }
 
     fn try_remove_worktree(&self, bus_name: &str) {
-        if !is_worktree_role(bus_name) {
+        if !support::is_worktree_role(bus_name) {
             return;
         }
         let cfg = WorktreeConfig {
@@ -610,140 +620,4 @@ impl OrchestratorRuntime {
 
         b
     }
-}
-
-/// Determine working directory and sandbox prefix for an agent.
-///
-/// Developer/Merger agents always get a writable sandbox — either the worktree
-/// (if creation succeeded) or the project directory as fallback.
-/// Non-developer agents get a read-only sandbox.
-pub fn resolve_sandbox(
-    role: AgentRole,
-    project_path: &Path,
-    worktree_result: Result<PathBuf>,
-    use_sandbox: bool,
-) -> (String, Vec<String>) {
-    let is_dev = matches!(role, AgentRole::Developer | AgentRole::Merger);
-
-    if is_dev {
-        let dev_path = worktree_result.unwrap_or_else(|_| project_path.to_path_buf());
-        if use_sandbox {
-            let git_dir = find_git_dir(project_path);
-            let prefix = llm_sdk::sandbox::developer_prefix(&dev_path, git_dir.as_deref());
-            return (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix);
-        }
-        return (dev_path.to_string_lossy().into_owned(), Vec::new());
-    }
-
-    if use_sandbox {
-        let prefix = llm_sdk::sandbox::readonly_prefix(project_path);
-        (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix)
-    } else {
-        (project_path.to_string_lossy().into_owned(), Vec::new())
-    }
-}
-
-/// Find the `.git` directory for a project (resolves worktree indirection).
-fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
-    let git_path = project_path.join(".git");
-    if git_path.is_dir() {
-        return Some(git_path);
-    }
-    // .git might be a file (worktree pointer): "gitdir: /path/to/.git/worktrees/name"
-    if git_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&git_path) {
-            if let Some(gitdir) = content.strip_prefix("gitdir: ") {
-                let gitdir = gitdir.trim();
-                // Walk up to find the actual .git dir (parent of worktrees/)
-                let p = Path::new(gitdir);
-                if let Some(parent) = p.parent().and_then(|p| p.parent()) {
-                    if parent.is_dir() {
-                        return Some(parent.to_path_buf());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn build_mcp_config(agent_name: &str, project: &str) -> String {
-    let socket_path = relay::relay_socket_path(project);
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("agent-orchestrator"))
-        .to_string_lossy()
-        .into_owned();
-    serde_json::json!({
-        "mcpServers": {
-            "orchestrator": {
-                "command": exe,
-                "args": ["mcp-serve", "--socket", socket_path.to_string_lossy(), "--agent", agent_name]
-            }
-        }
-    })
-    .to_string()
-}
-
-struct CommandTimers {
-    audit: tokio::time::Interval,
-    nudge: tokio::time::Interval,
-    timeout: tokio::time::Interval,
-    watchdog: tokio::time::Interval,
-    sigint: tokio::signal::unix::Signal,
-    sigterm: tokio::signal::unix::Signal,
-}
-
-impl CommandTimers {
-    fn new() -> Result<Self> {
-        let now = tokio::time::Instant::now();
-        Ok(Self {
-            audit: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(600)),
-            nudge: tokio::time::interval_at(now + NUDGE_INTERVAL, NUDGE_INTERVAL),
-            timeout: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(60)),
-            watchdog: tokio::time::interval_at(now + Duration::from_secs(30), Duration::from_secs(600)),
-            sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-        })
-    }
-}
-
-fn default_state() -> RuntimeState {
-    RuntimeState {
-        developer_count: 1,
-        manager_generation: 0,
-        last_relieve: None,
-        last_activity: Instant::now(),
-    }
-}
-
-async fn open_test_stores() -> Result<(Database, SessionStore)> {
-    let tmp = std::env::temp_dir().join(format!(
-        "orch-test-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let db = Database::open(&tmp.join("tasks.db"))
-        .await
-        .context("Failed to open test database")?;
-    Ok((db, SessionStore::load(tmp.join("sessions"))))
-}
-
-fn payload_str(payload: &serde_json::Value, key: &str) -> String {
-    payload
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn payload_u8(payload: &serde_json::Value, key: &str, default: u8) -> u8 {
-    payload
-        .get(key)
-        .and_then(|v| v.as_u64())
-        .unwrap_or(default as u64) as u8
-}
-
-fn is_worktree_role(bus_name: &str) -> bool {
-    bus_name.starts_with("developer-")
 }

@@ -89,6 +89,15 @@ struct TaskIdParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct TaskReviewParams {
+    /// Task ID (e.g. "lt-abc123")
+    id: String,
+    /// Reason or notes for the review decision (recorded as a comment)
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct RejectCompletionParams {
     /// Task ID (e.g. "lt-abc123")
     id: String,
@@ -198,12 +207,12 @@ impl OrchestratorMcp {
     }
 
     #[tool(description = "Approve a pending task, setting it to 'ready' for auto-dispatch to developers. Architect only.")]
-    async fn approve_task(&self, Parameters(params): Parameters<TaskIdParams>) -> String {
+    async fn approve_task(&self, Parameters(params): Parameters<TaskReviewParams>) -> String {
         relay_call(&self.client, "approve_task", &params, "Task approved").await
     }
 
     #[tool(description = "Mark an in_review task as completed/done. Architect/validator only.")]
-    async fn complete_task(&self, Parameters(params): Parameters<TaskIdParams>) -> String {
+    async fn complete_task(&self, Parameters(params): Parameters<TaskReviewParams>) -> String {
         relay_call(&self.client, "complete_task", &params, "Task completed").await
     }
 

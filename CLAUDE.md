@@ -100,6 +100,15 @@ src/
 - Spawns agents with `AgentConfig` + `Session` from the store
 - Command loop handles bus messages and delegates to dispatcher for task events
 
+### Runtime Paths
+
+| What | Path |
+|------|------|
+| Tasks DB | `~/.local/share/agent-orchestrator/{project}/tasks.db` |
+| Relay socket | `~/.claude/orchestrator/{project}/relay.sock` |
+| Control socket | `~/.claude/orchestrator/control.sock` |
+| Project config | `~/.config/agent-orchestrator/projects.toml` |
+
 ## Usage
 
 ```bash

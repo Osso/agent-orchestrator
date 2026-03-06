@@ -7,7 +7,7 @@ use std::time::Duration;
 use agent_bus::Bus;
 use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools};
 use agent_orchestrator::bus_tools::bus_tools_for_role;
-use agent_orchestrator::runtime::resolve_sandbox;
+use agent_orchestrator::runtime_support::resolve_sandbox;
 use agent_orchestrator::types::{AgentId, AgentRole};
 use support::{test_config, TestAgentBuilder, TestBench, assert_agent_registered};
 

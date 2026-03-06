@@ -60,10 +60,13 @@ pub async fn handle_approve_task(
     if task.status != "pending" {
         return Err(format!("Cannot approve task {}: status is {}", id, task.status));
     }
+    let reason = args["reason"].as_str().unwrap_or("approved");
     let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
     db.update_task(id, updates, agent_name)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
+    let comment = format!("Approved: {}", reason);
+    let _ = db.add_comment(id, agent_name, &comment).await;
     let _ = mailbox.send("runtime", "task_ready", serde_json::json!({"task_id": id}));
     Ok(serde_json::json!({"ok": true, "status": "ready"}))
 }
@@ -83,9 +86,12 @@ pub async fn handle_complete_task(
     if task.status != "in_review" {
         return Err(format!("Cannot complete task {}: status is {}", id, task.status));
     }
+    let reason = args["reason"].as_str().unwrap_or("completed");
     db.close_task(id, agent_name)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
+    let comment = format!("Completed: {}", reason);
+    let _ = db.add_comment(id, agent_name, &comment).await;
     let _ = mailbox.send("runtime", "task_done", serde_json::json!({"task_id": id}));
     let _ = mailbox.send(
         "manager",
