@@ -134,6 +134,21 @@ impl OrchestratorRuntime {
         &self.project
     }
 
+    pub fn db(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
+    pub async fn run_watchdog_and_dispatch(&mut self) {
+        self.dispatcher.watchdog().await;
+        self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+    }
+
+    /// Insert a fake agent handle for testing (avoids spawning a real agent).
+    pub fn insert_fake_handle(&mut self, name: &str) {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        self.agent_handles.insert(name.to_string(), handle);
+    }
+
     /// Run in standalone mode (creates its own control server).
     pub async fn run(self, initial_task: Option<String>) -> Result<()> {
         let registry = control::new_registry();
@@ -203,6 +218,7 @@ impl OrchestratorRuntime {
         shutdown_tx: tokio::sync::watch::Sender<bool>,
     ) -> Result<()> {
         let mut timers = CommandTimers::new()?;
+        let mut shutdown_rx = shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -219,6 +235,12 @@ impl OrchestratorRuntime {
                 _ = timers.watchdog.tick() => self.run_watchdog().await,
                 _ = timers.sigint.recv() => { tracing::info!("Received SIGINT, shutting down"); break; }
                 _ = timers.sigterm.recv() => { tracing::info!("Received SIGTERM, shutting down"); break; }
+                Ok(_) = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("Received shutdown signal from daemon");
+                        break;
+                    }
+                }
             }
         }
 
@@ -250,9 +272,9 @@ impl OrchestratorRuntime {
         if self.state.last_activity.elapsed() < NUDGE_IDLE_THRESHOLD {
             return;
         }
-        let has_active = matches!(self.db.list_tasks(None, None).await,
-            Ok(t) if t.iter().any(|t| !matches!(t.status.as_str(), "completed" | "done" | "closed")));
-        if !has_active {
+        let needs_attention = matches!(self.db.list_tasks(None, None).await,
+            Ok(t) if t.iter().any(|t| matches!(t.status.as_str(), "pending" | "needs_info")));
+        if !needs_attention {
             return;
         }
         let snapshot = self.build_task_snapshot().await;
@@ -359,8 +381,17 @@ impl OrchestratorRuntime {
         match kind {
             "goal_complete" => {
                 let summary = support::payload_str(payload, "summary");
-                tracing::info!("GOAL COMPLETE: {}", summary);
-                return true;
+                let active = self.db.list_tasks(Some("in_progress"), None).await.unwrap_or_default();
+                if !active.is_empty() {
+                    let ids: Vec<&str> = active.iter().map(|t| t.id.as_str()).collect();
+                    tracing::warn!("GOAL_COMPLETE rejected: {} tasks still in_progress: {:?}", active.len(), ids);
+                    let _ = self.dispatcher.notify(from, "error", serde_json::json!({
+                        "content": format!("Cannot complete goal: {} tasks still in progress", active.len()),
+                    }));
+                } else {
+                    tracing::info!("GOAL COMPLETE: {}", summary);
+                    return true;
+                }
             }
             "set_crew" => {
                 let count = support::payload_u8(payload, "count", 1);
@@ -380,6 +411,15 @@ impl OrchestratorRuntime {
     }
 
     async fn shutdown(&mut self) {
+        // Reset any in-progress tasks so they don't stay stuck after restart
+        if let Ok(tasks) = self.db.list_tasks(Some("in_progress"), None).await {
+            for task in &tasks {
+                tracing::info!("Resetting in_progress task {} on shutdown", task.id);
+                let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+                let _ = self.db.update_task(&task.id, updates, "runtime").await;
+                let _ = self.db.clear_assignee(&task.id, "runtime").await;
+            }
+        }
         tracing::info!("Shutting down {} agents", self.agent_handles.len());
         let merger_handle = self.agent_handles.remove("merger");
         let names: Vec<String> = self.agent_handles.keys().cloned().collect();

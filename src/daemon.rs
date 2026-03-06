@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use llm_tasks::db::Database;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::BackendKind;
 use crate::config::{self, ProjectConfig};
@@ -183,8 +183,24 @@ impl Supervisor {
     async fn shutdown_all(&mut self) {
         let names: Vec<String> = self.projects.keys().cloned().collect();
         info!("Shutting down {} project(s)", names.len());
+        // Signal all runtimes to shut down (they'll clean up in-progress tasks)
         for name in &names {
-            self.stop_project(name);
+            let state = self.projects.get_mut(name).unwrap();
+            if let Some(tx) = state.shutdown_tx.take() {
+                let _ = tx.send(true);
+            }
+            self.registry.write().unwrap().remove(name);
+        }
+        // Wait for graceful shutdown (5s timeout per project)
+        for name in &names {
+            let state = self.projects.get_mut(name).unwrap();
+            if let Some(handle) = state.handle.take() {
+                match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                    Ok(_) => info!("Project '{}' shut down cleanly", name),
+                    Err(_) => warn!("Project '{}' shutdown timed out, aborting", name),
+                }
+            }
+            state.idle_since = None;
         }
     }
 }

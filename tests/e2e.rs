@@ -243,6 +243,46 @@ async fn task_created_notifies_architect() {
     assert_eq!(msg.payload["task_id"], "lt-test1");
 }
 
+#[tokio::test]
+async fn ready_task_with_stale_assignee_gets_dispatched_after_watchdog() {
+    let bus = Bus::new();
+    let mut dev_mbox = bus.register("developer-0").unwrap();
+    let (mut rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
+
+    // Create a task, set it to ready with a stale assignee
+    let db = rt.db();
+    let task = db.create_task("test task", Some("do something"), 1, "test").await.unwrap();
+    let updates = llm_tasks::db::TaskUpdates {
+        status: Some("ready"),
+        assignee: Some("ghost-dev"),
+        ..Default::default()
+    };
+    db.update_task(&task.id, updates, "test").await.unwrap();
+
+    // Register a fake developer-0 handle so dispatch can find it
+    // (developer-0 mailbox was already registered on the bus above)
+    rt.insert_fake_handle("developer-0");
+
+    // Dispatch alone won't find it — ready_tasks() filters out tasks with assignees
+    let payload = serde_json::json!({"task_id": task.id});
+    rt.handle_message("task_ready", &payload, "runtime").await;
+    assert!(dev_mbox.try_recv().is_none(), "stale assignee must block dispatch");
+
+    // Verify the assignee was NOT cleared by dispatch
+    let t = db.get_task(&task.id).await.unwrap();
+    assert_eq!(t.assignee.as_deref(), Some("ghost-dev"), "dispatch must not clear assignee");
+
+    // Now run the watchdog explicitly — it should clear the stale assignee and dispatch
+    rt.run_watchdog_and_dispatch().await;
+
+    let t = db.get_task(&task.id).await.unwrap();
+    assert!(t.assignee.as_deref() != Some("ghost-dev"), "watchdog must clear stale assignee");
+
+    let msg = dev_mbox.try_recv();
+    assert!(msg.is_some(), "developer-0 must receive task after watchdog clears assignee");
+    assert_eq!(msg.unwrap().kind, "task_assignment");
+}
+
 // ---------------------------------------------------------------------------
 // Tool restriction tests
 // ---------------------------------------------------------------------------
