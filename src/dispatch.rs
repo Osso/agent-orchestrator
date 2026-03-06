@@ -150,6 +150,10 @@ impl Dispatcher {
                 return;
             }
         };
+        if tasks.is_empty() {
+            return;
+        }
+        tracing::info!("Dispatching {} tasks to {} idle devs", tasks.len(), idle_devs.len());
         for (task, dev) in tasks.iter().zip(idle_devs.iter()) {
             self.dispatch_one(task, dev).await;
         }
