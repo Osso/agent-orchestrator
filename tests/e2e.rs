@@ -223,6 +223,27 @@ async fn handle_message_ignores_unknown_kind() {
 }
 
 // ---------------------------------------------------------------------------
+// Task event tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn task_created_notifies_architect() {
+    let bus = Bus::new();
+    let mut arch_mbox = bus.register("architect").unwrap();
+    let (mut rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
+
+    let payload = serde_json::json!({"task_id": "lt-test1"});
+    rt.handle_message("task_created", &payload, "manager").await;
+
+    // Architect should receive a review_task message
+    let msg = arch_mbox.try_recv();
+    assert!(msg.is_some(), "architect must receive review_task on task_created");
+    let msg = msg.unwrap();
+    assert_eq!(msg.kind, "review_task");
+    assert_eq!(msg.payload["task_id"], "lt-test1");
+}
+
+// ---------------------------------------------------------------------------
 // Tool restriction tests
 // ---------------------------------------------------------------------------
 
