@@ -40,17 +40,22 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Option<PathBuf> {
         return None;
     }
     tracing::info!("Reusing existing worktree at {}", path.display());
-    let ok = Command::new("git")
-        .args(["reset", "--hard", "HEAD"])
+    let branch = cfg.branch();
+    let reset_ok = Command::new("git")
+        .args(["switch", "-C", &branch])
         .current_dir(path)
         .status()
         .is_ok_and(|s| s.success());
-    if ok {
-        return Some(path.clone());
+    if !reset_ok {
+        tracing::warn!("Branch switch failed, removing and recreating worktree");
+        let _ = remove_worktree(cfg);
+        return None;
     }
-    tracing::warn!("Reset failed, removing and recreating worktree");
-    let _ = remove_worktree(cfg);
-    None
+    let _ = Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(path)
+        .status();
+    Some(path.clone())
 }
 
 fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {

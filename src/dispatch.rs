@@ -216,7 +216,11 @@ impl Dispatcher {
             last_activity: Instant::now(),
         });
         let desc = task.description.as_deref().unwrap_or("");
-        let content = format!("## Task {}\n\n{}\n\n{}", task.id, task.title, desc);
+        let branch = format!("agent/{}", dev);
+        let content = format!(
+            "## Task {}\n\n{}\n\n{}\n\nCommit your changes on branch `{}`.",
+            task.id, task.title, desc, branch
+        );
         let payload = serde_json::json!({"content": content, "task_id": task.id});
         if let Err(e) = self.mailbox.send(dev, "task_assignment", payload) {
             tracing::error!("Failed to dispatch task {} to {}: {}", task.id, dev, e);
