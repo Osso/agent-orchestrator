@@ -214,6 +214,7 @@ impl OrchestratorRuntime {
                 _ = timers.timeout.tick() => self.check_dev_timeouts().await,
                 _ = timers.nudge.tick() => self.maybe_nudge_manager(mailbox).await,
                 _ = timers.audit.tick() => self.send_audit_snapshot(mailbox).await,
+                _ = timers.watchdog.tick() => self.run_watchdog().await,
                 _ = timers.sigint.recv() => { tracing::info!("Received SIGINT, shutting down"); break; }
                 _ = timers.sigterm.recv() => { tracing::info!("Received SIGTERM, shutting down"); break; }
             }
@@ -270,8 +271,14 @@ impl OrchestratorRuntime {
             tracing::warn!("Aborting timed-out developer {}", dev_name);
             self.abort_agent(dev_name);
         }
-        let orphaned = self.dispatcher.reclaim_orphaned_tasks().await;
-        if !timed_out.is_empty() || orphaned > 0 {
+        if !timed_out.is_empty() {
+            self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+        }
+    }
+
+    async fn run_watchdog(&mut self) {
+        let fixed = self.dispatcher.watchdog().await;
+        if fixed > 0 {
             self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
         }
     }
@@ -681,6 +688,7 @@ struct CommandTimers {
     audit: tokio::time::Interval,
     nudge: tokio::time::Interval,
     timeout: tokio::time::Interval,
+    watchdog: tokio::time::Interval,
     sigint: tokio::signal::unix::Signal,
     sigterm: tokio::signal::unix::Signal,
 }
@@ -692,6 +700,7 @@ impl CommandTimers {
             audit: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(600)),
             nudge: tokio::time::interval_at(now + NUDGE_INTERVAL, NUDGE_INTERVAL),
             timeout: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(60)),
+            watchdog: tokio::time::interval_at(now + Duration::from_secs(30), Duration::from_secs(600)),
             sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
             sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
         })

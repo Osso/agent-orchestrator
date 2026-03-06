@@ -71,19 +71,32 @@ impl Dispatcher {
                 task_id,
                 self.dev_tasks[&dev_name].last_activity.elapsed(),
             );
-            let updates = TaskUpdates { status: Some("ready"), assignee: Some(""), ..Default::default() };
+            let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
             if let Err(e) = self.db.update_task(&task_id, updates, "runtime").await {
                 tracing::error!("Failed to reclaim task {} from {}: {}", task_id, dev_name, e);
             }
+            let _ = self.db.clear_assignee(&task_id, "runtime").await;
             self.dev_tasks.remove(&dev_name);
             aborted.push(dev_name);
         }
         aborted
     }
 
-    /// Reclaim tasks that are in_progress but not tracked by any developer.
-    /// Returns number of tasks reclaimed.
-    pub async fn reclaim_orphaned_tasks(&mut self) -> usize {
+    /// Watchdog: fix stuck tasks. Returns number of tasks fixed.
+    ///
+    /// - `in_progress` with no tracked developer → reset to `ready`
+    /// - `ready` with non-empty assignee → clear assignee so dispatch finds them
+    pub async fn watchdog(&mut self) -> usize {
+        let mut fixed = 0;
+        fixed += self.reclaim_orphaned_in_progress().await;
+        fixed += self.clear_stale_ready_assignees().await;
+        if fixed > 0 {
+            tracing::info!("Watchdog fixed {} stuck tasks", fixed);
+        }
+        fixed
+    }
+
+    async fn reclaim_orphaned_in_progress(&mut self) -> usize {
         let tasks = match self.db.list_tasks(Some("in_progress"), None).await {
             Ok(t) => t,
             Err(e) => {
@@ -91,22 +104,46 @@ impl Dispatcher {
                 return 0;
             }
         };
-        let tracked_task_ids: Vec<&str> =
+        let tracked: Vec<&str> =
             self.dev_tasks.values().map(|a| a.task_id.as_str()).collect();
-        let mut reclaimed = 0;
+        let mut count = 0;
         for task in &tasks {
-            if tracked_task_ids.contains(&task.id.as_str()) {
+            if tracked.contains(&task.id.as_str()) {
                 continue;
             }
             tracing::warn!("Reclaiming orphaned task {} (assignee: {:?})", task.id, task.assignee);
-            let updates = TaskUpdates { status: Some("ready"), assignee: Some(""), ..Default::default() };
+            let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
             if let Err(e) = self.db.update_task(&task.id, updates, "runtime").await {
-                tracing::error!("Failed to reclaim orphaned task {}: {}", task.id, e);
+                tracing::error!("Failed to reclaim task {}: {}", task.id, e);
+                continue;
+            }
+            let _ = self.db.clear_assignee(&task.id, "runtime").await;
+            count += 1;
+        }
+        count
+    }
+
+    async fn clear_stale_ready_assignees(&self) -> usize {
+        let tasks = match self.db.list_tasks(Some("ready"), None).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to query ready tasks: {}", e);
+                return 0;
+            }
+        };
+        let mut count = 0;
+        for task in &tasks {
+            if task.assignee.is_none() {
+                continue;
+            }
+            tracing::warn!("Clearing stale assignee on ready task {} ({:?})", task.id, task.assignee);
+            if let Err(e) = self.db.clear_assignee(&task.id, "runtime").await {
+                tracing::error!("Failed to clear assignee on task {}: {}", task.id, e);
             } else {
-                reclaimed += 1;
+                count += 1;
             }
         }
-        reclaimed
+        count
     }
 
     async fn transition_to_review(&self, task_id: &str, dev: &str, summary: &str) {
