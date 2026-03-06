@@ -103,10 +103,11 @@ pub fn resolve_sandbox(
 }
 
 /// Find the `.git` directory for a project (resolves worktree indirection).
+/// Returns a canonicalized path so bwrap doesn't choke on symlinks.
 fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
     let git_path = project_path.join(".git");
     if git_path.is_dir() {
-        return Some(git_path);
+        return Some(git_path.canonicalize().unwrap_or(git_path));
     }
     if git_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&git_path) {
@@ -114,7 +115,7 @@ fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
                 let p = Path::new(gitdir.trim());
                 if let Some(parent) = p.parent().and_then(|p| p.parent()) {
                     if parent.is_dir() {
-                        return Some(parent.to_path_buf());
+                        return Some(parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()));
                     }
                 }
             }
