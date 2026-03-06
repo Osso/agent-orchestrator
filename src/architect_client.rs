@@ -1,0 +1,255 @@
+//! Client for the external claude-architect daemon.
+//!
+//! Replaces the in-process architect agent. The runtime calls the systemd-managed
+//! claude-architect service via Unix socket IPC for task validation and completion review.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_bus::Bus;
+use claude_architect::{
+    Request, Response, build_assessment_prompt, contains_incomplete, contains_needs_changes,
+    socket_path, truncate,
+};
+use llm_tasks::db::Database;
+use peercred_ipc::Client;
+
+pub enum ValidateResult {
+    Approved(String),
+    NeedsChanges(String),
+}
+
+pub enum ReviewResult {
+    Accomplished(String),
+    Incomplete(String),
+}
+
+/// Validate a pending task via the external architect daemon.
+pub async fn validate_task(
+    project: &str,
+    title: &str,
+    description: &str,
+    cwd: &str,
+) -> Result<ValidateResult, String> {
+    let request = build_validate_request(project, title, description, cwd);
+    tokio::task::spawn_blocking(move || dispatch_validate(request))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Assess task completion via Haiku and report to the daemon.
+pub async fn review_completion(
+    project: &str,
+    task_title: &str,
+    dev_output: &str,
+    cwd: &str,
+) -> Result<ReviewResult, String> {
+    let truncated = truncate(dev_output, 4000);
+    let prompt = build_assessment_prompt(task_title, &truncated);
+    let assessment = call_haiku(&prompt).await?;
+
+    report_to_daemon(project, task_title, &assessment, cwd);
+
+    if contains_incomplete(&assessment) {
+        Ok(ReviewResult::Incomplete(assessment))
+    } else {
+        Ok(ReviewResult::Accomplished(assessment))
+    }
+}
+
+/// Run validation in background, update DB and notify via bus when done.
+pub fn spawn_validation(db: Arc<Database>, bus: Bus, project: String, cwd: String, task: llm_tasks::db::Task) {
+    let task_id = task.id.clone();
+    tokio::spawn(async move {
+        let desc = task.description.as_deref().unwrap_or("");
+        let result = validate_task(&project, &task.title, desc, &cwd).await;
+        apply_validation_result(&db, &bus, &task_id, result).await;
+    });
+}
+
+/// Run completion review in background, update DB and notify via bus.
+pub fn spawn_review(db: Arc<Database>, bus: Bus, project: String, cwd: String, task_id: String, dev_output: String) {
+    tokio::spawn(async move {
+        let title = match db.get_task(&task_id).await {
+            Ok(t) => t.title,
+            Err(e) => {
+                tracing::error!("Failed to get task {task_id} for review: {e}");
+                return;
+            }
+        };
+        let result = review_completion(&project, &title, &dev_output, &cwd).await;
+        apply_review_result(&db, &bus, &task_id, &title, result).await;
+    });
+}
+
+// --- Internal helpers ---
+
+fn build_validate_request(project: &str, title: &str, description: &str, cwd: &str) -> Request {
+    let task_summary = if description.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}: {description}")
+    };
+    Request::Validate {
+        project: project.to_string(),
+        goal: title.to_string(),
+        tasks: vec![task_summary],
+        cwd: cwd.to_string(),
+    }
+}
+
+fn dispatch_validate(request: Request) -> Result<ValidateResult, String> {
+    let path = socket_path();
+    match Client::call_timeout::<_, Request, Response>(&path, &request, Duration::from_secs(180)) {
+        Ok(Response::Verdict(v)) if contains_needs_changes(&v) => {
+            Ok(ValidateResult::NeedsChanges(v))
+        }
+        Ok(Response::Verdict(v)) => Ok(ValidateResult::Approved(v)),
+        Ok(Response::Error(e)) => Err(format!("architect error: {e}")),
+        Ok(Response::Pong) => Err("unexpected pong".to_string()),
+        Err(e) => Err(format!("architect IPC error: {e}")),
+    }
+}
+
+async fn apply_validation_result(db: &Database, bus: &Bus, task_id: &str, result: Result<ValidateResult, String>) {
+    match result {
+        Ok(ValidateResult::Approved(verdict)) => {
+            approve_task(db, task_id, &verdict).await;
+            notify_bus(bus, task_id, "runtime", "task_ready");
+        }
+        Ok(ValidateResult::NeedsChanges(verdict)) => {
+            reject_task(db, task_id, &verdict).await;
+            notify_bus(bus, task_id, "manager", "task_rejected");
+        }
+        Err(e) => {
+            tracing::error!("Architect validation failed for {task_id}: {e}");
+            approve_task_fallback(db, task_id).await;
+            notify_bus(bus, task_id, "runtime", "task_ready");
+        }
+    }
+}
+
+async fn apply_review_result(
+    db: &Database,
+    bus: &Bus,
+    task_id: &str,
+    title: &str,
+    result: Result<ReviewResult, String>,
+) {
+    match result {
+        Ok(ReviewResult::Accomplished(assessment)) => {
+            complete_task(db, bus, task_id, title, &assessment).await;
+        }
+        Ok(ReviewResult::Incomplete(assessment)) => {
+            reject_completion(db, bus, task_id, &assessment).await;
+        }
+        Err(e) => {
+            tracing::error!("Completion review failed for {task_id}: {e}");
+            complete_task_fallback(db, bus, task_id, title).await;
+        }
+    }
+}
+
+async fn approve_task(db: &Database, task_id: &str, verdict: &str) {
+    let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+    let _ = db.update_task(task_id, updates, "architect").await;
+    let short = truncate(verdict, 200);
+    let _ = db.add_comment(task_id, "architect", &format!("Approved: {short}")).await;
+    tracing::info!("Task {task_id} approved by external architect");
+}
+
+async fn approve_task_fallback(db: &Database, task_id: &str) {
+    let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+    let _ = db.update_task(task_id, updates, "runtime").await;
+    tracing::warn!("Auto-approved task {task_id} due to architect error");
+}
+
+async fn reject_task(db: &Database, task_id: &str, verdict: &str) {
+    let short = truncate(verdict, 200);
+    let _ = db.add_comment(task_id, "architect", &format!("Rejected: {short}")).await;
+    tracing::warn!("Task {task_id} rejected by external architect");
+}
+
+async fn complete_task(db: &Database, bus: &Bus, task_id: &str, title: &str, assessment: &str) {
+    let _ = db.close_task(task_id, "architect").await;
+    let short = truncate(assessment, 200);
+    let _ = db.add_comment(task_id, "architect", &format!("Completed: {short}")).await;
+    tracing::info!("Task {task_id} completed (review passed)");
+    notify_bus(bus, task_id, "runtime", "task_done");
+    notify_manager_done(bus, task_id, title);
+}
+
+async fn complete_task_fallback(db: &Database, bus: &Bus, task_id: &str, title: &str) {
+    let _ = db.close_task(task_id, "runtime").await;
+    tracing::warn!("Auto-completed task {task_id} due to review error");
+    notify_bus(bus, task_id, "runtime", "task_done");
+    notify_manager_done(bus, task_id, title);
+}
+
+async fn reject_completion(db: &Database, bus: &Bus, task_id: &str, assessment: &str) {
+    let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+    let _ = db.update_task(task_id, updates, "architect").await;
+    let _ = db.clear_assignee(task_id, "architect").await;
+    let short = truncate(assessment, 200);
+    let _ = db.add_comment(task_id, "architect", &format!("Rejected: {short}")).await;
+    tracing::warn!("Task {task_id} completion rejected");
+    notify_bus(bus, task_id, "runtime", "task_ready");
+    let content = format!("Task {task_id} completion rejected: {short}");
+    notify_bus_with(bus, task_id, "manager", "task_rejected", &content);
+}
+
+fn notify_bus(bus: &Bus, task_id: &str, to: &str, kind: &str) {
+    let tag = &task_id[..8.min(task_id.len())];
+    if let Ok(mb) = bus.register(&format!("arch-{tag}")) {
+        let _ = mb.send(to, kind, serde_json::json!({"task_id": task_id}));
+    }
+}
+
+fn notify_bus_with(bus: &Bus, task_id: &str, to: &str, kind: &str, content: &str) {
+    let tag = &task_id[..8.min(task_id.len())];
+    if let Ok(mb) = bus.register(&format!("arch-n-{tag}")) {
+        let _ = mb.send(to, kind, serde_json::json!({"content": content, "task_id": task_id}));
+    }
+}
+
+fn notify_manager_done(bus: &Bus, task_id: &str, title: &str) {
+    let content = format!("Task {task_id} completed: {title}");
+    notify_bus_with(bus, task_id, "manager", "task_done", &content);
+}
+
+/// Fire-and-forget report to the daemon for context.
+fn report_to_daemon(project: &str, task_title: &str, assessment: &str, cwd: &str) {
+    let report_req = Request::Report {
+        project: project.to_string(),
+        task_description: task_title.to_string(),
+        assessment: assessment.to_string(),
+        cwd: cwd.to_string(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let path = socket_path();
+        let _ = Client::call_timeout::<_, Request, Response>(
+            &path,
+            &report_req,
+            Duration::from_secs(30),
+        );
+    });
+}
+
+async fn call_haiku(prompt: &str) -> Result<String, String> {
+    let output = tokio::process::Command::new("claude")
+        .arg("-p")
+        .arg(prompt)
+        .arg("--model")
+        .arg("haiku")
+        .env_remove("CLAUDECODE")
+        .output()
+        .await
+        .map_err(|e| format!("failed to run claude: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("claude haiku exited {}: {stderr}", output.status));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}

@@ -21,6 +21,7 @@ dependencies = [
  "agent-bus",
  "anyhow",
  "async-trait",
+ "claude-architect",
  "dirs",
  "dotenvy",
  "glob",
@@ -228,6 +229,21 @@ name = "clap_lex"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
+
+[[package]]
+name = "claude-architect"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "llm-sdk",
+ "peercred-ipc",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "colorchoice"
@@ -1181,7 +1197,6 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "peercred-ipc"
 version = "0.1.0"
-source = "git+https://github.com/Osso/peercred-ipc.git#42cf4fa585a697969db9e9acea29d61645922e33"
 dependencies = [
  "libc",
  "rmp-serde",

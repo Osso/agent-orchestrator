@@ -179,9 +179,6 @@ async fn dispatch_tool(
         "merge_request" => handle_merge_request(mailbox, agent_name, &req.args),
         "create_task" => tt::handle_create_task(db, mailbox, agent_name, role, &req.args).await,
         "list_tasks" => tt::handle_list_tasks(db, &req.args).await,
-        "approve_task" => tt::handle_approve_task(db, mailbox, agent_name, role, &req.args).await,
-        "complete_task" => tt::handle_complete_task(db, mailbox, agent_name, role, &req.args).await,
-        "reject_completion" => tt::handle_reject_completion(db, mailbox, agent_name, role, &req.args).await,
         unknown => Err(format!("unknown tool: {}", unknown)),
     }
 }

@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig, BackendKind};
+use crate::architect_client;
 use crate::control;
 use crate::dispatch::Dispatcher;
 use crate::relay::{self, RelayServer};
@@ -306,13 +307,14 @@ impl OrchestratorRuntime {
         match kind {
             "task_created" => {
                 let task_id = support::payload_str(payload, "task_id");
-                let msg = serde_json::json!({"content": format!("Review pending task {}", task_id), "task_id": task_id});
-                let _ = self.dispatcher.notify("architect", "review_task", msg);
+                self.spawn_architect_validation(&task_id).await;
             }
             "task_complete" => {
                 self.ensure_agent(AgentRole::Merger, 0);
                 let content = support::payload_str(payload, "content");
-                self.dispatcher.handle_dev_complete(from, &content).await;
+                if let Some(task_id) = self.dispatcher.handle_dev_complete(from, &content).await {
+                    self.spawn_completion_review(&task_id, &content);
+                }
             }
             "task_blocked" => {
                 let content = support::payload_str(payload, "content");
@@ -345,6 +347,28 @@ impl OrchestratorRuntime {
         if fixed > 0 {
             self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
         }
+    }
+
+    async fn spawn_architect_validation(&self, task_id: &str) {
+        let task = match self.db.get_task(task_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to get task {task_id} for validation: {e}");
+                return;
+            }
+        };
+        architect_client::spawn_validation(
+            self.db.clone(), self.bus.clone(),
+            self.project.clone(), self.working_dir.clone(), task,
+        );
+    }
+
+    fn spawn_completion_review(&self, task_id: &str, dev_output: &str) {
+        architect_client::spawn_review(
+            self.db.clone(), self.bus.clone(),
+            self.project.clone(), self.working_dir.clone(),
+            task_id.to_string(), dev_output.to_string(),
+        );
     }
 
     async fn build_task_snapshot(&self) -> String {
@@ -442,7 +466,6 @@ impl OrchestratorRuntime {
 
     fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
         self.spawn_agent(AgentRole::Manager, 0, manager_task)?;
-        self.spawn_agent(AgentRole::Architect, 0, None)?;
         Ok(())
     }
 

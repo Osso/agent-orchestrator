@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod architect_client;
 pub mod bus_tools;
 pub mod config;
 pub mod control;

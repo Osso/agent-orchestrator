@@ -13,7 +13,6 @@ async fn test_complete_development_workflow() {
     let scenario = TestScenario::new()
         .with_agents(vec![
             (AgentRole::Manager, "Plan and coordinate task"),
-            (AgentRole::Architect, "Design solution"),
             (AgentRole::Developer, "Implement feature"),
             (AgentRole::Merger, "Review and merge"),
         ])
@@ -23,7 +22,7 @@ async fn test_complete_development_workflow() {
     let result = scenario.run().await;
     
     assert!(result.is_ok(), "Complete workflow should succeed");
-    assert!(result.unwrap().messages_sent >= 3, "Should have cross-agent communication");
+    assert!(result.unwrap().messages_sent >= 2, "Should have cross-agent communication");
 }
 
 #[tokio::test]

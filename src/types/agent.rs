@@ -24,7 +24,7 @@ impl AgentRole {
     pub fn system_prompt(&self) -> &'static str {
         match self {
             AgentRole::Manager => include_str!("../../prompts/manager.md"),
-            AgentRole::Architect => include_str!("../../prompts/architect.md"),
+            AgentRole::Architect => unreachable!("architect is handled by external daemon"),
             AgentRole::Developer => include_str!("../../prompts/developer.md"),
             AgentRole::Auditor => include_str!("../../prompts/auditor.md"),
             AgentRole::Merger => include_str!("../../prompts/merger.md"),

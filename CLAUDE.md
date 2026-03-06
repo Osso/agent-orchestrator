@@ -28,13 +28,13 @@ The runtime is the central state machine. Agents signal intent via tools, the ru
 ```
 User → Manager (creates tasks) → DB [pending]
                                    ↓
-       Architect (reviews)      → DB [ready]
+       External Architect (IPC) → DB [ready]
                                    ↓
        Runtime (auto-dispatches) → Developer [in_progress]
                                    ↓
        Developer (signals done) → DB [in_review]
                                    ↓
-       Architect (validates)    → DB [done]
+       Haiku assessment + report → DB [done]
 ```
 
 **Task statuses**: `pending` → `ready` → `in_progress` → `in_review` → `done` (or `needs_info` from developer)
@@ -42,10 +42,10 @@ User → Manager (creates tasks) → DB [pending]
 ### Agent Roles
 
 - **Manager**: Creates tasks via `create_task` tool. Never messages developers directly.
-- **Architect**: Reviews pending tasks (`approve_task`), validates completions (`complete_task`/`reject_completion`).
+- **Architect (external)**: The `claude-architect` systemd service validates tasks via IPC. Not an in-process agent — the runtime calls it directly via `peercred-ipc`. Maintains per-project design docs and session context.
 - **Developer-N**: Receives auto-dispatched tasks, implements them, signals completion via bus messages.
 - **Auditor**: Wakes every 10 minutes, evaluates task snapshot, can fire manager via RELIEVE.
-- **Runtime**: State machine — dispatches ready tasks to idle developers, handles all DB transitions.
+- **Runtime**: State machine — dispatches ready tasks to idle developers, handles all DB transitions. Calls external architect for validation and Haiku for completion review.
 
 ### MCP Tools (via relay)
 
@@ -53,9 +53,6 @@ User → Manager (creates tasks) → DB [pending]
 |------|-------|---------|
 | `create_task` | Manager | Create task (pending) |
 | `list_tasks` | All | Query task DB |
-| `approve_task` | Architect | pending → ready |
-| `complete_task` | Architect | in_review → done |
-| `reject_completion` | Architect | in_review → ready (re-dispatch) |
 | `send_message` | All | Direct bus messages |
 | `set_crew` | Manager | Set developer count (1-3) |
 | `goal_complete` | Manager | Trigger shutdown |
@@ -69,17 +66,18 @@ User → Manager (creates tasks) → DB [pending]
 src/
 ├── types/
 │   ├── mod.rs
-│   └── agent.rs        # AgentRole, AgentId (role + index)
-├── agent.rs            # Agent struct, completer abstraction, message handling
-├── runtime.rs          # OrchestratorRuntime, agent lifecycle, state
-├── dispatch.rs         # Dispatcher: task→developer matching, DB transitions
-├── task_tools.rs       # Task DB tool handlers (create, approve, complete, etc.)
-├── relay.rs            # Unix socket relay: MCP subprocess → bus + DB
-├── mcp.rs              # MCP stdio server (spawned by Claude CLI)
-├── bus_tools.rs        # ToolDef impls for OpenRouter agents (bus-direct)
-├── control.rs          # Control socket for external commands
-├── worktree.rs         # Git worktree management for developers
-└── main.rs             # CLI entrypoint (run/orchestrate/send)
+│   └── agent.rs           # AgentRole, AgentId (role + index)
+├── agent.rs               # Agent struct, completer abstraction, message handling
+├── architect_client.rs    # IPC client for external claude-architect daemon
+├── runtime.rs             # OrchestratorRuntime, agent lifecycle, state
+├── dispatch.rs            # Dispatcher: task→developer matching, DB transitions
+├── task_tools.rs          # Task DB tool handlers (create_task, list_tasks)
+├── relay.rs               # Unix socket relay: MCP subprocess → bus + DB
+├── mcp.rs                 # MCP stdio server (spawned by Claude CLI)
+├── bus_tools.rs           # ToolDef impls for OpenRouter agents (bus-direct)
+├── control.rs             # Control socket for external commands
+├── worktree.rs            # Git worktree management for developers
+└── main.rs                # CLI entrypoint (run/orchestrate/send)
 ```
 
 ### Key Abstractions

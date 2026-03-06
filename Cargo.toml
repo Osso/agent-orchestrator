@@ -22,6 +22,7 @@ peercred-ipc = { git = "https://github.com/Osso/peercred-ipc.git" }
 llm-sdk = { git = "https://github.com/Osso/llm-sdk.git" }
 agent-bus = { git = "https://github.com/Osso/agent-bus.git" }
 llm-tasks = { git = "https://github.com/Osso/llm-tasks.git" }
+claude-architect = { path = "../claude-architect" }
 dirs = "6"
 toml = "0.8"
 dotenvy = "0.15.7"
@@ -34,3 +35,6 @@ llm-sdk = { path = "../../lib/llm-sdk" }
 
 [patch."https://github.com/Osso/llm-tasks.git"]
 llm-tasks = { path = "../llm-tasks" }
+
+[patch."https://github.com/Osso/peercred-ipc.git"]
+peercred-ipc = { path = "../../lib/peercred-ipc" }

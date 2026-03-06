@@ -227,20 +227,24 @@ async fn handle_message_ignores_unknown_kind() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn task_created_notifies_architect() {
+async fn task_created_spawns_validation() {
+    // With the external architect, task_created spawns a background validation task.
+    // Since the daemon isn't running in tests, the validation errors and auto-approves.
     let bus = Bus::new();
-    let mut arch_mbox = bus.register("architect").unwrap();
     let (mut rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
 
-    let payload = serde_json::json!({"task_id": "lt-test1"});
+    // Create a real task so the validation can look it up
+    let db = rt.db();
+    let task = db.create_task("test task", Some("description"), 1, "test").await.unwrap();
+
+    let payload = serde_json::json!({"task_id": task.id});
     rt.handle_message("task_created", &payload, "manager").await;
 
-    // Architect should receive a review_task message
-    let msg = arch_mbox.try_recv();
-    assert!(msg.is_some(), "architect must receive review_task on task_created");
-    let msg = msg.unwrap();
-    assert_eq!(msg.kind, "review_task");
-    assert_eq!(msg.payload["task_id"], "lt-test1");
+    // Give the background validation task time to run and auto-approve
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let t = db.get_task(&task.id).await.unwrap();
+    assert_eq!(t.status, "ready", "task should be auto-approved when daemon is unavailable");
 }
 
 #[tokio::test]
@@ -377,35 +381,19 @@ fn bus_tools_merger_gets_send_message_only() {
 async fn full_message_flow() {
     let bus = Bus::new();
     let (mut rt, calls) =
-        test_runtime(bus.clone(), vec!["task planned", "approved"]).await.unwrap();
+        test_runtime(bus.clone(), vec!["task planned"]).await.unwrap();
 
     // Spawn manager with initial task (uses runtime's factory)
     rt.spawn_agent(AgentRole::Manager, 0, Some("build login".into()))
         .unwrap();
-    // Spawn architect
-    rt.spawn_agent(AgentRole::Architect, 0, None).unwrap();
 
     // Let manager process initial_task
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Send a message from "outside" to architect via bus
-    let sender = bus.register("test-sender").unwrap();
-    sender
-        .send(
-            "architect",
-            "task_assignment",
-            serde_json::json!({"content": "review login task"}),
-        )
-        .unwrap();
-
-    // Let architect process
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Manager processed initial_task (1 call) + architect processed 1 message
-    // Both share the same call counter from the factory
+    // Manager processed initial_task (1 call)
     assert!(
-        calls.load(Ordering::SeqCst) >= 2,
-        "expected at least 2 completions, got {}",
+        calls.load(Ordering::SeqCst) >= 1,
+        "expected at least 1 completion, got {}",
         calls.load(Ordering::SeqCst)
     );
 }

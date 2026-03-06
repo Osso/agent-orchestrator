@@ -33,10 +33,13 @@ impl Dispatcher {
         Self { db, mailbox, dev_tasks: HashMap::new() }
     }
 
-    /// Developer signals task complete → set in_review, notify architect.
-    pub async fn handle_dev_complete(&mut self, from: &str, content: &str) {
+    /// Developer signals task complete → set in_review. Returns task_id for review.
+    pub async fn handle_dev_complete(&mut self, from: &str, content: &str) -> Option<String> {
         if let Some(assignment) = self.dev_tasks.remove(from) {
             self.transition_to_review(&assignment.task_id, from, content).await;
+            Some(assignment.task_id)
+        } else {
+            None
         }
     }
 
@@ -155,16 +158,11 @@ impl Dispatcher {
         count
     }
 
-    async fn transition_to_review(&self, task_id: &str, dev: &str, summary: &str) {
+    async fn transition_to_review(&self, task_id: &str, _dev: &str, _summary: &str) {
         let updates = TaskUpdates { status: Some("in_review"), ..Default::default() };
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {
             tracing::error!("Failed to set task {} in_review: {}", task_id, e);
         }
-        let payload = serde_json::json!({
-            "content": format!("## Verify Completion\n\n**Task ID:** {task_id}\n**Developer:** {dev}\n**Output:**\n{summary}"),
-            "task_id": task_id,
-        });
-        let _ = self.mailbox.send("architect", "verify_completion", payload);
     }
 
     async fn transition_to_needs_info(&self, task_id: &str, dev: &str, question: &str) {
