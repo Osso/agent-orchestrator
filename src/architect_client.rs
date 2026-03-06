@@ -253,3 +253,84 @@ async fn call_haiku(prompt: &str) -> Result<String, String> {
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon_available() -> bool {
+        let path = socket_path();
+        Client::call::<_, Request, Response>(&path, &Request::Ping)
+            .is_ok_and(|r| matches!(r, Response::Pong))
+    }
+
+    #[tokio::test]
+    #[ignore] // requires live claude-architect daemon
+    async fn validate_task_returns_verdict() {
+        assert!(daemon_available(), "claude-architect daemon not running");
+        let result = validate_task(
+            "agent-orchestrator",
+            "Add retry logic to API calls",
+            "Wrap HTTP calls in architect_client.rs with exponential backoff",
+            "/syncthing/Sync/Projects/claude/agent-orchestrator",
+        )
+        .await;
+        match result {
+            Ok(ValidateResult::Approved(v)) => {
+                assert!(v.contains("VERDICT"), "verdict missing VERDICT line: {v}");
+            }
+            Ok(ValidateResult::NeedsChanges(v)) => {
+                assert!(v.contains("VERDICT"), "verdict missing VERDICT line: {v}");
+                assert!(v.contains("needs-changes"));
+            }
+            Err(e) => panic!("validate_task failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // requires live claude-architect daemon + claude CLI
+    async fn review_completion_returns_assessment() {
+        assert!(daemon_available(), "claude-architect daemon not running");
+        let result = review_completion(
+            "agent-orchestrator",
+            "Add retry logic to API calls",
+            "Added retry with exponential backoff to all HTTP calls. Tests pass.",
+            "/syncthing/Sync/Projects/claude/agent-orchestrator",
+        )
+        .await;
+        match result {
+            Ok(ReviewResult::Accomplished(a)) => {
+                assert!(a.contains("ACCOMPLISHED"), "unexpected assessment: {a}");
+            }
+            Ok(ReviewResult::Incomplete(a)) => {
+                assert!(a.contains("INCOMPLETE"), "unexpected assessment: {a}");
+            }
+            Err(e) => panic!("review_completion failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn build_validate_request_with_description() {
+        let req = build_validate_request("proj", "Fix bug", "null pointer in parser", "/tmp");
+        match req {
+            Request::Validate { project, goal, tasks, cwd } => {
+                assert_eq!(project, "proj");
+                assert_eq!(goal, "Fix bug");
+                assert_eq!(tasks, vec!["Fix bug: null pointer in parser"]);
+                assert_eq!(cwd, "/tmp");
+            }
+            _ => panic!("expected Validate"),
+        }
+    }
+
+    #[test]
+    fn build_validate_request_empty_description() {
+        let req = build_validate_request("proj", "Fix bug", "", "/tmp");
+        match req {
+            Request::Validate { tasks, .. } => {
+                assert_eq!(tasks, vec!["Fix bug"]);
+            }
+            _ => panic!("expected Validate"),
+        }
+    }
+}
