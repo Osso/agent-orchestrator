@@ -42,7 +42,7 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Option<PathBuf> {
     tracing::info!("Reusing existing worktree at {}", path.display());
     let branch = cfg.branch();
     let reset_ok = Command::new("git")
-        .args(["switch", "-C", &branch])
+        .args(["switch", "-C", &branch, "master"])
         .current_dir(path)
         .status()
         .is_ok_and(|s| s.success());
