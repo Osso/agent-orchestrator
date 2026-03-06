@@ -81,6 +81,14 @@ struct RemoveDependencyParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct AddCommentParams {
+    /// Task ID
+    id: String,
+    /// Comment text
+    content: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SetDevelopersParams {
     /// Number of developer agents (1-3)
     count: u8,
@@ -111,11 +119,13 @@ impl TasksMcp {
             Err(e) => return err(e),
         };
         let events = self.db.get_events(&p.id).await.unwrap_or_default();
+        let comments = self.db.get_comments(&p.id).await.unwrap_or_default();
         let deps = self.db.get_dependencies(&p.id).await.unwrap_or_default();
         let blocked_by = self.db.get_reverse_dependencies(&p.id).await.unwrap_or_default();
         to_json(&serde_json::json!({
             "task": task,
             "events": events,
+            "comments": comments,
             "blocks": deps,
             "blocked_by": blocked_by,
         }))
@@ -183,6 +193,14 @@ impl TasksMcp {
     async fn remove_dependency(&self, Parameters(p): Parameters<RemoveDependencyParams>) -> String {
         match self.db.remove_dependency(&p.task_id, &p.depends_on).await {
             Ok(()) => "Dependency removed".to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Add a comment to a task. Use for context, questions, or status notes.")]
+    async fn add_comment(&self, Parameters(p): Parameters<AddCommentParams>) -> String {
+        match self.db.add_comment(&p.id, "user", &p.content).await {
+            Ok(comment) => to_json(&comment),
             Err(e) => err(e),
         }
     }

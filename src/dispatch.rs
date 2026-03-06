@@ -163,6 +163,9 @@ impl Dispatcher {
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {
             tracing::error!("Failed to set task {} needs_info: {}", task_id, e);
         }
+        if let Err(e) = self.db.add_comment(task_id, dev, question).await {
+            tracing::error!("Failed to add needs_info comment on {}: {}", task_id, e);
+        }
         let payload = serde_json::json!({
             "content": format!("Task {task_id} from {dev} needs info: {question}"),
             "task_id": task_id,

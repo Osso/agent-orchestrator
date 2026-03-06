@@ -118,6 +118,8 @@ pub async fn handle_reject_completion(
     db.clear_assignee(id, agent_name)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
+    let comment = format!("Rejected: {}", reason);
+    let _ = db.add_comment(id, agent_name, &comment).await;
     let _ = mailbox.send(
         "manager",
         "task_rejected",
