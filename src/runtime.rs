@@ -311,8 +311,9 @@ impl OrchestratorRuntime {
             }
             "task_complete" => {
                 let content = support::payload_str(payload, "content");
+                let dev_name = from.to_string();
                 if let Some(task_id) = self.dispatcher.handle_dev_complete(from, &content).await {
-                    self.spawn_completion_review(&task_id, &content);
+                    self.spawn_completion_review(&task_id, &content, &dev_name);
                 }
             }
             "task_done" => {
@@ -391,11 +392,12 @@ impl OrchestratorRuntime {
         }
     }
 
-    fn spawn_completion_review(&self, task_id: &str, dev_output: &str) {
+    fn spawn_completion_review(&self, task_id: &str, dev_output: &str, dev_name: &str) {
+        let branch = format!("agent/{}", dev_name);
         architect_client::spawn_review(
             self.db.clone(), self.bus.clone(),
             self.project.clone(), self.working_dir.clone(),
-            task_id.to_string(), dev_output.to_string(),
+            task_id.to_string(), dev_output.to_string(), branch,
         );
     }
 

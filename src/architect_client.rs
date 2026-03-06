@@ -42,10 +42,17 @@ pub async fn review_completion(
     project: &str,
     task_title: &str,
     dev_output: &str,
+    diff: &str,
     cwd: &str,
 ) -> Result<ReviewResult, String> {
-    let truncated = truncate(dev_output, 4000);
-    let prompt = build_assessment_prompt(task_title, &truncated);
+    let truncated_output = truncate(dev_output, 2000);
+    let truncated_diff = truncate(diff, 4000);
+    let combined = if truncated_diff.is_empty() {
+        truncated_output
+    } else {
+        format!("{truncated_output}\n\n## Git diff\n```\n{truncated_diff}\n```")
+    };
+    let prompt = build_assessment_prompt(task_title, &combined);
     let assessment = call_haiku(&prompt).await?;
 
     report_to_daemon(project, task_title, &assessment, cwd);
@@ -68,7 +75,7 @@ pub fn spawn_validation(db: Arc<Database>, bus: Bus, project: String, cwd: Strin
 }
 
 /// Run completion review in background, update DB and notify via bus.
-pub fn spawn_review(db: Arc<Database>, bus: Bus, project: String, cwd: String, task_id: String, dev_output: String) {
+pub fn spawn_review(db: Arc<Database>, bus: Bus, project: String, cwd: String, task_id: String, dev_output: String, branch: String) {
     tokio::spawn(async move {
         let title = match db.get_task(&task_id).await {
             Ok(t) => t.title,
@@ -77,7 +84,8 @@ pub fn spawn_review(db: Arc<Database>, bus: Bus, project: String, cwd: String, t
                 return;
             }
         };
-        let result = review_completion(&project, &title, &dev_output, &cwd).await;
+        let diff = get_branch_diff(&cwd, &branch).await;
+        let result = review_completion(&project, &title, &dev_output, &diff, &cwd).await;
         apply_review_result(&db, &bus, &task_id, &title, result).await;
     });
 }
@@ -235,6 +243,27 @@ fn report_to_daemon(project: &str, task_title: &str, assessment: &str, cwd: &str
     });
 }
 
+async fn get_branch_diff(cwd: &str, branch: &str) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(["diff", &format!("master..{branch}"), "--stat", "-p"])
+        .current_dir(cwd)
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).to_string()
+        }
+        Ok(o) => {
+            tracing::warn!("git diff failed: {}", String::from_utf8_lossy(&o.stderr));
+            String::new()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to run git diff: {e}");
+            String::new()
+        }
+    }
+}
+
 async fn call_haiku(prompt: &str) -> Result<String, String> {
     let output = tokio::process::Command::new("claude")
         .arg("-p")
@@ -296,6 +325,7 @@ mod tests {
             "agent-orchestrator",
             "Add retry logic to API calls",
             "Added retry with exponential backoff to all HTTP calls. Tests pass.",
+            "",
             "/syncthing/Sync/Projects/claude/agent-orchestrator",
         )
         .await;
