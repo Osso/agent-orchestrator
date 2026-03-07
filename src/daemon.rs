@@ -48,6 +48,8 @@ struct ProjectState {
     handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     idle_since: Option<Instant>,
+    /// Cached DB handle to avoid leaking FDs on repeated polls.
+    db: Option<Database>,
 }
 
 struct Supervisor {
@@ -72,6 +74,7 @@ impl Supervisor {
                     handle: None,
                     shutdown_tx: None,
                     idle_since: None,
+                    db: None,
                 };
                 (name, state)
             })
@@ -105,7 +108,7 @@ impl Supervisor {
 
     async fn poll_project(&mut self, name: &str) {
         let db_path = db_path_for_project(name);
-        let has_active = has_active_tasks(&db_path).await;
+        let has_active = has_active_tasks_cached(&mut self.projects, name, &db_path).await;
         let state = self.projects.get_mut(name).unwrap();
         let is_running = is_runtime_alive(state);
 
@@ -209,18 +212,25 @@ fn is_runtime_alive(state: &ProjectState) -> bool {
     state.handle.as_ref().is_some_and(|h| !h.is_finished())
 }
 
-async fn has_active_tasks(db_path: &std::path::Path) -> bool {
+/// Check if there are tasks that warrant activating the runtime.
+/// Uses a cached DB handle per project to avoid leaking file descriptors.
+async fn has_active_tasks_cached(
+    projects: &mut HashMap<String, ProjectState>,
+    name: &str,
+    db_path: &std::path::Path,
+) -> bool {
     if !db_path.exists() {
         return false;
     }
-    let db = match Database::open(db_path).await {
-        Ok(db) => db,
-        Err(_) => return false,
-    };
+    let state = projects.get_mut(name).unwrap();
+    if state.db.is_none() {
+        state.db = Database::open(db_path).await.ok();
+    }
+    let Some(db) = &state.db else { return false };
     matches!(
         db.list_tasks(None, None).await,
         Ok(tasks) if tasks.iter().any(|t|
-            !matches!(t.status.as_str(), "completed" | "done" | "closed")
+            matches!(t.status.as_str(), "pending" | "ready" | "in_progress" | "in_review")
         )
     )
 }
