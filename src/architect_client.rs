@@ -191,9 +191,9 @@ async fn reject_task(db: &Database, task_id: &str, verdict: &str) {
 }
 
 async fn complete_task(db: &Database, bus: &Bus, task_id: &str, _title: &str, assessment: &str) {
-    let _ = db.close_task(task_id, "architect").await;
+    let _ = db.close_task(task_id, "reviewer").await;
     let short = truncate(assessment, 200);
-    let _ = db.add_comment(task_id, "architect", &format!("Completed: {short}")).await;
+    let _ = db.add_comment(task_id, "reviewer", &format!("Completed: {short}")).await;
     tracing::info!("Task {task_id} completed (review passed)");
     notify_bus(bus, task_id, "runtime", "task_done");
 }
@@ -206,10 +206,10 @@ async fn complete_task_fallback(db: &Database, bus: &Bus, task_id: &str, _title:
 
 async fn reject_completion(db: &Database, bus: &Bus, task_id: &str, assessment: &str) {
     let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
-    let _ = db.update_task(task_id, updates, "architect").await;
-    let _ = db.clear_assignee(task_id, "architect").await;
+    let _ = db.update_task(task_id, updates, "reviewer").await;
+    let _ = db.clear_assignee(task_id, "reviewer").await;
     let short = truncate(assessment, 200);
-    let _ = db.add_comment(task_id, "architect", &format!("Rejected: {short}")).await;
+    let _ = db.add_comment(task_id, "reviewer", &format!("Rejected: {short}")).await;
     tracing::warn!("Task {task_id} completion rejected");
     notify_bus(bus, task_id, "runtime", "task_ready");
 }
