@@ -5,7 +5,7 @@
 //! 2. Waits for messages from other agents
 //! 3. Calls llm-sdk to get a completion (with MCP tools for outbound communication)
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent_bus::{Bus, Mailbox};
 use anyhow::Result;
@@ -63,29 +63,44 @@ impl Completer for OpenRouterCompleter {
 /// Production completer backed by Codex (ChatGPT Pro OAuth) with MessageLog persistence.
 struct CodexCompleter {
     codex: Arc<llm_sdk::codex::Codex>,
-    log: llm_sdk::MessageLog,
+    log: Arc<Mutex<llm_sdk::MessageLog>>,
+}
+
+/// Writes each agent-loop turn into the MessageLog so the viewer sees incremental progress.
+struct LogTurnObserver {
+    log: Arc<Mutex<llm_sdk::MessageLog>>,
+}
+
+impl llm_sdk::TurnObserver for LogTurnObserver {
+    fn on_turn(&self, _turn: u32, response: &llm_sdk::AgentResponse, _usage: &llm_sdk::AgentUsage) {
+        if let Some(text) = response.text() {
+            if let Ok(mut log) = self.log.lock() {
+                log.push(llm_sdk::ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: llm_sdk::session::now_utc(),
+                });
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl Completer for CodexCompleter {
     async fn complete(&mut self, prompt: &str) -> Result<llm_sdk::Output, llm_sdk::Error> {
-        use llm_sdk::Backend;
-        self.log.push(llm_sdk::ChatMessage {
-            role: "user".into(),
-            content: Some(prompt.into()),
-            tool_calls: None,
-            tool_call_id: None,
-            timestamp: llm_sdk::session::now_utc(),
-        });
-        let output = self.codex.complete(prompt).await?;
-        self.log.push(llm_sdk::ChatMessage {
-            role: "assistant".into(),
-            content: Some(output.text.clone()),
-            tool_calls: None,
-            tool_call_id: None,
-            timestamp: llm_sdk::session::now_utc(),
-        });
-        Ok(output)
+        if let Ok(mut log) = self.log.lock() {
+            log.push(llm_sdk::ChatMessage {
+                role: "user".into(),
+                content: Some(prompt.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: llm_sdk::session::now_utc(),
+            });
+        }
+        let observer = LogTurnObserver { log: self.log.clone() };
+        self.codex.complete_observed(prompt, observer).await
     }
 }
 
@@ -245,7 +260,7 @@ impl Agent {
             }
             FreshCtx::Codex { store, key, codex } => {
                 store.remove_message_log(key);
-                let log = store.message_log(key);
+                let log = Arc::new(Mutex::new(store.message_log(key)));
                 self.completer = Box::new(CodexCompleter {
                     codex: codex.clone(),
                     log,
@@ -387,7 +402,7 @@ fn build_codex_completer(
     }
     let codex = Arc::new(builder);
 
-    let log = config.session_store.message_log(bus_name);
+    let log = Arc::new(Mutex::new(config.session_store.message_log(bus_name)));
     let completer: Box<dyn Completer> = Box::new(CodexCompleter {
         codex: codex.clone(),
         log,
