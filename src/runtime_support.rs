@@ -6,7 +6,6 @@ use llm_sdk::session::SessionStore;
 use llm_tasks::db::Database;
 
 use crate::relay;
-use crate::runtime::RuntimeState;
 use crate::types::AgentRole;
 
 pub struct CommandTimers {
@@ -27,12 +26,6 @@ impl CommandTimers {
             sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
             sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
         })
-    }
-}
-
-pub fn default_state() -> RuntimeState {
-    RuntimeState {
-        max_concurrent: 3,
     }
 }
 

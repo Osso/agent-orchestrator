@@ -27,6 +27,7 @@ async fn dispatch(args: &[String]) -> Result<()> {
         "mcp-serve" => cmd_mcp_serve(args).await,
         "mcp-tasks" => cmd_mcp_tasks(args).await,
         "status" => cmd_status(args),
+        "scale" => cmd_scale(args),
         _ => {
             print_usage();
             Ok(())
@@ -133,12 +134,14 @@ COMMANDS:
     send --project <name> <to> <message>        Send a message to a running agent
     notify --project <name> <task-id>           Notify runtime about a new task
     status --project <name>                     Show running agents for a project
+    scale <max>                                  Set global max concurrent task agents (1-20)
     mcp-serve --agent <name> --socket <path>    Run MCP stdio server for an agent
     mcp-tasks [--project <name>]                Task DB MCP for Claude Code (uses CLAUDE_CODE_TASK_LIST_ID)
 
 EXAMPLES:
     agent-orchestrator daemon
     agent-orchestrator send --project my-project runtime "check status"
+    agent-orchestrator scale 5
 "#
     );
 }
@@ -203,6 +206,24 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 .collect();
             println!("{}", serde_json::json!({ "project": project, "agents": out }));
         }
+        control::ControlResponse::Error { message } => bail!("Error: {message}"),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn cmd_scale(args: &[String]) -> Result<()> {
+    let max: u8 = args.iter()
+        .nth(2)
+        .ok_or_else(|| anyhow::anyhow!("Usage: agent-orchestrator scale <max>"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("max must be a number 1-20"))?;
+    let max = max.clamp(1, 20);
+    let socket = control::control_socket_path();
+    let request = control::ControlRequest::SetConcurrency { max };
+    let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
+    match response {
+        control::ControlResponse::Ok => println!("Global max concurrency set to {max}"),
         control::ControlResponse::Error { message } => bail!("Error: {message}"),
         _ => {}
     }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use tracing::{info, warn};
 use crate::agent::BackendKind;
 use crate::config::{self, ProjectConfig};
 use crate::control::{self, ProjectRegistry};
-use crate::runtime::OrchestratorRuntime;
+use crate::runtime::{GlobalLimits, OrchestratorRuntime};
 
 pub async fn run(backend: BackendKind, no_sandbox: bool) -> Result<()> {
     let projects = config::load_config().context("Failed to load project config")?;
@@ -24,16 +25,18 @@ pub async fn run(backend: BackendKind, no_sandbox: bool) -> Result<()> {
     info!("Daemon starting with {} project(s)", projects.len());
 
     let registry = control::new_registry();
+    let global_limits = Arc::new(GlobalLimits::new(10));
     let (global_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(control::run_control_server(
         registry.clone(),
+        global_limits.clone(),
         global_shutdown_tx.clone(),
         shutdown_rx,
     ));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut supervisor = Supervisor::new(registry, backend, no_sandbox);
+    let mut supervisor = Supervisor::new(registry, global_limits, backend, no_sandbox);
     supervisor.start_all(projects).await;
     supervisor.wait_for_signal(global_shutdown_tx).await;
     info!("Daemon stopped");
@@ -48,13 +51,14 @@ struct ProjectHandle {
 struct Supervisor {
     projects: HashMap<String, ProjectHandle>,
     registry: ProjectRegistry,
+    global_limits: Arc<GlobalLimits>,
     backend: BackendKind,
     no_sandbox: bool,
 }
 
 impl Supervisor {
-    fn new(registry: ProjectRegistry, backend: BackendKind, no_sandbox: bool) -> Self {
-        Self { projects: HashMap::new(), registry, backend, no_sandbox }
+    fn new(registry: ProjectRegistry, global_limits: Arc<GlobalLimits>, backend: BackendKind, no_sandbox: bool) -> Self {
+        Self { projects: HashMap::new(), registry, global_limits, backend, no_sandbox }
     }
 
     async fn start_all(&mut self, configs: HashMap<String, ProjectConfig>) {
@@ -70,6 +74,7 @@ impl Supervisor {
             config.dir.clone(),
             self.backend.clone(),
             self.no_sandbox,
+            self.global_limits.clone(),
         ).await {
             Ok(r) => r,
             Err(e) => {

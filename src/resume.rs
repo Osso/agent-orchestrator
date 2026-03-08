@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use std::sync::atomic::Ordering;
+
 use anyhow::Result;
 
 use crate::agent::{AgentConfig, BackendKind};
@@ -63,6 +65,7 @@ impl OrchestratorRuntime {
         let config = self.resume_agent_config(agent_id, working_dir, sandbox_prefix);
 
         self.spawn_agent_with_config(config)?;
+        self.global_limits.active_agents.fetch_add(1, Ordering::Relaxed);
         self.dispatcher.register_active(task.id.clone(), bus_name.to_string());
         let payload = serde_json::json!({"content": prompt, "task_id": task.id});
         if let Err(e) = self.dispatcher.notify(bus_name, "task_assignment", payload) {

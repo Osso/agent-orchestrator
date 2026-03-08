@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
 use agent_bus::Bus;
@@ -6,6 +7,8 @@ use peercred_ipc::Server;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+use crate::runtime::GlobalLimits;
 
 /// Returns the path for the global control Unix socket.
 /// Uses ~/.claude/orchestrator/ so it's accessible inside bwrap sandboxes.
@@ -27,7 +30,7 @@ pub fn new_registry() -> ProjectRegistry {
 pub enum ControlRequest {
     SendMessage { project: String, to: String, content: String },
     NotifyTaskCreated { project: String, task_id: String },
-    SetConcurrency { project: String, max: u8 },
+    SetConcurrency { max: u8 },
     Abort { project: String },
     Status { project: String },
 }
@@ -47,6 +50,7 @@ pub struct AgentStatus {
 
 pub async fn run_control_server(
     registry: ProjectRegistry,
+    global_limits: Arc<GlobalLimits>,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -71,9 +75,10 @@ pub async fn run_control_server(
                     Ok((mut conn, caller)) => {
                         info!("Control connection from pid={} uid={}", caller.pid, caller.uid);
                         let registry = registry.clone();
+                        let global_limits = global_limits.clone();
                         let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(&mut conn, &registry, &shutdown_tx).await {
+                            if let Err(e) = handle_connection(&mut conn, &registry, &global_limits, &shutdown_tx).await {
                                 warn!("Control connection error: {e}");
                             }
                         });
@@ -92,10 +97,11 @@ pub async fn run_control_server(
 async fn handle_connection(
     conn: &mut peercred_ipc::Connection,
     registry: &ProjectRegistry,
+    global_limits: &Arc<GlobalLimits>,
     shutdown_tx: &watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let request: ControlRequest = conn.read().await?;
-    let response = handle_request(request, registry, shutdown_tx);
+    let response = handle_request(request, registry, global_limits, shutdown_tx);
     conn.write(&response).await?;
     Ok(())
 }
@@ -103,16 +109,18 @@ async fn handle_connection(
 fn handle_request(
     request: ControlRequest,
     registry: &ProjectRegistry,
+    global_limits: &Arc<GlobalLimits>,
     shutdown_tx: &watch::Sender<bool>,
 ) -> ControlResponse {
     match request {
         ControlRequest::SendMessage { project, to, content } => {
             with_bus(registry, &project, |bus| send_to_agent(bus, &to, &content))
         }
-        ControlRequest::SetConcurrency { project, max } => {
-            with_bus(registry, &project, |bus| {
-                send_bus_message(bus, "runtime", "set_concurrency", serde_json::json!({ "max": max }))
-            })
+        ControlRequest::SetConcurrency { max } => {
+            let max = (max as usize).clamp(1, 20);
+            let prev = global_limits.max_concurrent.swap(max, Ordering::Relaxed);
+            info!("Global max concurrency set to {} (was {})", max, prev);
+            ControlResponse::Ok
         }
         ControlRequest::NotifyTaskCreated { project, task_id } => {
             with_bus(registry, &project, |bus| {

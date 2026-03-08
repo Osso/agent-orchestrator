@@ -90,7 +90,7 @@ struct AddCommentParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetConcurrencyParams {
-    /// Maximum number of parallel task agents (1-6). Each agent runs in its own git worktree.
+    /// Global maximum number of parallel task agents (1-20). Each agent runs in its own git worktree.
     max: u8,
 }
 
@@ -211,11 +211,11 @@ impl TasksMcp {
         }
     }
 
-    #[tool(description = "Scale the maximum number of parallel task agents (1-6) that pick up and implement tasks in isolated git worktrees. Requires a running orchestrator.")]
+    #[tool(description = "Scale the global maximum number of parallel task agents (1-20) across all projects. Requires a running orchestrator.")]
     async fn set_concurrency(&self, Parameters(p): Parameters<SetConcurrencyParams>) -> String {
-        let max = p.max.clamp(1, 6);
+        let max = p.max.clamp(1, 20);
         let socket_path = control::control_socket_path();
-        let req = control::ControlRequest::SetConcurrency { project: self.project.clone(), max };
+        let req = control::ControlRequest::SetConcurrency { max };
         match tokio::task::spawn_blocking(move || {
             peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
                 &socket_path, &req,

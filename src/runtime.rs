@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,8 +31,26 @@ use crate::runtime_support::{self as support, CommandTimers};
 use crate::types::{AgentId, AgentRole};
 use crate::worktree::{self, WorktreeConfig};
 
-pub struct RuntimeState {
-    pub max_concurrent: usize,
+/// Global concurrency limits shared across all project runtimes.
+pub struct GlobalLimits {
+    pub max_concurrent: AtomicUsize,
+    pub active_agents: AtomicUsize,
+}
+
+impl GlobalLimits {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max_concurrent: AtomicUsize::new(max),
+            active_agents: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many more agents can be spawned globally.
+    pub fn available_slots(&self) -> usize {
+        let max = self.max_concurrent.load(Ordering::Relaxed);
+        let active = self.active_agents.load(Ordering::Relaxed);
+        max.saturating_sub(active)
+    }
 }
 
 /// Factory function that creates an Agent from config + mailbox.
@@ -44,7 +63,7 @@ fn default_agent_factory() -> AgentFactory {
 }
 
 pub struct OrchestratorRuntime {
-    pub state: RuntimeState,
+    pub global_limits: Arc<GlobalLimits>,
     pub bus: Bus,
     pub(crate) db: Arc<Database>,
     pub(crate) session_store: SessionStore,
@@ -63,6 +82,7 @@ impl OrchestratorRuntime {
         working_dir: String,
         backend: BackendKind,
         no_sandbox: bool,
+        global_limits: Arc<GlobalLimits>,
     ) -> Result<Self> {
         let db = Database::open(db_path)
             .await
@@ -83,7 +103,7 @@ impl OrchestratorRuntime {
         let dispatcher = Dispatcher::new(db.clone(), dispatch_mailbox);
 
         Ok(Self {
-            state: support::default_state(),
+            global_limits,
             bus,
             db,
             session_store,
@@ -112,7 +132,7 @@ impl OrchestratorRuntime {
         let dispatcher = Dispatcher::new(db.clone(), dispatch_mailbox);
 
         Ok(Self {
-            state: support::default_state(),
+            global_limits: Arc::new(GlobalLimits::new(10)),
             bus,
             db,
             session_store,
@@ -153,6 +173,7 @@ impl OrchestratorRuntime {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(control::run_control_server(
             registry,
+            self.global_limits.clone(),
             shutdown_tx.clone(),
             shutdown_rx,
         ));
@@ -229,8 +250,15 @@ impl OrchestratorRuntime {
     }
 
     async fn poll_dispatch(&mut self) {
-        let task_ids = self.dispatcher.tasks_to_dispatch(self.state.max_concurrent).await;
+        let available = self.global_limits.available_slots();
+        if available == 0 {
+            return;
+        }
+        let task_ids = self.dispatcher.tasks_to_dispatch(available).await;
         for task_id in task_ids {
+            if self.global_limits.available_slots() == 0 {
+                break;
+            }
             if let Err(e) = self.spawn_task_agent(&task_id).await {
                 tracing::error!("Failed to spawn agent for task {}: {}", task_id, e);
             }
@@ -243,32 +271,12 @@ impl OrchestratorRuntime {
                 let task_id = support::payload_str(payload, "task_id");
                 self.spawn_architect_validation(&task_id).await;
             }
-            "task_complete" => {
-                let content = support::payload_str(payload, "content");
-                let task_id = self.resolve_task_id(from);
-                if let Some(task_id) = task_id {
-                    let agent_name = from.to_string();
-                    // Clean up the agent so a retry can re-register the same name.
-                    self.agent_handles.remove(&agent_name);
-                    self.cleanup_agent_bus(&agent_name);
-                    if self.dispatcher.handle_agent_complete(&task_id, &content).await {
-                        self.spawn_completion_review(&task_id, &content, &agent_name);
-                    }
-                }
-            }
+            "task_complete" => self.handle_agent_done(payload, from).await,
             "task_done" => {
                 let task_id = support::payload_str(payload, "task_id");
                 self.merge_agent_branch(&task_id).await;
             }
-            "task_blocked" => {
-                let content = support::payload_str(payload, "content");
-                let agent_name = from.to_string();
-                self.agent_handles.remove(&agent_name);
-                self.cleanup_agent_bus(&agent_name);
-                if let Some(task_id) = self.resolve_task_id(from) {
-                    self.dispatcher.handle_agent_blocked(&task_id, &content).await;
-                }
-            }
+            "task_blocked" => self.handle_agent_blocked_event(payload, from).await,
             "agent_heartbeat" => {
                 let agent = support::payload_str(payload, "agent");
                 if !agent.is_empty() { self.dispatcher.record_activity(&agent); }
@@ -277,6 +285,31 @@ impl OrchestratorRuntime {
             _ => {}
         }
         self.poll_dispatch().await;
+    }
+
+    async fn handle_agent_done(&mut self, payload: &serde_json::Value, from: &str) {
+        let content = support::payload_str(payload, "content");
+        let Some(task_id) = self.resolve_task_id(from) else { return };
+        let agent_name = from.to_string();
+        self.release_agent(&agent_name);
+        if self.dispatcher.handle_agent_complete(&task_id, &content).await {
+            self.spawn_completion_review(&task_id, &content, &agent_name);
+        }
+    }
+
+    async fn handle_agent_blocked_event(&mut self, payload: &serde_json::Value, from: &str) {
+        let content = support::payload_str(payload, "content");
+        let agent_name = from.to_string();
+        self.release_agent(&agent_name);
+        if let Some(task_id) = self.resolve_task_id(from) {
+            self.dispatcher.handle_agent_blocked(&task_id, &content).await;
+        }
+    }
+
+    fn release_agent(&mut self, agent_name: &str) {
+        self.agent_handles.remove(agent_name);
+        self.cleanup_agent_bus(agent_name);
+        self.global_limits.active_agents.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Resolve task ID from an agent's bus name.
@@ -334,6 +367,7 @@ impl OrchestratorRuntime {
             return Ok(());
         }
 
+        self.global_limits.active_agents.fetch_add(1, Ordering::Relaxed);
         let config = self.build_task_agent_config(agent_id)?;
         self.spawn_agent_with_config(config)?;
         self.send_task_assignment(task_id, &bus_name).await;
@@ -568,6 +602,7 @@ impl OrchestratorRuntime {
             handle.abort();
         }
         self.cleanup_agent_bus(name);
+        self.global_limits.active_agents.fetch_sub(1, Ordering::Relaxed);
         self.dispatcher.remove_task_by_agent(name);
         self.try_remove_worktree(name);
     }
