@@ -20,6 +20,9 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig, BackendKind};
 use crate::architect_client;
+
+/// Maximum times a task can be dispatched before it's marked as failed.
+const MAX_TASK_ATTEMPTS: u32 = 3;
 use crate::control;
 use crate::dispatch::Dispatcher;
 use crate::relay::{self, RelayServer};
@@ -52,6 +55,8 @@ pub struct OrchestratorRuntime {
     pub backend: BackendKind,
     pub(crate) no_sandbox: bool,
     pub(crate) dispatcher: Dispatcher,
+    /// Number of times a task has been dispatched (task_id → count).
+    task_attempts: HashMap<String, u32>,
 }
 
 impl OrchestratorRuntime {
@@ -91,6 +96,7 @@ impl OrchestratorRuntime {
             backend,
             no_sandbox,
             dispatcher,
+            task_attempts: HashMap::new(),
         })
     }
 
@@ -120,6 +126,7 @@ impl OrchestratorRuntime {
             backend,
             no_sandbox: true,
             dispatcher,
+            task_attempts: HashMap::new(),
         })
     }
 
@@ -316,6 +323,15 @@ impl OrchestratorRuntime {
 
     /// Spawn a fresh agent for a task.
     async fn spawn_task_agent(&mut self, task_id: &str) -> Result<()> {
+        let attempts = self.task_attempts.entry(task_id.to_string()).or_insert(0);
+        *attempts += 1;
+        if *attempts > MAX_TASK_ATTEMPTS {
+            tracing::error!("Task {} exceeded max attempts ({}), marking failed", task_id, MAX_TASK_ATTEMPTS);
+            self.fail_task(task_id).await;
+            return Ok(());
+        }
+        tracing::info!("Dispatching task {} (attempt {}/{})", task_id, attempts, MAX_TASK_ATTEMPTS);
+
         let agent_id = AgentId::for_task(task_id);
         let bus_name = agent_id.bus_name();
 
@@ -327,6 +343,12 @@ impl OrchestratorRuntime {
         self.spawn_agent_with_config(config)?;
         self.send_task_assignment(task_id, &bus_name).await;
         Ok(())
+    }
+
+    async fn fail_task(&self, task_id: &str) {
+        let updates = llm_tasks::db::TaskUpdates { status: Some("failed"), ..Default::default() };
+        let _ = self.db.update_task(task_id, updates, "runtime").await;
+        let _ = self.db.add_comment(task_id, "runtime", &format!("Failed after {} attempts", MAX_TASK_ATTEMPTS)).await;
     }
 
     fn build_task_agent_config(&self, agent_id: AgentId) -> Result<AgentConfig> {
