@@ -26,6 +26,7 @@ async fn dispatch(args: &[String]) -> Result<()> {
         "notify" => cmd_notify(args),
         "mcp-serve" => cmd_mcp_serve(args).await,
         "mcp-tasks" => cmd_mcp_tasks(args).await,
+        "status" => cmd_status(args),
         _ => {
             print_usage();
             Ok(())
@@ -131,6 +132,7 @@ COMMANDS:
     daemon                                      Run as daemon for all configured projects
     send --project <name> <to> <message>        Send a message to a running agent
     notify --project <name> <task-id>           Notify runtime about a new task
+    status --project <name>                     Show running agents for a project
     mcp-serve --agent <name> --socket <path>    Run MCP stdio server for an agent
     mcp-tasks [--project <name>]                Task DB MCP for Claude Code (uses CLAUDE_CODE_TASK_LIST_ID)
 
@@ -178,6 +180,29 @@ fn cmd_notify(args: &[String]) -> Result<()> {
     let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
     match response {
         control::ControlResponse::Ok => println!("Notified runtime about {}", task_id),
+        control::ControlResponse::Error { message } => bail!("Error: {message}"),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn cmd_status(args: &[String]) -> Result<()> {
+    let project = extract_named_arg(args, "--project")
+        .ok_or_else(|| anyhow::anyhow!("--project required for status"))?;
+    let socket = control::control_socket_path();
+    let request = control::ControlRequest::Status { project };
+    let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
+    match response {
+        control::ControlResponse::Status { agents, project } => {
+            let out: Vec<serde_json::Value> = agents
+                .iter()
+                .map(|a| {
+                    let task_id = a.name.strip_prefix("task-").map(String::from);
+                    serde_json::json!({ "name": a.name, "role": a.role, "task_id": task_id })
+                })
+                .collect();
+            println!("{}", serde_json::json!({ "project": project, "agents": out }));
+        }
         control::ControlResponse::Error { message } => bail!("Error: {message}"),
         _ => {}
     }

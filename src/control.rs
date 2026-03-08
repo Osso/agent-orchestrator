@@ -126,9 +126,9 @@ fn handle_request(
             })
         }
         ControlRequest::Status { project } => {
-            let p = project.clone();
-            with_bus(registry, &project, |bus| {
-                let agents = bus
+            let guard = registry.read().unwrap();
+            let agents = match guard.get(&project) {
+                Some(bus) => bus
                     .list_registered()
                     .into_iter()
                     .filter(|n| n != "runtime" && !n.starts_with("relay-"))
@@ -136,9 +136,10 @@ fn handle_request(
                         let role = role_from_name(&name).to_string();
                         AgentStatus { name, role }
                     })
-                    .collect();
-                ControlResponse::Status { agents, project: p }
-            })
+                    .collect(),
+                None => Vec::new(),
+            };
+            ControlResponse::Status { agents, project }
         }
     }
 }

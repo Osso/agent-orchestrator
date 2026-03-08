@@ -60,16 +60,32 @@ impl Completer for OpenRouterCompleter {
     }
 }
 
-/// Production completer backed by Codex (ChatGPT Pro OAuth).
+/// Production completer backed by Codex (ChatGPT Pro OAuth) with MessageLog persistence.
 struct CodexCompleter {
     codex: Arc<llm_sdk::codex::Codex>,
+    log: llm_sdk::MessageLog,
 }
 
 #[async_trait]
 impl Completer for CodexCompleter {
     async fn complete(&mut self, prompt: &str) -> Result<llm_sdk::Output, llm_sdk::Error> {
         use llm_sdk::Backend;
-        self.codex.complete(prompt).await
+        self.log.push(llm_sdk::ChatMessage {
+            role: "user".into(),
+            content: Some(prompt.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: llm_sdk::session::now_utc(),
+        });
+        let output = self.codex.complete(prompt).await?;
+        self.log.push(llm_sdk::ChatMessage {
+            role: "assistant".into(),
+            content: Some(output.text.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: llm_sdk::session::now_utc(),
+        });
+        Ok(output)
     }
 }
 
@@ -229,8 +245,10 @@ impl Agent {
             }
             FreshCtx::Codex { store, key, codex } => {
                 store.remove_message_log(key);
+                let log = store.message_log(key);
                 self.completer = Box::new(CodexCompleter {
                     codex: codex.clone(),
+                    log,
                 });
             }
         }
@@ -369,8 +387,10 @@ fn build_codex_completer(
     }
     let codex = Arc::new(builder);
 
+    let log = config.session_store.message_log(bus_name);
     let completer: Box<dyn Completer> = Box::new(CodexCompleter {
         codex: codex.clone(),
+        log,
     });
 
     let fresh_ctx = if config.fresh_session_per_task {
