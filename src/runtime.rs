@@ -245,6 +245,9 @@ impl OrchestratorRuntime {
                 let task_id = self.resolve_task_id(from);
                 if let Some(task_id) = task_id {
                     let agent_name = from.to_string();
+                    // Clean up the agent so a retry can re-register the same name.
+                    self.agent_handles.remove(&agent_name);
+                    self.cleanup_agent_bus(&agent_name);
                     if self.dispatcher.handle_agent_complete(&task_id, &content).await {
                         self.spawn_completion_review(&task_id, &content, &agent_name);
                     }
@@ -256,6 +259,9 @@ impl OrchestratorRuntime {
             }
             "task_blocked" => {
                 let content = support::payload_str(payload, "content");
+                let agent_name = from.to_string();
+                self.agent_handles.remove(&agent_name);
+                self.cleanup_agent_bus(&agent_name);
                 if let Some(task_id) = self.resolve_task_id(from) {
                     self.dispatcher.handle_agent_blocked(&task_id, &content).await;
                 }
@@ -536,11 +542,19 @@ impl OrchestratorRuntime {
         if let Some(handle) = self.agent_handles.remove(name) {
             tracing::info!("Stopping {}", name);
             handle.abort();
-            let relay_name = format!("relay-{}", name);
-            self.bus.deregister(&relay_name);
-            self.dispatcher.remove_task_by_agent(name);
-            self.try_remove_worktree(name);
         }
+        self.cleanup_agent_bus(name);
+        self.dispatcher.remove_task_by_agent(name);
+        self.try_remove_worktree(name);
+    }
+
+    /// Remove an agent's bus registrations without aborting its task handle.
+    /// Used when the agent has already finished (task_complete) but needs
+    /// to be cleaned up so a retry can re-register the same name.
+    fn cleanup_agent_bus(&self, name: &str) {
+        self.bus.deregister(name);
+        self.bus.deregister(&format!("{}-tools", name));
+        self.bus.deregister(&format!("relay-{}", name));
     }
 
     fn try_remove_worktree(&self, bus_name: &str) {
