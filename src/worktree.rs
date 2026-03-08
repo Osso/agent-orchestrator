@@ -24,20 +24,34 @@ impl WorktreeConfig {
 }
 
 pub fn create_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
+    create_worktree_inner(cfg, false)
+}
+
+/// Create or reuse a worktree, preserving the branch state when `resume` is true.
+/// Used on restart to keep partial work from a previous session.
+pub fn create_or_resume_worktree(cfg: &WorktreeConfig) -> Result<PathBuf> {
+    create_worktree_inner(cfg, true)
+}
+
+fn create_worktree_inner(cfg: &WorktreeConfig, resume: bool) -> Result<PathBuf> {
     ensure_git_repo(&cfg.project_dir)?;
     ensure_head_exists(&cfg.project_dir)?;
     prune_stale_worktrees(&cfg.project_dir);
     let path = cfg.path();
 
-    if let Some(reused) = try_reuse_worktree(cfg, &path) {
+    if let Some(reused) = try_reuse_worktree(cfg, &path, resume) {
         return Ok(reused);
     }
     add_fresh_worktree(cfg, &path)
 }
 
-fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Option<PathBuf> {
+fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf, resume: bool) -> Option<PathBuf> {
     if !path.join(".git").exists() {
         return None;
+    }
+    if resume {
+        tracing::info!("Resuming worktree at {} (preserving branch state)", path.display());
+        return Some(path.clone());
     }
     tracing::info!("Reusing existing worktree at {}", path.display());
     let branch = cfg.branch();

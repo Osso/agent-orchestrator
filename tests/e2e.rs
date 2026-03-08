@@ -123,7 +123,7 @@ async fn runtime_crew_clamps_bounds() {
     let (mut rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
 
     rt.handle_crew_size(10);
-    assert_eq!(rt.state.developer_count, 3, "should clamp to max 3");
+    assert_eq!(rt.state.developer_count, 6, "should clamp to max 6");
 
     rt.handle_crew_size(0);
     assert_eq!(rt.state.developer_count, 1, "should clamp to min 1");

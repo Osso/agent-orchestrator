@@ -43,8 +43,41 @@ fn init_tracing() -> Result<()> {
 }
 
 async fn cmd_daemon() -> Result<()> {
-    let backend = BackendKind::Claude;
+    let backend = load_backend_config();
     agent_orchestrator::daemon::run(backend, false).await
+}
+
+fn load_backend_config() -> BackendKind {
+    let path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("agent-orchestrator")
+        .join("config.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return BackendKind::Claude,
+    };
+    let table: toml::Table = match contents.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Bad config {}: {e}", path.display());
+            return BackendKind::Claude;
+        }
+    };
+    let backend = table.get("backend").and_then(|v| v.as_str()).unwrap_or("claude");
+    match backend {
+        "codex" => {
+            let model = table.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-5.4");
+            BackendKind::Codex { model: model.to_string() }
+        }
+        "openrouter" => {
+            let model = table.get("model").and_then(|v| v.as_str()).unwrap_or("anthropic/claude-sonnet-4");
+            let api_key = table.get("api_key").and_then(|v| v.as_str()).map(String::from)
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .unwrap_or_default();
+            BackendKind::OpenRouter { model: model.to_string(), api_key }
+        }
+        _ => BackendKind::Claude,
+    }
 }
 
 fn cmd_send(args: &[String]) -> Result<()> {

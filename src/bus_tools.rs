@@ -95,7 +95,7 @@ impl ToolDef for SendMessageTool {
                 "Message sent".into()
             }
             Err(e) => {
-                tracing::error!("bus_tool send_message failed: -> {} kind={}: {}", to, kind, e);
+                tracing::warn!("bus_tool send_message failed: -> {} kind={}: {}", to, kind, e);
                 format!(
                     "Send failed: {e}. Valid agent names: manager, architect, \
                      developer-0, developer-1, developer-2, merger, auditor"
@@ -125,11 +125,11 @@ impl ToolDef for SetCrewTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "set_crew".into(),
-            description: "Set the number of developer agents (1-3). Manager only.".into(),
+            description: "Set the number of developer agents (1-6). Manager only.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "count": { "type": "integer", "description": "Number of developers (1-3)" }
+                    "count": { "type": "integer", "description": "Number of developers (1-6)" }
                 },
                 "required": ["count"]
             }),

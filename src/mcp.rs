@@ -32,7 +32,7 @@ struct SendMessageParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct SetCrewParams {
-    /// Number of developer agents (1-3)
+    /// Number of developer agents (1-6)
     count: u8,
 }
 
@@ -146,7 +146,7 @@ impl OrchestratorMcp {
         relay_call(&self.client, "goal_complete", &params, "Goal marked complete. Orchestrator shutting down.").await
     }
 
-    #[tool(description = "Set the number of developer agents (1-3). Manager only.")]
+    #[tool(description = "Set the number of developer agents (1-6). Manager only.")]
     async fn set_crew(&self, Parameters(params): Parameters<SetCrewParams>) -> String {
         relay_call(&self.client, "set_crew", &params, "Crew size updated").await
     }

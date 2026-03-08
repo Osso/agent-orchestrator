@@ -120,6 +120,12 @@ fn dispatch_validate(request: Request) -> Result<ValidateResult, String> {
 }
 
 async fn apply_validation_result(db: &Database, bus: &Bus, task_id: &str, result: Result<ValidateResult, String>) {
+    // Never override pending_delete — close the task immediately
+    if matches!(db.get_task(task_id).await, Ok(t) if t.status == "pending_delete") {
+        tracing::info!("Task {task_id} is pending_delete, closing instead of applying validation");
+        let _ = db.close_task(task_id, "runtime").await;
+        return;
+    }
     match result {
         Ok(ValidateResult::Approved(verdict)) => {
             approve_task(db, task_id, &verdict).await;
@@ -144,6 +150,12 @@ async fn apply_review_result(
     title: &str,
     result: Result<ReviewResult, String>,
 ) {
+    // Never override pending_delete — close the task immediately
+    if matches!(db.get_task(task_id).await, Ok(t) if t.status == "pending_delete") {
+        tracing::info!("Task {task_id} is pending_delete, closing instead of applying review");
+        let _ = db.close_task(task_id, "runtime").await;
+        return;
+    }
     match result {
         Ok(ReviewResult::Accomplished(assessment)) => {
             complete_task(db, bus, task_id, title, &assessment).await;

@@ -25,6 +25,7 @@ const DISALLOWED_TOOLS: &[&str] = &[
 pub enum BackendKind {
     Claude,
     OpenRouter { model: String, api_key: String },
+    Codex { model: String },
 }
 
 /// Abstraction over Session+Claude so tests can inject a fake.
@@ -59,6 +60,19 @@ impl Completer for OpenRouterCompleter {
     }
 }
 
+/// Production completer backed by Codex (ChatGPT Pro OAuth).
+struct CodexCompleter {
+    codex: Arc<llm_sdk::codex::Codex>,
+}
+
+#[async_trait]
+impl Completer for CodexCompleter {
+    async fn complete(&mut self, prompt: &str) -> Result<llm_sdk::Output, llm_sdk::Error> {
+        use llm_sdk::Backend;
+        self.codex.complete(prompt).await
+    }
+}
+
 /// Context needed to issue a fresh completer for each task.
 enum FreshCtx {
     Claude {
@@ -71,6 +85,11 @@ enum FreshCtx {
         store: SessionStore,
         key: String,
         openrouter: Arc<llm_sdk::openrouter::OpenRouter>,
+    },
+    Codex {
+        store: SessionStore,
+        key: String,
+        codex: Arc<llm_sdk::codex::Codex>,
     },
 }
 
@@ -208,6 +227,12 @@ impl Agent {
                     log,
                 });
             }
+            FreshCtx::Codex { store, key, codex } => {
+                store.remove_message_log(key);
+                self.completer = Box::new(CodexCompleter {
+                    codex: codex.clone(),
+                });
+            }
         }
         tracing::info!("Agent {} fresh completer for task", self.config.agent_id);
     }
@@ -244,6 +269,9 @@ fn build_completer(
         BackendKind::Claude => build_claude_completer(config, bus_name),
         BackendKind::OpenRouter { model, api_key } => {
             build_openrouter_completer(config, bus_name, model, api_key)
+        }
+        BackendKind::Codex { model } => {
+            build_codex_completer(config, bus_name, model)
         }
     }
 }
@@ -318,6 +346,38 @@ fn build_openrouter_completer(
             store: config.session_store.clone(),
             key: bus_name.to_string(),
             openrouter,
+        })
+    } else {
+        None
+    };
+
+    Ok((completer, fresh_ctx))
+}
+
+fn build_codex_completer(
+    config: &AgentConfig,
+    bus_name: &str,
+    model: &str,
+) -> Result<(Box<dyn Completer>, Option<FreshCtx>)> {
+    let mut builder = llm_sdk::codex::Codex::new(model)
+        .system_prompt(&config.system_prompt);
+    let tools = build_openrouter_tools(config, bus_name);
+    let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
+    tracing::info!("Codex tools for {}: {:?}", bus_name, tool_names);
+    if !tools.is_empty() {
+        builder = builder.tools(tools);
+    }
+    let codex = Arc::new(builder);
+
+    let completer: Box<dyn Completer> = Box::new(CodexCompleter {
+        codex: codex.clone(),
+    });
+
+    let fresh_ctx = if config.fresh_session_per_task {
+        Some(FreshCtx::Codex {
+            store: config.session_store.clone(),
+            key: bus_name.to_string(),
+            codex,
         })
     } else {
         None

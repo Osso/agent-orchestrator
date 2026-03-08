@@ -50,15 +50,15 @@ fn default_agent_factory() -> AgentFactory {
 pub struct OrchestratorRuntime {
     pub state: RuntimeState,
     pub bus: Bus,
-    db: Arc<Database>,
-    session_store: SessionStore,
-    working_dir: String,
-    project: String,
+    pub(crate) db: Arc<Database>,
+    pub(crate) session_store: SessionStore,
+    pub(crate) working_dir: String,
+    pub(crate) project: String,
     agent_handles: HashMap<String, JoinHandle<()>>,
     agent_factory: AgentFactory,
     pub backend: BackendKind,
-    no_sandbox: bool,
-    dispatcher: Dispatcher,
+    pub(crate) no_sandbox: bool,
+    pub(crate) dispatcher: Dispatcher,
 }
 
 impl OrchestratorRuntime {
@@ -187,6 +187,7 @@ impl OrchestratorRuntime {
 
         let enriched_task = self.enrich_with_task_state(initial_task).await;
         self.spawn_initial_agents(enriched_task)?;
+        self.resume_in_progress_tasks().await;
         self.command_loop(&mut mailbox, shutdown_tx).await
     }
 
@@ -368,14 +369,21 @@ impl OrchestratorRuntime {
     }
 
     /// Look up the task's assignee and send merge_request to the merger.
+    /// Refuses to merge if the task is `pending_delete`.
     async fn merge_developer_branch(&mut self, task_id: &str) {
-        let assignee = match self.db.get_task(task_id).await {
-            Ok(t) => t.assignee.unwrap_or_default(),
+        let task = match self.db.get_task(task_id).await {
+            Ok(t) => t,
             Err(e) => {
                 tracing::error!("Failed to get task {task_id} for merge: {e}");
                 return;
             }
         };
+        if task.status == "pending_delete" {
+            tracing::info!("Task {task_id} is pending_delete, skipping merge and closing");
+            let _ = self.db.close_task(task_id, "runtime").await;
+            return;
+        }
+        let assignee = task.assignee.unwrap_or_default();
         if assignee.is_empty() || !assignee.starts_with("developer-") {
             tracing::warn!("Task {task_id} has no developer assignee, skipping merge");
             return;
@@ -465,18 +473,24 @@ impl OrchestratorRuntime {
     }
 
     async fn shutdown(&mut self) {
-        // Reset any in-progress tasks so they don't stay stuck after restart
-        if let Ok(tasks) = self.db.list_tasks(Some("in_progress"), None).await {
+        // Keep in_progress tasks and their assignees so they can resume on restart.
+        // The worktrees preserve partial work; the DB preserves the assignment.
+        let in_progress = self.db.list_tasks(Some("in_progress"), None).await.unwrap_or_default();
+        for task in &in_progress {
+            tracing::info!(
+                "Preserving in_progress task {} (assignee: {:?}) for resume",
+                task.id, task.assignee
+            );
+        }
+        // Close any pending_delete tasks that survived the session
+        if let Ok(tasks) = self.db.list_tasks(Some("pending_delete"), None).await {
             for task in &tasks {
-                tracing::info!("Resetting in_progress task {} on shutdown", task.id);
-                let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
-                let _ = self.db.update_task(&task.id, updates, "runtime").await;
-                let _ = self.db.clear_assignee(&task.id, "runtime").await;
+                tracing::info!("Closing pending_delete task {} on shutdown", task.id);
+                let _ = self.db.close_task(&task.id, "runtime").await;
             }
         }
         tracing::info!("Shutting down {} agents", self.agent_handles.len());
         let merger_handle = self.agent_handles.remove("merger");
-        let names: Vec<String> = self.agent_handles.keys().cloned().collect();
         for (name, handle) in self.agent_handles.drain() {
             tracing::info!("Stopping {}", name);
             handle.abort();
@@ -488,9 +502,7 @@ impl OrchestratorRuntime {
                 Err(_) => tracing::warn!("Merger timed out, aborting"),
             }
         }
-        for name in &names {
-            self.try_remove_worktree(name);
-        }
+        // Only remove non-developer worktrees; developer worktrees are preserved for resume
         self.try_remove_worktree("merger");
     }
 
@@ -528,7 +540,7 @@ impl OrchestratorRuntime {
         let (working_dir, sandbox_prefix) = self.working_dir_and_sandbox(role, &bus_name);
         let fresh = role == AgentRole::Developer;
         let bus = match self.backend {
-            BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
+            BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
         };
         let config = AgentConfig {
@@ -572,7 +584,7 @@ impl OrchestratorRuntime {
         support::resolve_sandbox(role, &project_path, worktree_result, use_sandbox)
     }
 
-    fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
+    pub(crate) fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
         let bus_name = config.agent_id.bus_name();
         let mailbox = self
             .bus
@@ -597,7 +609,7 @@ impl OrchestratorRuntime {
     }
 
     pub fn handle_crew_size(&mut self, count: u8) {
-        let count = count.clamp(1, 3);
+        let count = count.clamp(1, 6);
         let current = self.state.developer_count;
         if count == current {
             return;
@@ -651,7 +663,7 @@ impl OrchestratorRuntime {
     fn spawn_replacement_manager(&mut self, briefing: String) {
         let prompt = format!("{}\n\n{}", AgentRole::Manager.system_prompt(), briefing);
         let bus = match self.backend {
-            BackendKind::OpenRouter { .. } => Some(self.bus.clone()),
+            BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
         };
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();

@@ -90,7 +90,7 @@ struct AddCommentParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetDevelopersParams {
-    /// Number of developer agents (1-3)
+    /// Number of parallel Claude Code worker agents (1-6). Each agent runs in its own git worktree.
     count: u8,
 }
 
@@ -211,9 +211,9 @@ impl TasksMcp {
         }
     }
 
-    #[tool(description = "Set the number of developer agents (1-3). Requires a running orchestrator.")]
+    #[tool(description = "Scale the number of parallel Claude Code worker agents (1-6) that pick up and implement tasks in isolated git worktrees. Requires a running orchestrator.")]
     async fn set_developers(&self, Parameters(p): Parameters<SetDevelopersParams>) -> String {
-        let count = p.count.clamp(1, 3);
+        let count = p.count.clamp(1, 6);
         let socket_path = control::control_socket_path();
         let req = control::ControlRequest::SetDevelopers { project: self.project.clone(), count };
         match tokio::task::spawn_blocking(move || {

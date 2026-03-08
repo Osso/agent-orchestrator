@@ -34,8 +34,14 @@ impl Dispatcher {
     }
 
     /// Developer signals task complete → set in_review. Returns task_id for review.
+    /// If the task is `pending_delete`, skips the review and closes it immediately.
     pub async fn handle_dev_complete(&mut self, from: &str, content: &str) -> Option<String> {
         if let Some(assignment) = self.dev_tasks.remove(from) {
+            if self.is_pending_delete(&assignment.task_id).await {
+                tracing::info!("Task {} is pending_delete, skipping review", assignment.task_id);
+                let _ = self.db.close_task(&assignment.task_id, "runtime").await;
+                return None;
+            }
             self.transition_to_review(&assignment.task_id, from, content).await;
             Some(assignment.task_id)
         } else {
@@ -90,10 +96,12 @@ impl Dispatcher {
     ///
     /// - `in_progress` with no tracked developer → reset to `ready`
     /// - `ready` with non-empty assignee → clear assignee so dispatch finds them
+    /// - `pending_delete` with no active developer → close immediately
     pub async fn watchdog(&mut self) -> usize {
         let mut fixed = 0;
         fixed += self.reclaim_orphaned_in_progress().await;
         fixed += self.clear_stale_assignees().await;
+        fixed += self.close_pending_deletes().await;
         if fixed > 0 {
             tracing::info!("Watchdog fixed {} stuck tasks", fixed);
         }
@@ -154,6 +162,37 @@ impl Dispatcher {
             } else {
                 count += 1;
             }
+        }
+        count
+    }
+
+    async fn is_pending_delete(&self, task_id: &str) -> bool {
+        matches!(self.db.get_task(task_id).await, Ok(t) if t.status == "pending_delete")
+    }
+
+    /// Close any `pending_delete` tasks that have no active developer working on them.
+    async fn close_pending_deletes(&mut self) -> usize {
+        let tasks = match self.db.list_tasks(Some("pending_delete"), None).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to query pending_delete tasks: {}", e);
+                return 0;
+            }
+        };
+        let tracked: Vec<&str> =
+            self.dev_tasks.values().map(|a| a.task_id.as_str()).collect();
+        let mut count = 0;
+        for task in &tasks {
+            if tracked.contains(&task.id.as_str()) {
+                // Developer is still working — abort will happen via handle_dev_complete
+                continue;
+            }
+            tracing::info!("Closing pending_delete task {} (no active developer)", task.id);
+            if let Err(e) = self.db.close_task(&task.id, "runtime").await {
+                tracing::error!("Failed to close pending_delete task {}: {}", task.id, e);
+                continue;
+            }
+            count += 1;
         }
         count
     }
@@ -232,6 +271,14 @@ impl Dispatcher {
     /// Send a message via the dispatcher's mailbox.
     pub fn notify(&self, to: &str, kind: &str, payload: serde_json::Value) -> Result<(), String> {
         self.mailbox.send(to, kind, payload).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Register a resumed developer→task assignment (from a previous session).
+    pub fn register_resumed(&mut self, dev_name: String, task_id: String) {
+        self.dev_tasks.insert(dev_name, DevAssignment {
+            task_id,
+            last_activity: Instant::now(),
+        });
     }
 
     /// Remove a developer from tracking (e.g. when aborted).
