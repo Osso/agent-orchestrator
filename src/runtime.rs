@@ -492,7 +492,7 @@ impl OrchestratorRuntime {
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
-        let worktree_result = if support::is_worktree_role(bus_name) || bus_name == "merger" {
+        let worktree_result = if support::is_worktree_role(bus_name) {
             let cfg = WorktreeConfig {
                 project_dir: project_path.clone(),
                 agent_name: bus_name.to_string(),
@@ -544,7 +544,7 @@ impl OrchestratorRuntime {
     }
 
     fn try_remove_worktree(&self, bus_name: &str) {
-        if !support::is_worktree_role(bus_name) && bus_name != "merger" {
+        if !support::is_worktree_role(bus_name) {
             return;
         }
         let cfg = WorktreeConfig {
