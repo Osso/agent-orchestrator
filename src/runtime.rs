@@ -55,8 +55,6 @@ pub struct OrchestratorRuntime {
     pub backend: BackendKind,
     pub(crate) no_sandbox: bool,
     pub(crate) dispatcher: Dispatcher,
-    /// Number of times a task has been dispatched (task_id → count).
-    task_attempts: HashMap<String, u32>,
 }
 
 impl OrchestratorRuntime {
@@ -96,7 +94,6 @@ impl OrchestratorRuntime {
             backend,
             no_sandbox,
             dispatcher,
-            task_attempts: HashMap::new(),
         })
     }
 
@@ -126,7 +123,6 @@ impl OrchestratorRuntime {
             backend,
             no_sandbox: true,
             dispatcher,
-            task_attempts: HashMap::new(),
         })
     }
 
@@ -323,14 +319,13 @@ impl OrchestratorRuntime {
 
     /// Spawn a fresh agent for a task.
     async fn spawn_task_agent(&mut self, task_id: &str) -> Result<()> {
-        let attempts = self.task_attempts.entry(task_id.to_string()).or_insert(0);
-        *attempts += 1;
-        if *attempts > MAX_TASK_ATTEMPTS {
+        let attempts = self.count_attempts(task_id).await;
+        if attempts >= MAX_TASK_ATTEMPTS {
             tracing::error!("Task {} exceeded max attempts ({}), marking failed", task_id, MAX_TASK_ATTEMPTS);
             self.fail_task(task_id).await;
             return Ok(());
         }
-        tracing::info!("Dispatching task {} (attempt {}/{})", task_id, attempts, MAX_TASK_ATTEMPTS);
+        tracing::info!("Dispatching task {} (attempt {}/{})", task_id, attempts + 1, MAX_TASK_ATTEMPTS);
 
         let agent_id = AgentId::for_task(task_id);
         let bus_name = agent_id.bus_name();
@@ -349,6 +344,13 @@ impl OrchestratorRuntime {
         let updates = llm_tasks::db::TaskUpdates { status: Some("failed"), ..Default::default() };
         let _ = self.db.update_task(task_id, updates, "runtime").await;
         let _ = self.db.add_comment(task_id, "runtime", &format!("Failed after {} attempts", MAX_TASK_ATTEMPTS)).await;
+    }
+
+    async fn count_attempts(&self, task_id: &str) -> u32 {
+        match self.db.get_events(task_id).await {
+            Ok(events) => events.iter().filter(|e| e.action == "claimed").count() as u32,
+            Err(_) => 0,
+        }
     }
 
     fn build_task_agent_config(&self, agent_id: AgentId) -> Result<AgentConfig> {
