@@ -1,8 +1,7 @@
-//! Task dispatch logic: matches ready tasks to idle developers.
+//! Task dispatch logic: spawns one agent per ready task.
 //!
 //! The runtime calls into this module when task state changes.
-//! It finds ready (unassigned) tasks, claims them, and sends
-//! task_assignment messages to idle developers via the bus.
+//! It finds ready (unassigned) tasks and returns task IDs to spawn agents for.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,92 +10,91 @@ use std::time::{Duration, Instant};
 use agent_bus::Mailbox;
 use llm_tasks::db::{Database, TaskUpdates};
 
-/// How long a developer can be idle before its task is reclaimed.
-/// Long timeout because Claude API turns can take 10+ minutes for complex code generation.
-pub const DEV_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a task agent can be idle before its task is reclaimed.
+pub const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-struct DevAssignment {
-    task_id: String,
+struct TaskAssignment {
+    agent_name: String,
     last_activity: Instant,
 }
 
-/// Tracks task assignments and handles dispatch + state transitions.
+/// Tracks active task agents and handles dispatch + state transitions.
 pub struct Dispatcher {
     db: Arc<Database>,
     mailbox: Mailbox,
-    /// developer bus_name → assignment (task_id + last activity)
-    dev_tasks: HashMap<String, DevAssignment>,
+    /// task_id → assignment (agent_name + last activity)
+    active_tasks: HashMap<String, TaskAssignment>,
 }
 
 impl Dispatcher {
     pub fn new(db: Arc<Database>, mailbox: Mailbox) -> Self {
-        Self { db, mailbox, dev_tasks: HashMap::new() }
+        Self { db, mailbox, active_tasks: HashMap::new() }
     }
 
-    /// Developer signals task complete → set in_review. Returns task_id for review.
+    /// Agent signals task complete → set in_review. Returns task_id for review.
     /// If the task is `pending_delete`, skips the review and closes it immediately.
-    pub async fn handle_dev_complete(&mut self, from: &str, content: &str) -> Option<String> {
-        if let Some(assignment) = self.dev_tasks.remove(from) {
-            if self.is_pending_delete(&assignment.task_id).await {
-                tracing::info!("Task {} is pending_delete, skipping review", assignment.task_id);
-                let _ = self.db.close_task(&assignment.task_id, "runtime").await;
-                return None;
+    pub async fn handle_agent_complete(&mut self, task_id: &str, content: &str) -> bool {
+        if self.active_tasks.remove(task_id).is_none() {
+            return false;
+        }
+        if self.is_pending_delete(task_id).await {
+            tracing::info!("Task {} is pending_delete, skipping review", task_id);
+            let _ = self.db.close_task(task_id, "runtime").await;
+            return false;
+        }
+        // Add agent output as comment
+        let short = if content.len() > 2000 { &content[..2000] } else { content };
+        let _ = self.db.add_comment(task_id, "agent", short).await;
+        self.transition_to_review(task_id).await;
+        true
+    }
+
+    /// Agent signals blocked/needs_info.
+    pub async fn handle_agent_blocked(&mut self, task_id: &str, content: &str) {
+        if self.active_tasks.remove(task_id).is_none() {
+            return;
+        }
+        self.transition_to_needs_info(task_id, content).await;
+    }
+
+    /// Record activity from a task agent (called on every relay tool call).
+    pub fn record_activity(&mut self, agent_name: &str) {
+        if let Some(task_id) = self.task_id_for_agent(agent_name) {
+            if let Some(assignment) = self.active_tasks.get_mut(&task_id) {
+                assignment.last_activity = Instant::now();
             }
-            self.transition_to_review(&assignment.task_id, from, content).await;
-            Some(assignment.task_id)
-        } else {
-            None
         }
     }
 
-    /// Developer signals needs_info → set needs_info, notify manager.
-    pub async fn handle_dev_needs_info(&mut self, from: &str, content: &str) {
-        if let Some(assignment) = self.dev_tasks.remove(from) {
-            self.transition_to_needs_info(&assignment.task_id, from, content).await;
-        }
-    }
-
-    /// Record activity from a developer (called on every relay tool call).
-    pub fn record_activity(&mut self, dev_name: &str) {
-        if let Some(assignment) = self.dev_tasks.get_mut(dev_name) {
-            assignment.last_activity = Instant::now();
-        }
-    }
-
-    /// Check for timed-out developers. Returns names of developers that timed out
-    /// so the runtime can abort their agents.
+    /// Check for timed-out agents. Returns agent names that timed out.
     pub async fn check_timeouts(&mut self) -> Vec<String> {
         let timed_out: Vec<(String, String)> = self
-            .dev_tasks
+            .active_tasks
             .iter()
-            .filter(|(_, a)| a.last_activity.elapsed() > DEV_IDLE_TIMEOUT)
-            .map(|(name, a)| (name.clone(), a.task_id.clone()))
+            .filter(|(_, a)| a.last_activity.elapsed() > AGENT_IDLE_TIMEOUT)
+            .map(|(tid, a)| (tid.clone(), a.agent_name.clone()))
             .collect();
 
         let mut aborted = Vec::new();
-        for (dev_name, task_id) in timed_out {
+        for (task_id, agent_name) in timed_out {
             tracing::warn!(
-                "Developer {} timed out on task {} (idle {:?})",
-                dev_name,
+                "Agent {} timed out on task {} (idle {:?})",
+                agent_name,
                 task_id,
-                self.dev_tasks[&dev_name].last_activity.elapsed(),
+                self.active_tasks[&task_id].last_activity.elapsed(),
             );
             let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
             if let Err(e) = self.db.update_task(&task_id, updates, "runtime").await {
-                tracing::error!("Failed to reclaim task {} from {}: {}", task_id, dev_name, e);
+                tracing::error!("Failed to reclaim task {} from {}: {}", task_id, agent_name, e);
             }
             let _ = self.db.clear_assignee(&task_id, "runtime").await;
-            self.dev_tasks.remove(&dev_name);
-            aborted.push(dev_name);
+            self.active_tasks.remove(&task_id);
+            aborted.push(agent_name);
         }
         aborted
     }
 
     /// Watchdog: fix stuck tasks. Returns number of tasks fixed.
-    ///
-    /// - `in_progress` with no tracked developer → reset to `ready`
-    /// - `ready` with non-empty assignee → clear assignee so dispatch finds them
-    /// - `pending_delete` with no active developer → close immediately
     pub async fn watchdog(&mut self) -> usize {
         let mut fixed = 0;
         fixed += self.reclaim_orphaned_in_progress().await;
@@ -108,6 +106,68 @@ impl Dispatcher {
         fixed
     }
 
+    /// Find ready tasks that can be dispatched. Returns task IDs.
+    pub async fn tasks_to_dispatch(&self, max_concurrent: usize) -> Vec<String> {
+        let available = max_concurrent.saturating_sub(self.active_tasks.len());
+        if available == 0 {
+            return Vec::new();
+        }
+        let tasks = match self.db.ready_tasks().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to query ready tasks: {}", e);
+                return Vec::new();
+            }
+        };
+        tasks.iter().take(available).map(|t| t.id.clone()).collect()
+    }
+
+    /// Claim a task in the DB and register it as active.
+    pub async fn claim_and_register(&mut self, task_id: &str, agent_name: &str) -> bool {
+        if let Err(e) = self.db.claim_task(task_id, agent_name).await {
+            tracing::warn!("Failed to claim task {} for {}: {}", task_id, agent_name, e);
+            return false;
+        }
+        self.active_tasks.insert(task_id.to_string(), TaskAssignment {
+            agent_name: agent_name.to_string(),
+            last_activity: Instant::now(),
+        });
+        true
+    }
+
+    /// Register a resumed task agent (from a previous session).
+    pub fn register_active(&mut self, task_id: String, agent_name: String) {
+        self.active_tasks.insert(task_id, TaskAssignment {
+            agent_name,
+            last_activity: Instant::now(),
+        });
+    }
+
+    /// Remove a task from tracking (e.g. when agent is aborted).
+    pub fn remove_task_by_agent(&mut self, agent_name: &str) {
+        if let Some(task_id) = self.task_id_for_agent(agent_name) {
+            self.active_tasks.remove(&task_id);
+        }
+    }
+
+    /// Send a message via the dispatcher's mailbox.
+    pub fn notify(&self, to: &str, kind: &str, payload: serde_json::Value) -> Result<(), String> {
+        self.mailbox.send(to, kind, payload).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Look up task_id from agent bus name.
+    fn task_id_for_agent(&self, agent_name: &str) -> Option<String> {
+        self.active_tasks
+            .iter()
+            .find(|(_, a)| a.agent_name == agent_name)
+            .map(|(tid, _)| tid.clone())
+    }
+
+    /// Look up task_id from agent bus name (public for runtime).
+    pub fn task_id_for_agent_name(&self, agent_name: &str) -> Option<String> {
+        self.task_id_for_agent(agent_name)
+    }
+
     async fn reclaim_orphaned_in_progress(&mut self) -> usize {
         let tasks = match self.db.list_tasks(Some("in_progress"), None).await {
             Ok(t) => t,
@@ -116,11 +176,9 @@ impl Dispatcher {
                 return 0;
             }
         };
-        let tracked: Vec<&str> =
-            self.dev_tasks.values().map(|a| a.task_id.as_str()).collect();
         let mut count = 0;
         for task in &tasks {
-            if tracked.contains(&task.id.as_str()) {
+            if self.active_tasks.contains_key(&task.id) {
                 continue;
             }
             tracing::warn!("Reclaiming orphaned task {} (assignee: {:?})", task.id, task.assignee);
@@ -170,7 +228,6 @@ impl Dispatcher {
         matches!(self.db.get_task(task_id).await, Ok(t) if t.status == "pending_delete")
     }
 
-    /// Close any `pending_delete` tasks that have no active developer working on them.
     async fn close_pending_deletes(&mut self) -> usize {
         let tasks = match self.db.list_tasks(Some("pending_delete"), None).await {
             Ok(t) => t,
@@ -179,15 +236,12 @@ impl Dispatcher {
                 return 0;
             }
         };
-        let tracked: Vec<&str> =
-            self.dev_tasks.values().map(|a| a.task_id.as_str()).collect();
         let mut count = 0;
         for task in &tasks {
-            if tracked.contains(&task.id.as_str()) {
-                // Developer is still working — abort will happen via handle_dev_complete
+            if self.active_tasks.contains_key(&task.id) {
                 continue;
             }
-            tracing::info!("Closing pending_delete task {} (no active developer)", task.id);
+            tracing::info!("Closing pending_delete task {} (no active agent)", task.id);
             if let Err(e) = self.db.close_task(&task.id, "runtime").await {
                 tracing::error!("Failed to close pending_delete task {}: {}", task.id, e);
                 continue;
@@ -197,104 +251,20 @@ impl Dispatcher {
         count
     }
 
-    async fn transition_to_review(&self, task_id: &str, _dev: &str, _summary: &str) {
+    async fn transition_to_review(&self, task_id: &str) {
         let updates = TaskUpdates { status: Some("in_review"), ..Default::default() };
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {
             tracing::error!("Failed to set task {} in_review: {}", task_id, e);
         }
     }
 
-    async fn transition_to_needs_info(&self, task_id: &str, dev: &str, question: &str) {
+    async fn transition_to_needs_info(&self, task_id: &str, question: &str) {
         let updates = TaskUpdates { status: Some("needs_info"), ..Default::default() };
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {
             tracing::error!("Failed to set task {} needs_info: {}", task_id, e);
         }
-        if let Err(e) = self.db.add_comment(task_id, dev, question).await {
+        if let Err(e) = self.db.add_comment(task_id, "agent", question).await {
             tracing::error!("Failed to add needs_info comment on {}: {}", task_id, e);
         }
-        let payload = serde_json::json!({
-            "content": format!("Task {task_id} from {dev} needs info: {question}"),
-            "task_id": task_id,
-        });
-        let _ = self.mailbox.send("manager", "task_needs_info", payload);
     }
-
-    /// Find ready tasks and dispatch to idle developers.
-    pub async fn try_dispatch(
-        &mut self,
-        developer_count: u8,
-        active_handles: &HashMap<String, tokio::task::JoinHandle<()>>,
-    ) {
-        let idle_devs = find_idle_developers(developer_count, &self.dev_tasks, active_handles);
-        if idle_devs.is_empty() {
-            return;
-        }
-        let tasks = match self.db.ready_tasks().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("Failed to query ready tasks: {}", e);
-                return;
-            }
-        };
-        if tasks.is_empty() {
-            return;
-        }
-        tracing::info!("Dispatching {} tasks to {} idle devs", tasks.len(), idle_devs.len());
-        for (task, dev) in tasks.iter().zip(idle_devs.iter()) {
-            self.dispatch_one(task, dev).await;
-        }
-    }
-
-    async fn dispatch_one(&mut self, task: &llm_tasks::db::Task, dev: &str) {
-        if let Err(e) = self.db.claim_task(&task.id, dev).await {
-            tracing::warn!("Failed to claim task {} for {}: {}", task.id, dev, e);
-            return;
-        }
-        self.dev_tasks.insert(dev.to_string(), DevAssignment {
-            task_id: task.id.clone(),
-            last_activity: Instant::now(),
-        });
-        let desc = task.description.as_deref().unwrap_or("");
-        let branch = format!("agent/{}", dev);
-        let content = format!(
-            "## Task {}\n\n{}\n\n{}\n\nCommit your changes on branch `{}`.",
-            task.id, task.title, desc, branch
-        );
-        let payload = serde_json::json!({"content": content, "task_id": task.id});
-        if let Err(e) = self.mailbox.send(dev, "task_assignment", payload) {
-            tracing::error!("Failed to dispatch task {} to {}: {}", task.id, dev, e);
-        } else {
-            tracing::info!("Dispatched task {} to {}", task.id, dev);
-        }
-    }
-
-    /// Send a message via the dispatcher's mailbox.
-    pub fn notify(&self, to: &str, kind: &str, payload: serde_json::Value) -> Result<(), String> {
-        self.mailbox.send(to, kind, payload).map(|_| ()).map_err(|e| e.to_string())
-    }
-
-    /// Register a resumed developer→task assignment (from a previous session).
-    pub fn register_resumed(&mut self, dev_name: String, task_id: String) {
-        self.dev_tasks.insert(dev_name, DevAssignment {
-            task_id,
-            last_activity: Instant::now(),
-        });
-    }
-
-    /// Remove a developer from tracking (e.g. when aborted).
-    pub fn remove_developer(&mut self, name: &str) {
-        self.dev_tasks.remove(name);
-    }
-}
-
-fn find_idle_developers(
-    developer_count: u8,
-    dev_tasks: &HashMap<String, DevAssignment>,
-    active_handles: &HashMap<String, tokio::task::JoinHandle<()>>,
-) -> Vec<String> {
-    (0..developer_count)
-        .map(|i| format!("developer-{}", i))
-        .filter(|name| !dev_tasks.contains_key(name))
-        .filter(|name| active_handles.contains_key(name))
-        .collect()
 }

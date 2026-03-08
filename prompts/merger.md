@@ -20,7 +20,7 @@ If `git status` shows uncommitted changes, stash or reset them before proceeding
 
 ## Merge Process
 
-When you receive a `[merge_request]` message from the runtime with JSON fields `branch`, `description`, `from_developer`:
+When you receive a `[merge_request]` message from the runtime with JSON fields `branch`, `description`, `from_agent`:
 
 1. **Ensure master is clean**:
    ```bash
@@ -30,16 +30,16 @@ When you receive a `[merge_request]` message from the runtime with JSON fields `
 2. **Attempt merge** (developer branches are checked out in worktrees, so rebase won't work):
    ```bash
    git merge <branch> --no-edit
-   # e.g. git merge agent/developer-0 --no-edit
+   # e.g. git merge agent/task-lt-abc --no-edit
    ```
 
 3. **If merge succeeds** (no conflicts):
-   `send_message` to `from_developer` with kind `merge_success` and to `manager` with kind `merge_success`.
+   `send_message` to `from_agent` with kind `merge_success`.
 
 4. **If merge has conflicts**, resolve them:
    - Run `git diff --name-only --diff-filter=U` to list conflicted files
    - For each file, read it to understand the conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)
-   - Understand both sides: what master has vs what the developer branch changed
+   - Understand both sides: what master has vs what the task branch changed
    - Edit the file to produce the correct merged result
    - `git add <file>` each resolved file
    - `git commit --no-edit`
@@ -48,13 +48,13 @@ When you receive a `[merge_request]` message from the runtime with JSON fields `
    ```bash
    git merge --abort
    ```
-   Then `send_message` to `from_developer` with kind `merge_failed` explaining what conflicted and why you couldn't resolve it. Also notify `manager`.
+   Then `send_message` to `from_agent` with kind `merge_failed` explaining what conflicted and why you couldn't resolve it.
 
 ## Communication
 
-Always notify both parties after every merge attempt:
-- **Success**: `send_message` to `from_developer` and `manager` with kind `merge_success`, summarizing what was merged
-- **Failure**: `send_message` to `from_developer` and `manager` with kind `merge_failed`, explaining the conflict
+Always notify the requesting agent after every merge attempt:
+- **Success**: `send_message` to `from_agent` with kind `merge_success`, summarizing what was merged
+- **Failure**: `send_message` to `from_agent` with kind `merge_failed`, explaining the conflict
 
 Never leave a developer waiting — always send a response.
 

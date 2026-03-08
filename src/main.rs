@@ -136,7 +136,7 @@ COMMANDS:
 
 EXAMPLES:
     agent-orchestrator daemon
-    agent-orchestrator send --project my-project manager "Add a login button"
+    agent-orchestrator send --project my-project runtime "check status"
 "#
     );
 }

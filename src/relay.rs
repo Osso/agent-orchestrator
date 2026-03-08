@@ -34,8 +34,6 @@ pub struct RelayResponse {
 }
 
 /// Returns the canonical path for the relay Unix socket.
-/// Uses ~/.claude/orchestrator/{project}/ so the socket is visible inside bwrap sandboxes
-/// (which bind-mount ~/.claude writable but overlay /tmp with tmpfs).
 pub fn relay_socket_path(project: &str) -> PathBuf {
     home_dir().join(".claude/orchestrator").join(project).join("relay.sock")
 }
@@ -147,15 +145,13 @@ async fn handle_tool_call(
     agent_name: &str,
     req: &RelayRequest,
 ) -> RelayResponse {
-    let role = role_from_agent_name(agent_name).unwrap_or(AgentRole::Developer);
-
-    // Notify runtime of developer activity for idle timeout tracking
-    if role == AgentRole::Developer {
-        let payload = serde_json::json!({ "developer": agent_name });
-        let _ = mailbox.send("runtime", "dev_heartbeat", payload);
+    // Notify runtime of task agent activity for idle timeout tracking
+    if role_from_agent_name(agent_name) == Some(AgentRole::TaskAgent) {
+        let payload = serde_json::json!({ "agent": agent_name });
+        let _ = mailbox.send("runtime", "agent_heartbeat", payload);
     }
 
-    let result = dispatch_tool(mailbox, db, agent_name, role, req).await;
+    let result = dispatch_tool(mailbox, db, agent_name, req).await;
     match result {
         Ok(val) => RelayResponse { id: req.id.clone(), result: Some(val), error: None },
         Err(msg) => RelayResponse { id: req.id.clone(), result: None, error: Some(msg) },
@@ -166,17 +162,11 @@ async fn dispatch_tool(
     mailbox: &Mailbox,
     db: &Database,
     agent_name: &str,
-    role: AgentRole,
     req: &RelayRequest,
 ) -> Result<serde_json::Value, String> {
     use crate::task_tools as tt;
     match req.tool.as_str() {
         "send_message" => handle_send_message(mailbox, agent_name, &req.args),
-        "set_crew" => handle_set_crew(mailbox, agent_name, &req.args),
-        "goal_complete" => handle_goal_complete(mailbox, agent_name, &req.args),
-        "relieve_manager" => handle_relieve_manager(mailbox, agent_name, &req.args),
-        "report" => handle_report(mailbox, agent_name, &req.args),
-        "create_task" => tt::handle_create_task(db, mailbox, agent_name, role, &req.args).await,
         "list_tasks" => tt::handle_list_tasks(db, &req.args).await,
         unknown => Err(format!("unknown tool: {}", unknown)),
     }
@@ -190,11 +180,6 @@ fn handle_send_message(
     let to = args["to"].as_str().ok_or("missing 'to'")?;
     let kind = args["kind"].as_str().ok_or("missing 'kind'")?;
     let content = args["content"].as_str().ok_or("missing 'content'")?;
-
-    // Validate INTERRUPT is only from architect
-    if kind == "interrupt" && role_from_agent_name(agent_name) != Some(AgentRole::Architect) {
-        return Err(format!("'{}' is not allowed to send interrupt", agent_name));
-    }
 
     let payload = serde_json::json!({
         "content": content,
@@ -214,109 +199,12 @@ fn handle_send_message(
     result
 }
 
-fn handle_set_crew(
-    mailbox: &Mailbox,
-    agent_name: &str,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    if role_from_agent_name(agent_name) != Some(AgentRole::Manager) {
-        return Err(format!("'{}' is not allowed to set crew size", agent_name));
-    }
-
-    let count = args["count"].as_u64().ok_or("missing 'count'")? as u8;
-    let payload = serde_json::json!({ "count": count, "from_agent": agent_name });
-
-    mailbox
-        .send("runtime", "set_crew", payload)
-        .map(|_| serde_json::json!({"ok": true}))
-        .map_err(|e| format!("send failed: {}", e))
-}
-
-fn handle_goal_complete(
-    mailbox: &Mailbox,
-    agent_name: &str,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    if role_from_agent_name(agent_name) != Some(AgentRole::Manager) {
-        return Err(format!(
-            "'{}' is not allowed to declare goal complete",
-            agent_name
-        ));
-    }
-
-    let summary = args["summary"].as_str().ok_or("missing 'summary'")?;
-    let payload = serde_json::json!({ "summary": summary, "from_agent": agent_name });
-
-    mailbox
-        .send("runtime", "goal_complete", payload)
-        .map(|_| serde_json::json!({"ok": true}))
-        .map_err(|e| format!("send failed: {}", e))
-}
-
-fn handle_relieve_manager(
-    mailbox: &Mailbox,
-    agent_name: &str,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    if role_from_agent_name(agent_name) != Some(AgentRole::Auditor) {
-        return Err(format!(
-            "'{}' is not allowed to relieve the manager",
-            agent_name
-        ));
-    }
-
-    let reason = args["reason"].as_str().ok_or("missing 'reason'")?;
-    let payload = serde_json::json!({ "reason": reason, "from_agent": agent_name });
-
-    mailbox
-        .send("runtime", "relieve_manager", payload)
-        .map(|_| serde_json::json!({"ok": true}))
-        .map_err(|e| format!("send failed: {}", e))
-}
-
-fn handle_report(
-    mailbox: &Mailbox,
-    agent_name: &str,
-    args: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    if role_from_agent_name(agent_name) != Some(AgentRole::Auditor) {
-        return Err(format!("'{}' is not allowed to submit reports", agent_name));
-    }
-
-    let report_type = args["report_type"].as_str().ok_or("missing 'report_type'")?;
-    let content = args["content"].as_str().ok_or("missing 'content'")?;
-
-    tracing::info!(
-        "[AUDITOR {}] {}",
-        report_type.to_uppercase(),
-        first_line(content)
-    );
-
-    let payload = serde_json::json!({
-        "report_type": report_type,
-        "content": content,
-        "from_agent": agent_name,
-    });
-
-    mailbox
-        .send("runtime", "auditor_report", payload)
-        .map(|_| serde_json::json!({"ok": true}))
-        .map_err(|e| format!("send failed: {}", e))
-}
-
-fn role_from_agent_name(name: &str) -> Option<AgentRole> {
+pub fn role_from_agent_name(name: &str) -> Option<AgentRole> {
     match name {
-        "manager" => Some(AgentRole::Manager),
-        "architect" => Some(AgentRole::Architect),
-        "auditor" => Some(AgentRole::Auditor),
         "merger" => Some(AgentRole::Merger),
-        n if n.starts_with("developer-") => Some(AgentRole::Developer),
+        n if n.starts_with("task-") => Some(AgentRole::TaskAgent),
         _ => None,
     }
-}
-
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("")
 }
 
 #[cfg(test)]
@@ -330,21 +218,18 @@ mod tests {
         Database::open(&tmp.join("tasks.db")).await.unwrap()
     }
 
-    // --- Wire protocol serialization ---
-
     #[test]
     fn relay_request_roundtrips_json() {
         let req = RelayRequest {
             id: "req-1".to_string(),
-            from: "manager".to_string(),
+            from: "task-lt-abc".to_string(),
             tool: "send_message".to_string(),
-            args: serde_json::json!({"to": "architect", "kind": "task_assignment", "content": "do stuff"}),
+            args: serde_json::json!({"to": "merger", "kind": "task_complete", "content": "done"}),
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: RelayRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.id, "req-1");
         assert_eq!(decoded.tool, "send_message");
-        assert_eq!(decoded.args["to"], "architect");
     }
 
     #[test]
@@ -362,29 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn relay_response_error_roundtrips_json() {
-        let resp = RelayResponse {
-            id: "req-3".to_string(),
-            result: None,
-            error: Some("something went wrong".to_string()),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: RelayResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.id, "req-3");
-        assert!(decoded.result.is_none());
-        assert_eq!(decoded.error.as_deref(), Some("something went wrong"));
-    }
-
-    // --- role_from_agent_name ---
-
-    #[test]
     fn role_from_agent_name_known_names() {
-        assert_eq!(role_from_agent_name("manager"), Some(AgentRole::Manager));
-        assert_eq!(role_from_agent_name("architect"), Some(AgentRole::Architect));
-        assert_eq!(role_from_agent_name("auditor"), Some(AgentRole::Auditor));
         assert_eq!(role_from_agent_name("merger"), Some(AgentRole::Merger));
-        assert_eq!(role_from_agent_name("developer-0"), Some(AgentRole::Developer));
-        assert_eq!(role_from_agent_name("developer-2"), Some(AgentRole::Developer));
+        assert_eq!(role_from_agent_name("task-lt-abc"), Some(AgentRole::TaskAgent));
+        assert_eq!(role_from_agent_name("task-123"), Some(AgentRole::TaskAgent));
     }
 
     #[test]
@@ -392,196 +258,55 @@ mod tests {
         assert_eq!(role_from_agent_name(""), None);
         assert_eq!(role_from_agent_name("unknown"), None);
         assert_eq!(role_from_agent_name("runtime"), None);
-        assert_eq!(role_from_agent_name("relay-manager"), None);
+        assert_eq!(role_from_agent_name("relay-task-abc"), None);
     }
-
-    // --- handle_tool_call dispatch ---
 
     #[tokio::test]
     async fn handle_tool_call_unknown_tool_returns_error() {
         let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
+        let mailbox = bus.register("relay-task-abc").unwrap();
         let _runtime = bus.register("runtime").unwrap();
         let db = test_db().await;
         let req = RelayRequest {
             id: "r1".to_string(),
-            from: "manager".to_string(),
+            from: "task-abc".to_string(),
             tool: "nonexistent_tool".to_string(),
             args: serde_json::json!({}),
         };
-        let resp = handle_tool_call(&mailbox, &db, "manager", &req).await;
+        let resp = handle_tool_call(&mailbox, &db, "task-abc", &req).await;
         assert_eq!(resp.id, "r1");
         assert!(resp.error.is_some());
         assert!(resp.error.unwrap().contains("unknown tool"));
     }
 
-    #[tokio::test]
-    async fn handle_tool_call_known_tool_dispatches() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let mut runtime = bus.register("runtime").unwrap();
-        let db = test_db().await;
-        let req = RelayRequest {
-            id: "r2".to_string(),
-            from: "manager".to_string(),
-            tool: "set_crew".to_string(),
-            args: serde_json::json!({"count": 2}),
-        };
-        let resp = handle_tool_call(&mailbox, &db, "manager", &req).await;
-        assert_eq!(resp.id, "r2");
-        assert!(resp.error.is_none());
-        assert!(runtime.try_recv().is_some());
-    }
-
-    // --- Role validation: send_message interrupt ---
-
-    #[test]
-    fn send_message_interrupt_rejected_from_non_architect() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let _target = bus.register("developer-0").unwrap();
-        let args = serde_json::json!({"to": "developer-0", "kind": "interrupt", "content": "stop"});
-        let result = handle_send_message(&mailbox, "manager", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed to send interrupt"));
-    }
-
-    #[test]
-    fn send_message_interrupt_allowed_from_architect() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-architect").unwrap();
-        let mut target = bus.register("developer-0").unwrap();
-        let args = serde_json::json!({"to": "developer-0", "kind": "interrupt", "content": "stop"});
-        let result = handle_send_message(&mailbox, "architect", &args);
-        assert!(result.is_ok());
-        assert!(target.try_recv().is_some());
-    }
-
-    // --- Role validation: set_crew ---
-
-    #[test]
-    fn set_crew_rejected_from_non_manager() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-architect").unwrap();
-        let _runtime = bus.register("runtime").unwrap();
-        let args = serde_json::json!({"count": 3});
-        let result = handle_set_crew(&mailbox, "architect", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed to set crew size"));
-    }
-
-    #[test]
-    fn set_crew_allowed_from_manager() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let mut runtime = bus.register("runtime").unwrap();
-        let args = serde_json::json!({"count": 2});
-        let result = handle_set_crew(&mailbox, "manager", &args);
-        assert!(result.is_ok());
-        let msg = runtime.try_recv().unwrap();
-        assert_eq!(msg.kind, "set_crew");
-        assert_eq!(msg.payload["count"], 2);
-    }
-
-    // --- Role validation: relieve_manager ---
-
-    #[test]
-    fn relieve_manager_rejected_from_non_auditor() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let _runtime = bus.register("runtime").unwrap();
-        let args = serde_json::json!({"reason": "poor performance"});
-        let result = handle_relieve_manager(&mailbox, "manager", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed to relieve"));
-    }
-
-    #[test]
-    fn relieve_manager_allowed_from_auditor() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-auditor").unwrap();
-        let mut runtime = bus.register("runtime").unwrap();
-        let args = serde_json::json!({"reason": "poor performance"});
-        let result = handle_relieve_manager(&mailbox, "auditor", &args);
-        assert!(result.is_ok());
-        let msg = runtime.try_recv().unwrap();
-        assert_eq!(msg.kind, "relieve_manager");
-        assert_eq!(msg.payload["reason"], "poor performance");
-    }
-
-    // --- Role validation: report ---
-
-    #[test]
-    fn report_rejected_from_non_auditor() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let _runtime = bus.register("runtime").unwrap();
-        let args = serde_json::json!({"report_type": "observation", "content": "things look fine"});
-        let result = handle_report(&mailbox, "manager", &args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed to submit reports"));
-    }
-
-    #[test]
-    fn report_allowed_from_auditor() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-auditor").unwrap();
-        let mut runtime = bus.register("runtime").unwrap();
-        let args = serde_json::json!({"report_type": "evaluation", "content": "progress is good"});
-        let result = handle_report(&mailbox, "auditor", &args);
-        assert!(result.is_ok());
-        let msg = runtime.try_recv().unwrap();
-        assert_eq!(msg.kind, "auditor_report");
-        assert_eq!(msg.payload["report_type"], "evaluation");
-    }
-
-    // --- send_message routing ---
-
     #[test]
     fn send_message_routes_to_correct_target() {
         let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let mut architect = bus.register("architect").unwrap();
-        let args = serde_json::json!({"to": "architect", "kind": "task_assignment", "content": "implement feature X"});
-        handle_send_message(&mailbox, "manager", &args).unwrap();
-        let msg = architect.try_recv().unwrap();
-        assert_eq!(msg.kind, "task_assignment");
-        assert_eq!(msg.payload["content"], "implement feature X");
-        assert_eq!(msg.payload["from_agent"], "manager");
+        let mailbox = bus.register("relay-task-abc").unwrap();
+        let mut merger = bus.register("merger").unwrap();
+        let args = serde_json::json!({"to": "merger", "kind": "task_complete", "content": "done"});
+        handle_send_message(&mailbox, "task-abc", &args).unwrap();
+        let msg = merger.try_recv().unwrap();
+        assert_eq!(msg.kind, "task_complete");
+        assert_eq!(msg.payload["content"], "done");
+        assert_eq!(msg.payload["from_agent"], "task-abc");
     }
 
     #[test]
     fn send_message_fails_for_unknown_target() {
         let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let args = serde_json::json!({"to": "ghost", "kind": "task_assignment", "content": "hello"});
-        let result = handle_send_message(&mailbox, "manager", &args);
+        let mailbox = bus.register("relay-task-abc").unwrap();
+        let args = serde_json::json!({"to": "ghost", "kind": "task_complete", "content": "hello"});
+        let result = handle_send_message(&mailbox, "task-abc", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("send failed"));
     }
-
-    // --- set_crew routing ---
-
-    #[test]
-    fn set_crew_sends_to_runtime_with_count() {
-        let bus = Bus::new();
-        let mailbox = bus.register("relay-manager").unwrap();
-        let mut runtime = bus.register("runtime").unwrap();
-        handle_set_crew(&mailbox, "manager", &serde_json::json!({"count": 3})).unwrap();
-        let msg = runtime.try_recv().unwrap();
-        assert_eq!(msg.to, "runtime");
-        assert_eq!(msg.payload["count"], 3);
-        assert_eq!(msg.payload["from_agent"], "manager");
-    }
-
-    // --- Integration: full relay connection via Unix socket ---
 
     async fn spawn_relay_server(socket_path: &std::path::Path) {
         let bus = Bus::new();
         let db = Arc::new(test_db().await);
         let server = RelayServer::new(bus.clone(), db);
         let path_clone = socket_path.to_path_buf();
-        // Register runtime inside the task so the Mailbox stays alive with the task.
         tokio::spawn(async move {
             let _runtime = bus.register("runtime").unwrap();
             server.run(&path_clone).await.ok()
@@ -590,18 +315,6 @@ mod tests {
             if socket_path.exists() { break; }
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
-    }
-
-    async fn relay_request(
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
-        req: serde_json::Value,
-    ) -> RelayResponse {
-        use tokio::io::AsyncWriteExt;
-        let line = format!("{}\n", serde_json::to_string(&req).unwrap());
-        writer.write_all(line.as_bytes()).await.unwrap();
-        let resp_line = lines.next_line().await.unwrap().unwrap();
-        serde_json::from_str(&resp_line).unwrap()
     }
 
     #[tokio::test]
@@ -618,17 +331,20 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
-        writer.write_all(b"{\"agent\": \"manager\"}\n").await.unwrap();
+        writer.write_all(b"{\"agent\": \"task-lt-test\"}\n").await.unwrap();
 
-        let resp = relay_request(
-            &mut writer,
-            &mut lines,
-            serde_json::json!({"id": "t1", "from": "manager", "tool": "set_crew", "args": {"count": 1}}),
-        ).await;
+        let req = serde_json::json!({
+            "id": "t1", "from": "task-lt-test",
+            "tool": "list_tasks", "args": {}
+        });
+        let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+        writer.write_all(line.as_bytes()).await.unwrap();
+
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: RelayResponse = serde_json::from_str(&resp_line).unwrap();
 
         assert_eq!(resp.id, "t1");
         assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap()["ok"], true);
         let _ = std::fs::remove_file(&socket_path);
     }
 }

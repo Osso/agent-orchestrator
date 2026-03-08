@@ -133,7 +133,7 @@ async fn apply_validation_result(db: &Database, bus: &Bus, task_id: &str, result
         }
         Ok(ValidateResult::NeedsChanges(verdict)) => {
             reject_task(db, task_id, &verdict).await;
-            notify_bus(bus, task_id, "manager", "task_rejected");
+            notify_bus(bus, task_id, "runtime", "task_rejected");
         }
         Err(e) => {
             tracing::error!("Architect validation failed for {task_id}: {e}");
@@ -190,20 +190,18 @@ async fn reject_task(db: &Database, task_id: &str, verdict: &str) {
     tracing::warn!("Task {task_id} rejected by external architect");
 }
 
-async fn complete_task(db: &Database, bus: &Bus, task_id: &str, title: &str, assessment: &str) {
+async fn complete_task(db: &Database, bus: &Bus, task_id: &str, _title: &str, assessment: &str) {
     let _ = db.close_task(task_id, "architect").await;
     let short = truncate(assessment, 200);
     let _ = db.add_comment(task_id, "architect", &format!("Completed: {short}")).await;
     tracing::info!("Task {task_id} completed (review passed)");
     notify_bus(bus, task_id, "runtime", "task_done");
-    notify_manager_done(bus, task_id, title);
 }
 
-async fn complete_task_fallback(db: &Database, bus: &Bus, task_id: &str, title: &str) {
+async fn complete_task_fallback(db: &Database, bus: &Bus, task_id: &str, _title: &str) {
     let _ = db.close_task(task_id, "runtime").await;
     tracing::warn!("Auto-completed task {task_id} due to review error");
     notify_bus(bus, task_id, "runtime", "task_done");
-    notify_manager_done(bus, task_id, title);
 }
 
 async fn reject_completion(db: &Database, bus: &Bus, task_id: &str, assessment: &str) {
@@ -214,8 +212,6 @@ async fn reject_completion(db: &Database, bus: &Bus, task_id: &str, assessment: 
     let _ = db.add_comment(task_id, "architect", &format!("Rejected: {short}")).await;
     tracing::warn!("Task {task_id} completion rejected");
     notify_bus(bus, task_id, "runtime", "task_ready");
-    let content = format!("Task {task_id} completion rejected: {short}");
-    notify_bus_with(bus, task_id, "manager", "task_rejected", &content);
 }
 
 fn notify_bus(bus: &Bus, task_id: &str, to: &str, kind: &str) {
@@ -223,18 +219,6 @@ fn notify_bus(bus: &Bus, task_id: &str, to: &str, kind: &str) {
     if let Ok(mb) = bus.register(&format!("arch-{tag}")) {
         let _ = mb.send(to, kind, serde_json::json!({"task_id": task_id}));
     }
-}
-
-fn notify_bus_with(bus: &Bus, task_id: &str, to: &str, kind: &str, content: &str) {
-    let tag = &task_id[..8.min(task_id.len())];
-    if let Ok(mb) = bus.register(&format!("arch-n-{tag}")) {
-        let _ = mb.send(to, kind, serde_json::json!({"content": content, "task_id": task_id}));
-    }
-}
-
-fn notify_manager_done(bus: &Bus, task_id: &str, title: &str) {
-    let content = format!("Task {task_id} completed: {title}");
-    notify_bus_with(bus, task_id, "manager", "task_done", &content);
 }
 
 /// Fire-and-forget report to the daemon for context.

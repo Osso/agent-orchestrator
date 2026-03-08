@@ -26,9 +26,8 @@ pub fn new_registry() -> ProjectRegistry {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ControlRequest {
     SendMessage { project: String, to: String, content: String },
-    StartTask { project: String, task: String },
-    SetDevelopers { project: String, count: u8 },
     NotifyTaskCreated { project: String, task_id: String },
+    SetConcurrency { project: String, max: u8 },
     Abort { project: String },
     Status { project: String },
 }
@@ -110,12 +109,9 @@ fn handle_request(
         ControlRequest::SendMessage { project, to, content } => {
             with_bus(registry, &project, |bus| send_to_agent(bus, &to, &content))
         }
-        ControlRequest::StartTask { project, task } => {
-            with_bus(registry, &project, |bus| send_to_agent(bus, "manager", &task))
-        }
-        ControlRequest::SetDevelopers { project, count } => {
+        ControlRequest::SetConcurrency { project, max } => {
             with_bus(registry, &project, |bus| {
-                send_bus_message(bus, "runtime", "set_crew", serde_json::json!({ "count": count }))
+                send_bus_message(bus, "runtime", "set_concurrency", serde_json::json!({ "max": max }))
             })
         }
         ControlRequest::NotifyTaskCreated { project, task_id } => {
@@ -184,14 +180,10 @@ fn send_bus_message(bus: &Bus, to: &str, kind: &str, payload: serde_json::Value)
 }
 
 fn role_from_name(name: &str) -> &str {
-    if name.starts_with("developer") {
-        "developer"
-    } else if name == "manager" {
-        "manager"
-    } else if name == "architect" {
-        "architect"
-    } else if name == "auditor" {
-        "auditor"
+    if name.starts_with("task-") {
+        "task_agent"
+    } else if name == "merger" {
+        "merger"
     } else {
         "unknown"
     }

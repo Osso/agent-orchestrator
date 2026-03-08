@@ -3,30 +3,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentRole {
-    Manager,
-    Architect,
-    Developer,
-    Auditor,
+    TaskAgent,
     Merger,
 }
 
 impl AgentRole {
     pub fn as_str(&self) -> &'static str {
         match self {
-            AgentRole::Manager => "manager",
-            AgentRole::Architect => "architect",
-            AgentRole::Developer => "developer",
-            AgentRole::Auditor => "auditor",
+            AgentRole::TaskAgent => "task_agent",
             AgentRole::Merger => "merger",
         }
     }
 
     pub fn system_prompt(&self) -> &'static str {
         match self {
-            AgentRole::Manager => include_str!("../../prompts/manager.md"),
-            AgentRole::Architect => unreachable!("architect is handled by external daemon"),
-            AgentRole::Developer => include_str!("../../prompts/developer.md"),
-            AgentRole::Auditor => include_str!("../../prompts/auditor.md"),
+            AgentRole::TaskAgent => include_str!("../../prompts/developer.md"),
             AgentRole::Merger => include_str!("../../prompts/merger.md"),
         }
     }
@@ -39,31 +30,33 @@ impl std::fmt::Display for AgentRole {
 }
 
 /// Unique identifier for an agent instance.
-/// Singletons (manager, architect, auditor) use index 0.
-/// Developers use index 0-2 for multi-developer support.
+/// TaskAgents use a task-id-based name. Merger is a singleton.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId {
     pub role: AgentRole,
-    pub index: u8,
+    pub name: String,
 }
 
 impl AgentId {
-    pub fn new_singleton(role: AgentRole) -> Self {
-        Self { role, index: 0 }
+    pub fn for_task(task_id: &str) -> Self {
+        Self {
+            role: AgentRole::TaskAgent,
+            name: task_id.to_string(),
+        }
     }
 
-    pub fn new_developer(index: u8) -> Self {
+    pub fn merger() -> Self {
         Self {
-            role: AgentRole::Developer,
-            index,
+            role: AgentRole::Merger,
+            name: "merger".to_string(),
         }
     }
 
     pub fn bus_name(&self) -> String {
-        if self.role == AgentRole::Developer {
-            format!("developer-{}", self.index)
+        if self.role == AgentRole::TaskAgent {
+            format!("task-{}", self.name)
         } else {
-            self.role.as_str().to_string()
+            self.name.clone()
         }
     }
 }

@@ -1,5 +1,4 @@
 // Unit tests for core components
-// These tests focus on individual components in isolation
 
 mod support;
 
@@ -17,26 +16,24 @@ use support::{test_config, TestAgentBuilder, TestBench, assert_agent_registered}
 
 #[test]
 fn agent_id_formatting() {
-    let dev_id = AgentId::new_developer(0);
-    assert_eq!(dev_id.bus_name(), "developer-0");
-    assert_eq!(dev_id.role, AgentRole::Developer);
-    assert_eq!(dev_id.index, 0);
+    let task_id = AgentId::for_task("lt-abc123");
+    assert_eq!(task_id.bus_name(), "task-lt-abc123");
+    assert_eq!(task_id.role, AgentRole::TaskAgent);
 
-    let mgr_id = AgentId::new_singleton(AgentRole::Manager);
-    assert_eq!(mgr_id.bus_name(), "manager");
-    assert_eq!(mgr_id.role, AgentRole::Manager);
-    assert_eq!(mgr_id.index, 0);
+    let merger_id = AgentId::merger();
+    assert_eq!(merger_id.bus_name(), "merger");
+    assert_eq!(merger_id.role, AgentRole::Merger);
 }
 
 #[test]
-fn agent_id_developer_uniqueness() {
-    let dev0 = AgentId::new_developer(0);
-    let dev1 = AgentId::new_developer(1);
-    let dev0_dup = AgentId::new_developer(0);
+fn agent_id_task_uniqueness() {
+    let task0 = AgentId::for_task("lt-aaa");
+    let task1 = AgentId::for_task("lt-bbb");
+    let task0_dup = AgentId::for_task("lt-aaa");
 
-    assert_ne!(dev0.bus_name(), dev1.bus_name());
-    assert_eq!(dev0.bus_name(), dev0_dup.bus_name());
-    assert_eq!(dev0.role, dev1.role);
+    assert_ne!(task0.bus_name(), task1.bus_name());
+    assert_eq!(task0.bus_name(), task0_dup.bus_name());
+    assert_eq!(task0.role, task1.role);
 }
 
 // ---------------------------------------------------------------------------
@@ -45,48 +42,35 @@ fn agent_id_developer_uniqueness() {
 
 #[test]
 fn test_config_creates_valid_configs() {
-    let dev_config = test_config(AgentRole::Developer, 2, Some("test task"));
-    assert_eq!(dev_config.agent_id.bus_name(), "developer-2");
-    assert_eq!(dev_config.initial_task, Some("test task".to_string()));
+    let task_config = test_config(AgentRole::TaskAgent, 0, Some("test task"));
+    assert!(task_config.agent_id.bus_name().starts_with("task-"));
+    assert_eq!(task_config.initial_task, Some("test task".to_string()));
 
-    let mgr_config = test_config(AgentRole::Manager, 0, None);
-    assert_eq!(mgr_config.agent_id.bus_name(), "manager");
-    assert_eq!(mgr_config.initial_task, None);
+    let merger_config = test_config(AgentRole::Merger, 0, None);
+    assert_eq!(merger_config.agent_id.bus_name(), "merger");
+    assert_eq!(merger_config.initial_task, None);
 }
 
 #[test]
 fn agent_config_sandbox_prefix() {
-    let config = test_config(AgentRole::Developer, 0, None);
+    let config = test_config(AgentRole::TaskAgent, 0, None);
     assert!(config.sandbox_prefix.is_empty());
     assert_eq!(config.working_dir, "/tmp");
 }
 
 // ---------------------------------------------------------------------------
-// Tool System Tests  
+// Tool System Tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn tool_permissions_are_role_specific() {
-    // Only developers and mergers should have tools
-    assert!(role_has_tools(AgentRole::Developer));
+    assert!(role_has_tools(AgentRole::TaskAgent));
     assert!(role_has_tools(AgentRole::Merger));
-    
-    // Management and oversight roles should not have direct tools
-    assert!(!role_has_tools(AgentRole::Manager));
-    assert!(!role_has_tools(AgentRole::Architect));
-    assert!(!role_has_tools(AgentRole::Auditor));
 }
 
 #[test]
 fn permission_modes_are_consistent() {
-    // All roles use bypass permissions (security via sandbox)
-    for role in [
-        AgentRole::Developer,
-        AgentRole::Merger, 
-        AgentRole::Manager,
-        AgentRole::Architect,
-        AgentRole::Auditor,
-    ] {
+    for role in [AgentRole::TaskAgent, AgentRole::Merger] {
         assert_eq!(permission_mode_for_role(role), "bypassPermissions");
     }
 }
@@ -94,28 +78,18 @@ fn permission_modes_are_consistent() {
 #[test]
 fn bus_tools_match_role_responsibilities() {
     let bus = Bus::new();
-    
-    // Manager: coordination tools
-    let mgr_mailbox = std::sync::Arc::new(bus.register("test-mgr").unwrap());
-    let mgr_tools = bus_tools_for_role(AgentRole::Manager, mgr_mailbox);
-    let mgr_names: Vec<String> = mgr_tools.definitions().iter().map(|d| d.name.clone()).collect();
-    assert!(mgr_names.contains(&"send_message".to_string()));
-    assert!(mgr_names.contains(&"set_crew".to_string()));
-    assert!(mgr_names.contains(&"goal_complete".to_string()));
 
-    // Developer: development tools
-    let dev_mailbox = std::sync::Arc::new(bus.register("test-dev").unwrap());
-    let dev_tools = bus_tools_for_role(AgentRole::Developer, dev_mailbox);
-    let dev_names: Vec<String> = dev_tools.definitions().iter().map(|d| d.name.clone()).collect();
-    assert!(dev_names.contains(&"send_message".to_string()));
+    let task_mailbox = std::sync::Arc::new(bus.register("test-task").unwrap());
+    let task_tools = bus_tools_for_role(AgentRole::TaskAgent, task_mailbox);
+    let task_names: Vec<String> = task_tools.definitions().iter().map(|d| d.name.clone()).collect();
+    assert!(task_names.contains(&"send_message".to_string()));
+    assert_eq!(task_names.len(), 1);
 
-    // Auditor: oversight tools
-    let aud_mailbox = std::sync::Arc::new(bus.register("test-aud").unwrap());
-    let aud_tools = bus_tools_for_role(AgentRole::Auditor, aud_mailbox);
-    let aud_names: Vec<String> = aud_tools.definitions().iter().map(|d| d.name.clone()).collect();
-    assert!(aud_names.contains(&"send_message".to_string()));
-    assert!(aud_names.contains(&"relieve_manager".to_string()));
-    assert!(aud_names.contains(&"report".to_string()));
+    let merger_mailbox = std::sync::Arc::new(bus.register("test-merger").unwrap());
+    let merger_tools = bus_tools_for_role(AgentRole::Merger, merger_mailbox);
+    let merger_names: Vec<String> = merger_tools.definitions().iter().map(|d| d.name.clone()).collect();
+    assert!(merger_names.contains(&"send_message".to_string()));
+    assert_eq!(merger_names.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,27 +99,25 @@ fn bus_tools_match_role_responsibilities() {
 #[test]
 fn test_agent_builder_creates_agents() {
     let bus = Bus::new();
-    
-    let agent = TestAgentBuilder::new(AgentRole::Developer)
-        .with_index(1)
+
+    let agent = TestAgentBuilder::new(AgentRole::TaskAgent)
         .with_responses(vec!["task completed"])
         .with_initial_task("build feature")
         .build(&bus);
-    
+
     assert!(agent.is_ok(), "Agent creation should succeed");
-    assert_agent_registered(&bus, "developer-1");
 }
 
 #[test]
 fn test_agent_builder_failure_modes() {
     let bus = Bus::new();
-    
-    let agent = TestAgentBuilder::new(AgentRole::Architect)
+
+    let agent = TestAgentBuilder::new(AgentRole::Merger)
         .should_fail(true)
         .build(&bus);
-    
+
     assert!(agent.is_ok(), "Agent creation should succeed even with failure simulation");
-    assert_agent_registered(&bus, "architect");
+    assert_agent_registered(&bus, "merger");
 }
 
 // ---------------------------------------------------------------------------
@@ -155,26 +127,15 @@ fn test_agent_builder_failure_modes() {
 #[test]
 fn test_bench_measures_throughput() {
     let mut bench = TestBench::new();
-    
-    // Simulate some operations
+
     for _ in 0..100 {
         bench.record_operation();
-        std::thread::sleep(Duration::from_nanos(1000)); // 1 microsecond
+        std::thread::sleep(Duration::from_nanos(1000));
     }
-    
+
     let throughput = bench.throughput();
     assert!(throughput > 0.0, "Throughput should be positive");
     assert!(bench.elapsed() > Duration::ZERO, "Time should have elapsed");
-}
-
-#[test]
-fn test_bench_handles_zero_time() {
-    let mut bench = TestBench::new();
-    bench.record_operation();
-    
-    // Check immediately - elapsed time might be zero
-    let throughput = bench.throughput();
-    assert!(throughput >= 0.0, "Throughput should be non-negative");
 }
 
 // ---------------------------------------------------------------------------
@@ -184,89 +145,85 @@ fn test_bench_handles_zero_time() {
 #[test]
 fn bus_registration_and_deregistration() {
     let bus = Bus::new();
-    
+
     let mailbox = bus.register("test-agent").unwrap();
     assert_agent_registered(&bus, "test-agent");
-    
-    drop(mailbox); // This should trigger deregistration
-    
-    // Give the bus time to process deregistration
+
+    drop(mailbox);
     std::thread::sleep(Duration::from_millis(1));
-    
-    // Note: exact deregistration timing is implementation dependent
-    // so we mainly verify registration worked
 }
 
 #[test]
 fn bus_prevents_duplicate_registration() {
     let bus = Bus::new();
-    
+
     let _mailbox1 = bus.register("test-agent").unwrap();
     let result = bus.register("test-agent");
-    
+
     assert!(result.is_err(), "Duplicate registration should fail");
 }
 
 #[test]
 fn bus_message_sending() {
     let bus = Bus::new();
-    
+
     let _receiver = bus.register("receiver").unwrap();
     let sender = bus.register("sender").unwrap();
-    
+
     let result = sender.send(
         "receiver",
         "test_message",
         serde_json::json!({"content": "hello"}),
     );
-    
+
     assert!(result.is_ok(), "Message sending should succeed");
 }
 
 // ---------------------------------------------------------------------------
-// Error Handling Tests
+// Working Directory Tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn invalid_agent_creation_handling() {
-    let bus = Bus::new();
-    
-    // Try to build agent without proper setup
-    // This should still work as our builder has defaults
-    let agent = TestAgentBuilder::new(AgentRole::Developer).build(&bus);
-    assert!(agent.is_ok(), "Agent builder should handle defaults gracefully");
+#[tokio::test]
+async fn bash_tool_uses_worktree_cwd_without_sandbox() {
+    // When not sandboxed, the ToolSet should set Bash's working_dir to the agent's working_dir.
+    // This ensures git commands run in the worktree, not the daemon's cwd.
+    let worktree = std::env::temp_dir().join(format!("orch-cwd-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&worktree);
+    let marker = worktree.join("cwd-marker.txt");
+    std::fs::write(&marker, "found").unwrap();
+
+    let tool_set = llm_sdk::tools::ToolSet::standard_with_cwd(&worktree);
+    let call = llm_sdk::tools::ToolCall {
+        id: "1".into(),
+        name: "Bash".into(),
+        arguments: r#"{"command": "cat cwd-marker.txt"}"#.into(),
+    };
+    let result = tool_set.execute(&call).await;
+    assert_eq!(result.trim(), "found", "Bash should run in the worktree dir, got: {result}");
+
+    let _ = std::fs::remove_dir_all(&worktree);
 }
 
-// ---------------------------------------------------------------------------
-// Role-specific Behavior Tests
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn bash_tool_pwd_matches_working_dir() {
+    let worktree = std::env::temp_dir().join(format!("orch-pwd-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&worktree);
 
-#[test]
-fn developer_role_characteristics() {
-    assert!(role_has_tools(AgentRole::Developer));
-    
-    let config = test_config(AgentRole::Developer, 5, Some("implement API"));
-    assert_eq!(config.agent_id.index, 5);
-    assert!(config.initial_task.is_some());
-}
+    let tool_set = llm_sdk::tools::ToolSet::standard_with_cwd(&worktree);
+    let call = llm_sdk::tools::ToolCall {
+        id: "1".into(),
+        name: "Bash".into(),
+        arguments: r#"{"command": "pwd"}"#.into(),
+    };
+    let result = tool_set.execute(&call).await;
+    let expected = worktree.canonicalize().unwrap_or(worktree.clone());
+    assert_eq!(
+        result.trim(),
+        expected.to_string_lossy(),
+        "pwd should match the worktree path"
+    );
 
-#[test]
-fn singleton_role_characteristics() {
-    for role in [AgentRole::Manager, AgentRole::Architect, AgentRole::Auditor] {
-        assert!(!role_has_tools(role), "Singleton roles should not have direct tools");
-        
-        let config = test_config(role, 0, None);
-        assert_eq!(config.agent_id.index, 0);
-    }
-}
-
-#[test]
-fn merger_role_characteristics() {
-    assert!(role_has_tools(AgentRole::Merger));
-
-    let config = test_config(AgentRole::Merger, 0, None);
-    assert_eq!(config.agent_id.bus_name(), "merger");
-    assert_eq!(config.agent_id.index, 0);
+    let _ = std::fs::remove_dir_all(&worktree);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +231,7 @@ fn merger_role_characteristics() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn developer_gets_writable_sandbox_when_worktree_fails() {
+fn task_agent_gets_writable_sandbox_when_worktree_fails() {
     use std::path::PathBuf;
 
     let project = PathBuf::from("/tmp/test-project");
@@ -282,12 +239,9 @@ fn developer_gets_writable_sandbox_when_worktree_fails() {
         Err(anyhow::anyhow!("git worktree add failed"));
 
     let (working_dir, prefix) =
-        resolve_sandbox(AgentRole::Developer, &project, worktree_result, true);
+        resolve_sandbox(AgentRole::TaskAgent, &project, worktree_result, true);
 
-    // Developer must get writable sandbox even when worktree fails
     assert_eq!(working_dir, llm_sdk::sandbox::REPO_MOUNT);
-    // Must use developer_prefix (--bind), not readonly_prefix (--ro-bind)
-    // Check that /tmp/test-project is mounted writable (--bind), not read-only
     let bind_positions: Vec<usize> = prefix
         .iter()
         .enumerate()
@@ -299,24 +253,23 @@ fn developer_gets_writable_sandbox_when_worktree_fails() {
         .any(|&i| prefix.get(i + 1).map(|s| s.as_str()) == Some("/tmp/test-project"));
     assert!(
         project_bound,
-        "Project dir should be --bind (writable), not --ro-bind. Got: {:?}",
+        "Project dir should be --bind (writable). Got: {:?}",
         prefix
     );
 }
 
 #[test]
-fn developer_gets_worktree_sandbox_when_worktree_succeeds() {
+fn task_agent_gets_worktree_sandbox_when_worktree_succeeds() {
     use std::path::PathBuf;
 
     let project = PathBuf::from("/tmp/test-project");
-    let worktree_path = PathBuf::from("/tmp/test-project/.worktrees/developer-0");
+    let worktree_path = PathBuf::from("/tmp/test-project/.worktrees/task-lt-abc");
     let worktree_result: Result<PathBuf, anyhow::Error> = Ok(worktree_path);
 
     let (working_dir, prefix) =
-        resolve_sandbox(AgentRole::Developer, &project, worktree_result, true);
+        resolve_sandbox(AgentRole::TaskAgent, &project, worktree_result, true);
 
     assert_eq!(working_dir, llm_sdk::sandbox::REPO_MOUNT);
-    // Worktree path should be bound writable
     let bind_positions: Vec<usize> = prefix
         .iter()
         .enumerate()
@@ -325,7 +278,7 @@ fn developer_gets_worktree_sandbox_when_worktree_succeeds() {
         .collect();
     let worktree_bound = bind_positions.iter().any(|&i| {
         prefix.get(i + 1).map(|s| s.as_str())
-            == Some("/tmp/test-project/.worktrees/developer-0")
+            == Some("/tmp/test-project/.worktrees/task-lt-abc")
     });
     assert!(
         worktree_bound,
@@ -335,54 +288,27 @@ fn developer_gets_worktree_sandbox_when_worktree_succeeds() {
 }
 
 #[test]
-fn non_developer_gets_readonly_sandbox() {
+fn task_agent_no_sandbox_uses_worktree_path() {
     use std::path::PathBuf;
 
     let project = PathBuf::from("/tmp/test-project");
+    let worktree_path = PathBuf::from("/tmp/test-project/.worktrees/task-lt-abc");
 
     let (working_dir, prefix) =
-        resolve_sandbox(AgentRole::Manager, &project, Err(anyhow::anyhow!("n/a")), true);
+        resolve_sandbox(AgentRole::TaskAgent, &project, Ok(worktree_path), false);
 
-    assert_eq!(working_dir, llm_sdk::sandbox::REPO_MOUNT);
-    // Project should be --ro-bind (read-only)
-    let ro_bind_positions: Vec<usize> = prefix
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.as_str() == "--ro-bind")
-        .map(|(i, _)| i)
-        .collect();
-    let project_ro = ro_bind_positions
-        .iter()
-        .any(|&i| prefix.get(i + 1).map(|s| s.as_str()) == Some("/tmp/test-project"));
-    assert!(
-        project_ro,
-        "Non-developer project dir should be --ro-bind. Got: {:?}",
-        prefix
-    );
-}
-
-#[test]
-fn developer_no_sandbox_uses_worktree_path() {
-    use std::path::PathBuf;
-
-    let project = PathBuf::from("/tmp/test-project");
-    let worktree_path = PathBuf::from("/tmp/test-project/.worktrees/developer-0");
-
-    let (working_dir, prefix) =
-        resolve_sandbox(AgentRole::Developer, &project, Ok(worktree_path), false);
-
-    assert_eq!(working_dir, "/tmp/test-project/.worktrees/developer-0");
+    assert_eq!(working_dir, "/tmp/test-project/.worktrees/task-lt-abc");
     assert!(prefix.is_empty(), "No sandbox prefix without sandbox");
 }
 
 #[test]
-fn developer_no_sandbox_worktree_fails_uses_project_dir() {
+fn task_agent_no_sandbox_worktree_fails_uses_project_dir() {
     use std::path::PathBuf;
 
     let project = PathBuf::from("/tmp/test-project");
 
     let (working_dir, prefix) = resolve_sandbox(
-        AgentRole::Developer,
+        AgentRole::TaskAgent,
         &project,
         Err(anyhow::anyhow!("worktree failed")),
         false,

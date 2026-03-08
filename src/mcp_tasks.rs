@@ -89,9 +89,9 @@ struct AddCommentParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct SetDevelopersParams {
-    /// Number of parallel Claude Code worker agents (1-6). Each agent runs in its own git worktree.
-    count: u8,
+struct SetConcurrencyParams {
+    /// Maximum number of parallel task agents (1-6). Each agent runs in its own git worktree.
+    max: u8,
 }
 
 // --- MCP server ---
@@ -211,11 +211,11 @@ impl TasksMcp {
         }
     }
 
-    #[tool(description = "Scale the number of parallel Claude Code worker agents (1-6) that pick up and implement tasks in isolated git worktrees. Requires a running orchestrator.")]
-    async fn set_developers(&self, Parameters(p): Parameters<SetDevelopersParams>) -> String {
-        let count = p.count.clamp(1, 6);
+    #[tool(description = "Scale the maximum number of parallel task agents (1-6) that pick up and implement tasks in isolated git worktrees. Requires a running orchestrator.")]
+    async fn set_concurrency(&self, Parameters(p): Parameters<SetConcurrencyParams>) -> String {
+        let max = p.max.clamp(1, 6);
         let socket_path = control::control_socket_path();
-        let req = control::ControlRequest::SetDevelopers { project: self.project.clone(), count };
+        let req = control::ControlRequest::SetConcurrency { project: self.project.clone(), max };
         match tokio::task::spawn_blocking(move || {
             peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
                 &socket_path, &req,
@@ -223,7 +223,7 @@ impl TasksMcp {
         })
         .await
         {
-            Ok(Ok(control::ControlResponse::Ok)) => format!("Developer count set to {count}"),
+            Ok(Ok(control::ControlResponse::Ok)) => format!("Max concurrency set to {max}"),
             Ok(Ok(resp)) => format!("Unexpected response: {resp:?}"),
             Ok(Err(e)) => format!("Error: {e} (is the orchestrator running?)"),
             Err(e) => format!("Error: {e}"),

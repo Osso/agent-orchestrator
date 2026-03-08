@@ -1,17 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use llm_sdk::session::SessionStore;
 use llm_tasks::db::Database;
 
 use crate::relay;
-use crate::runtime::{RuntimeState, NUDGE_INTERVAL};
+use crate::runtime::RuntimeState;
 use crate::types::AgentRole;
 
 pub struct CommandTimers {
-    pub audit: tokio::time::Interval,
-    pub nudge: tokio::time::Interval,
     pub poll: tokio::time::Interval,
     pub timeout: tokio::time::Interval,
     pub watchdog: tokio::time::Interval,
@@ -23,8 +21,6 @@ impl CommandTimers {
     pub fn new() -> Result<Self> {
         let now = tokio::time::Instant::now();
         Ok(Self {
-            audit: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(600)),
-            nudge: tokio::time::interval_at(now + NUDGE_INTERVAL, NUDGE_INTERVAL),
             poll: tokio::time::interval_at(now + Duration::from_secs(10), Duration::from_secs(10)),
             timeout: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(60)),
             watchdog: tokio::time::interval_at(now + Duration::from_secs(30), Duration::from_secs(600)),
@@ -36,10 +32,7 @@ impl CommandTimers {
 
 pub fn default_state() -> RuntimeState {
     RuntimeState {
-        developer_count: 1,
-        manager_generation: 0,
-        last_relieve: None,
-        last_activity: Instant::now(),
+        max_concurrent: 3,
     }
 }
 
@@ -64,15 +57,8 @@ pub fn payload_str(payload: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
-pub fn payload_u8(payload: &serde_json::Value, key: &str, default: u8) -> u8 {
-    payload
-        .get(key)
-        .and_then(|v| v.as_u64())
-        .unwrap_or(default as u64) as u8
-}
-
 pub fn is_worktree_role(bus_name: &str) -> bool {
-    bus_name.starts_with("developer-")
+    bus_name.starts_with("task-")
 }
 
 /// Determine working directory and sandbox prefix for an agent.
@@ -82,7 +68,7 @@ pub fn resolve_sandbox(
     worktree_result: Result<PathBuf>,
     use_sandbox: bool,
 ) -> (String, Vec<String>) {
-    let is_dev = matches!(role, AgentRole::Developer | AgentRole::Merger);
+    let is_dev = matches!(role, AgentRole::TaskAgent | AgentRole::Merger);
 
     if is_dev {
         let dev_path = worktree_result.unwrap_or_else(|_| project_path.to_path_buf());
@@ -103,7 +89,6 @@ pub fn resolve_sandbox(
 }
 
 /// Find the `.git` directory for a project (resolves worktree indirection).
-/// Returns a canonicalized path so bwrap doesn't choke on symlinks.
 fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
     let git_path = project_path.join(".git");
     if git_path.is_dir() {

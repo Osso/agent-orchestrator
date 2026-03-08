@@ -1,7 +1,7 @@
 //! Resume in-progress tasks from a previous daemon session.
 //!
 //! On startup, finds tasks that were `in_progress` when the daemon last shut down,
-//! spawns developers with their preserved worktrees (partial work intact), and
+//! spawns agents with their preserved worktrees (partial work intact), and
 //! re-dispatches with a resume prompt that includes the git diff.
 
 use std::path::{Path, PathBuf};
@@ -37,15 +37,13 @@ impl OrchestratorRuntime {
             self.reset_task_to_ready(&task.id).await;
             return;
         };
-        let Some(index) = parse_developer_index(assignee) else {
-            tracing::warn!("Cannot parse developer index from '{}'", assignee);
+        // Assignee should be "task-{id}" format
+        if !assignee.starts_with("task-") {
+            tracing::warn!("Cannot resume non-task assignee '{}'", assignee);
             self.reset_task_to_ready(&task.id).await;
             return;
-        };
-        if index >= self.state.developer_count {
-            self.state.developer_count = index + 1;
         }
-        if let Err(e) = self.spawn_resuming_developer(index, task) {
+        if let Err(e) = self.spawn_resuming_agent(assignee, task) {
             tracing::error!("Failed to resume {} on task {}: {}", assignee, task.id, e);
             self.reset_task_to_ready(&task.id).await;
         }
@@ -57,17 +55,17 @@ impl OrchestratorRuntime {
         let _ = self.db.clear_assignee(task_id, "runtime").await;
     }
 
-    fn spawn_resuming_developer(&mut self, index: u8, task: &llm_tasks::db::Task) -> Result<()> {
-        let agent_id = AgentId::new_developer(index);
-        let bus_name = agent_id.bus_name();
-        let (working_dir, sandbox_prefix, diff) = self.resume_worktree(&bus_name)?;
-        let prompt = build_task_resume_prompt(task, &bus_name, &diff);
-        let config = self.resume_developer_config(agent_id, working_dir, sandbox_prefix);
+    fn spawn_resuming_agent(&mut self, bus_name: &str, task: &llm_tasks::db::Task) -> Result<()> {
+        let task_id = bus_name.strip_prefix("task-").unwrap_or(&task.id);
+        let agent_id = AgentId::for_task(task_id);
+        let (working_dir, sandbox_prefix, diff) = self.resume_worktree(bus_name)?;
+        let prompt = build_task_resume_prompt(task, bus_name, &diff);
+        let config = self.resume_agent_config(agent_id, working_dir, sandbox_prefix);
 
         self.spawn_agent_with_config(config)?;
-        self.dispatcher.register_resumed(bus_name.clone(), task.id.clone());
+        self.dispatcher.register_active(task.id.clone(), bus_name.to_string());
         let payload = serde_json::json!({"content": prompt, "task_id": task.id});
-        if let Err(e) = self.dispatcher.notify(&bus_name, "task_assignment", payload) {
+        if let Err(e) = self.dispatcher.notify(bus_name, "task_assignment", payload) {
             tracing::error!("Failed to send resume assignment to {}: {}", bus_name, e);
         }
         tracing::info!("Resumed {} on task {} (diff: {} bytes)", bus_name, task.id, diff.len());
@@ -83,11 +81,11 @@ impl OrchestratorRuntime {
         let wt_path = worktree::create_or_resume_worktree(&wt_cfg)?;
         let diff = worktree_diff(&wt_path);
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
-        let (wd, sp) = support::resolve_sandbox(AgentRole::Developer, &project_path, Ok(wt_path), use_sandbox);
+        let (wd, sp) = support::resolve_sandbox(AgentRole::TaskAgent, &project_path, Ok(wt_path), use_sandbox);
         Ok((wd, sp, diff))
     }
 
-    fn resume_developer_config(
+    fn resume_agent_config(
         &self,
         agent_id: AgentId,
         working_dir: String,
@@ -101,7 +99,7 @@ impl OrchestratorRuntime {
         AgentConfig {
             agent_id,
             working_dir,
-            system_prompt: AgentRole::Developer.system_prompt().to_string(),
+            system_prompt: AgentRole::TaskAgent.system_prompt().to_string(),
             initial_task: None,
             mcp_config: Some(support::build_mcp_config(&bus_name, &self.project)),
             fresh_session_per_task: true,
@@ -111,11 +109,6 @@ impl OrchestratorRuntime {
             sandbox_prefix,
         }
     }
-}
-
-/// Parse "developer-N" into N.
-pub fn parse_developer_index(name: &str) -> Option<u8> {
-    name.strip_prefix("developer-")?.parse().ok()
 }
 
 /// Get the diff between master and the worktree's current state.

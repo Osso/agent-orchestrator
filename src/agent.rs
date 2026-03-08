@@ -15,7 +15,7 @@ use llm_sdk::session::{Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
 
-/// Tools blocked for non-developer agents (managers, architects, auditors).
+/// Tools blocked for non-task agents (currently unused, all agents get full tools).
 const DISALLOWED_TOOLS: &[&str] = &[
     "Bash", "Write", "Edit", "NotebookEdit", "Agent",
 ];
@@ -434,20 +434,19 @@ fn truncate(text: &str, max_chars: usize) -> String {
 pub fn permission_mode_for_role(role: AgentRole) -> &'static str {
     // All agents use bypassPermissions — bwrap sandbox is the real security boundary.
     match role {
-        AgentRole::Developer | AgentRole::Merger => "bypassPermissions",
-        AgentRole::Manager | AgentRole::Architect | AgentRole::Auditor => "bypassPermissions",
+        AgentRole::TaskAgent | AgentRole::Merger => "bypassPermissions",
     }
 }
 
 pub fn role_has_tools(role: AgentRole) -> bool {
-    matches!(role, AgentRole::Developer | AgentRole::Merger)
+    matches!(role, AgentRole::TaskAgent | AgentRole::Merger)
 }
 
 /// Build the ToolSet for an OpenRouter agent: file tools for developers, bus tools for all.
 fn build_openrouter_tools(config: &AgentConfig, bus_name: &str) -> llm_sdk::tools::ToolSet {
     let mut set = if role_has_tools(config.agent_id.role) {
         if config.sandbox_prefix.is_empty() {
-            llm_sdk::tools::ToolSet::standard()
+            llm_sdk::tools::ToolSet::standard_with_cwd(&config.working_dir)
         } else {
             llm_sdk::tools::ToolSet::standard_sandboxed(config.sandbox_prefix.clone())
         }

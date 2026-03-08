@@ -2,16 +2,16 @@
 //!
 //! The runtime:
 //! - Creates the in-process message bus
-//! - Spawns and tracks agent processes
-//! - Listens for runtime commands via its mailbox (CREW sizing, RELIEVE manager)
+//! - Spawns and tracks agent processes (one per task)
+//! - Listens for runtime commands via its mailbox
 //! - Persists task history via llm-tasks
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use agent_bus::{Bus, Mailbox};
+use agent_bus::Bus;
 use anyhow::{Context, Result};
 use llm_sdk::session::SessionStore;
 use llm_tasks::db::Database;
@@ -27,20 +27,13 @@ use crate::runtime_support::{self as support, CommandTimers};
 use crate::types::{AgentId, AgentRole};
 use crate::worktree::{self, WorktreeConfig};
 
-pub const RELIEVE_COOLDOWN: Duration = Duration::from_secs(60);
-pub const NUDGE_INTERVAL: Duration = Duration::from_secs(120);
-pub const NUDGE_IDLE_THRESHOLD: Duration = Duration::from_secs(90);
-
 pub struct RuntimeState {
-    pub developer_count: u8,
-    pub manager_generation: u32,
-    pub last_relieve: Option<Instant>,
-    pub last_activity: Instant,
+    pub max_concurrent: usize,
 }
 
 /// Factory function that creates an Agent from config + mailbox.
 /// Tests inject a factory that uses FakeCompleter instead of real Claude.
-pub type AgentFactory = Arc<dyn Fn(AgentConfig, Mailbox) -> Result<Agent> + Send + Sync>;
+pub type AgentFactory = Arc<dyn Fn(AgentConfig, agent_bus::Mailbox) -> Result<Agent> + Send + Sync>;
 
 /// Default factory: creates a real Agent backed by the configured backend.
 fn default_agent_factory() -> AgentFactory {
@@ -101,8 +94,7 @@ impl OrchestratorRuntime {
         })
     }
 
-    /// Create a runtime suitable for testing — uses tempdir for DB + sessions,
-    /// and an injected agent factory.
+    /// Create a runtime suitable for testing.
     pub async fn new_test(
         bus: Bus,
         working_dir: &str,
@@ -141,17 +133,17 @@ impl OrchestratorRuntime {
 
     pub async fn run_watchdog_and_dispatch(&mut self) {
         self.dispatcher.watchdog().await;
-        self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+        self.poll_dispatch().await;
     }
 
-    /// Insert a fake agent handle for testing (avoids spawning a real agent).
+    /// Insert a fake agent handle for testing.
     pub fn insert_fake_handle(&mut self, name: &str) {
         let handle = tokio::spawn(std::future::pending::<()>());
         self.agent_handles.insert(name.to_string(), handle);
     }
 
-    /// Run in standalone mode (creates its own control server).
-    pub async fn run(self, initial_task: Option<String>) -> Result<()> {
+    /// Run in standalone mode.
+    pub async fn run(self, _initial_task: Option<String>) -> Result<()> {
         let registry = control::new_registry();
         registry.write().unwrap().insert(self.project.clone(), self.bus.clone());
 
@@ -162,17 +154,16 @@ impl OrchestratorRuntime {
             shutdown_rx,
         ));
 
-        self.run_with_shutdown(initial_task, shutdown_tx).await
+        self.run_with_shutdown(shutdown_tx).await
     }
 
-    /// Run as part of a daemon (control server managed externally).
+    /// Run as part of a daemon.
     pub async fn run_managed(self, shutdown_tx: watch::Sender<bool>) -> Result<()> {
-        self.run_with_shutdown(None, shutdown_tx).await
+        self.run_with_shutdown(shutdown_tx).await
     }
 
     async fn run_with_shutdown(
         mut self,
-        initial_task: Option<String>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Result<()> {
         let mut mailbox = self
@@ -182,12 +173,10 @@ impl OrchestratorRuntime {
 
         llm_sdk::sandbox::ensure_state_dirs();
         self.start_relay();
-        // Brief pause for relay to bind its socket before agents connect
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let enriched_task = self.enrich_with_task_state(initial_task).await;
-        self.spawn_initial_agents(enriched_task)?;
         self.resume_in_progress_tasks().await;
+        self.poll_dispatch().await;
         self.command_loop(&mut mailbox, shutdown_tx).await
     }
 
@@ -201,19 +190,6 @@ impl OrchestratorRuntime {
         });
     }
 
-    /// Process a single bus message. Returns true if the orchestrator should exit.
-    async fn process_bus_message(
-        &mut self,
-        msg: Option<agent_bus::BusMessage>,
-    ) -> Option<bool> {
-        let msg = msg?;
-        self.state.last_activity = Instant::now();
-        let should_exit = self
-            .handle_message(&msg.kind, &msg.payload, &msg.from)
-            .await;
-        Some(should_exit)
-    }
-
     async fn command_loop(
         &mut self,
         mailbox: &mut agent_bus::Mailbox,
@@ -225,15 +201,13 @@ impl OrchestratorRuntime {
         loop {
             tokio::select! {
                 msg = mailbox.recv() => {
-                    match self.process_bus_message(msg).await {
-                        Some(true) | None => break,
-                        _ => {}
+                    let Some(msg) = msg else { break };
+                    if self.handle_message(&msg.kind, &msg.payload, &msg.from).await {
+                        break;
                     }
                 }
                 _ = timers.poll.tick() => self.poll_dispatch().await,
-                _ = timers.timeout.tick() => self.check_dev_timeouts().await,
-                _ = timers.nudge.tick() => self.maybe_nudge_manager(mailbox).await,
-                _ = timers.audit.tick() => self.send_audit_snapshot(mailbox).await,
+                _ = timers.timeout.tick() => self.check_agent_timeouts().await,
                 _ = timers.watchdog.tick() => self.run_watchdog().await,
                 _ = timers.sigint.recv() => { tracing::info!("Received SIGINT, shutting down"); break; }
                 _ = timers.sigterm.recv() => { tracing::info!("Received SIGTERM, shutting down"); break; }
@@ -251,56 +225,12 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    async fn enrich_with_task_state(&self, task: Option<String>) -> Option<String> {
-        let task = task?;
-        let snapshot = self.build_task_snapshot().await;
-        if snapshot.contains("No tasks") {
-            Some(task)
-        } else {
-            Some(format!("{}\n\n## Your Task\n{}", snapshot, task))
-        }
-    }
-
-    async fn send_audit_snapshot(&mut self, mailbox: &Mailbox) {
-        self.ensure_agent(AgentRole::Auditor, 0);
-        let snapshot = self.build_task_snapshot().await;
-        let payload = serde_json::json!({ "content": snapshot });
-        if let Err(e) = mailbox.send("auditor", "patrol_snapshot", payload) {
-            tracing::warn!("Failed to send audit snapshot: {}", e);
-        }
-    }
-
-    async fn maybe_nudge_manager(&self, mailbox: &Mailbox) {
-        if self.state.last_activity.elapsed() < NUDGE_IDLE_THRESHOLD {
-            return;
-        }
-        let needs_attention = matches!(self.db.list_tasks(None, None).await,
-            Ok(t) if t.iter().any(|t| matches!(t.status.as_str(), "pending" | "needs_info")));
-        if !needs_attention {
-            return;
-        }
-        let snapshot = self.build_task_snapshot().await;
-        let idle_secs = self.state.last_activity.elapsed().as_secs();
-        let payload = serde_json::json!({
-            "content": format!(
-                "NUDGE: No activity for {}s. Tasks exist but none are being processed.\n\n{}",
-                idle_secs, snapshot
-            )
-        });
-        tracing::info!("Nudging manager (idle {}s with pending tasks)", idle_secs);
-        if let Err(e) = mailbox.send("manager", "nudge", payload) {
-            tracing::debug!("Failed to nudge manager: {}", e);
-        }
-    }
-
     async fn poll_dispatch(&mut self) {
-        self.ensure_developers();
-        self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
-    }
-
-    fn ensure_developers(&mut self) {
-        for i in 0..self.state.developer_count {
-            self.ensure_agent(AgentRole::Developer, i);
+        let task_ids = self.dispatcher.tasks_to_dispatch(self.state.max_concurrent).await;
+        for task_id in task_ids {
+            if let Err(e) = self.spawn_task_agent(&task_id).await {
+                tracing::error!("Failed to spawn agent for task {}: {}", task_id, e);
+            }
         }
     }
 
@@ -312,45 +242,55 @@ impl OrchestratorRuntime {
             }
             "task_complete" => {
                 let content = support::payload_str(payload, "content");
-                let dev_name = from.to_string();
-                if let Some(task_id) = self.dispatcher.handle_dev_complete(from, &content).await {
-                    self.spawn_completion_review(&task_id, &content, &dev_name);
+                let task_id = self.resolve_task_id(from);
+                if let Some(task_id) = task_id {
+                    let agent_name = from.to_string();
+                    if self.dispatcher.handle_agent_complete(&task_id, &content).await {
+                        self.spawn_completion_review(&task_id, &content, &agent_name);
+                    }
                 }
             }
             "task_done" => {
                 let task_id = support::payload_str(payload, "task_id");
-                self.merge_developer_branch(&task_id).await;
+                self.merge_agent_branch(&task_id).await;
             }
             "task_blocked" => {
                 let content = support::payload_str(payload, "content");
-                self.dispatcher.handle_dev_needs_info(from, &content).await;
+                if let Some(task_id) = self.resolve_task_id(from) {
+                    self.dispatcher.handle_agent_blocked(&task_id, &content).await;
+                }
             }
-            "dev_heartbeat" => {
-                let dev = support::payload_str(payload, "developer");
-                if !dev.is_empty() { self.dispatcher.record_activity(&dev); }
+            "agent_heartbeat" => {
+                let agent = support::payload_str(payload, "agent");
+                if !agent.is_empty() { self.dispatcher.record_activity(&agent); }
                 return;
             }
             _ => {}
         }
-        self.ensure_developers();
-        self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+        self.poll_dispatch().await;
     }
 
-    async fn check_dev_timeouts(&mut self) {
+    /// Resolve task ID from an agent's bus name.
+    fn resolve_task_id(&self, from: &str) -> Option<String> {
+        self.dispatcher.task_id_for_agent_name(from)
+            .or_else(|| from.strip_prefix("task-").map(String::from))
+    }
+
+    async fn check_agent_timeouts(&mut self) {
         let timed_out = self.dispatcher.check_timeouts().await;
-        for dev_name in &timed_out {
-            tracing::warn!("Aborting timed-out developer {}", dev_name);
-            self.abort_agent(dev_name);
+        for agent_name in &timed_out {
+            tracing::warn!("Aborting timed-out agent {}", agent_name);
+            self.abort_agent(agent_name);
         }
         if !timed_out.is_empty() {
-            self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+            self.poll_dispatch().await;
         }
     }
 
     async fn run_watchdog(&mut self) {
         let fixed = self.dispatcher.watchdog().await;
         if fixed > 0 {
-            self.dispatcher.try_dispatch(self.state.developer_count, &self.agent_handles).await;
+            self.poll_dispatch().await;
         }
     }
 
@@ -368,9 +308,66 @@ impl OrchestratorRuntime {
         );
     }
 
+    /// Spawn a fresh agent for a task.
+    async fn spawn_task_agent(&mut self, task_id: &str) -> Result<()> {
+        let agent_id = AgentId::for_task(task_id);
+        let bus_name = agent_id.bus_name();
+
+        if !self.dispatcher.claim_and_register(task_id, &bus_name).await {
+            return Ok(());
+        }
+
+        let config = self.build_task_agent_config(agent_id)?;
+        self.spawn_agent_with_config(config)?;
+        self.send_task_assignment(task_id, &bus_name).await;
+        Ok(())
+    }
+
+    fn build_task_agent_config(&self, agent_id: AgentId) -> Result<AgentConfig> {
+        let bus_name = agent_id.bus_name();
+        let (working_dir, sandbox_prefix) = self.working_dir_for_task(&bus_name);
+        let bus = match self.backend {
+            BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
+            BackendKind::Claude => None,
+        };
+        Ok(AgentConfig {
+            agent_id,
+            working_dir,
+            system_prompt: AgentRole::TaskAgent.system_prompt().to_string(),
+            initial_task: None,
+            mcp_config: Some(support::build_mcp_config(&bus_name, &self.project)),
+            fresh_session_per_task: true,
+            backend: self.backend.clone(),
+            session_store: self.session_store.clone(),
+            bus,
+            sandbox_prefix,
+        })
+    }
+
+    async fn send_task_assignment(&self, task_id: &str, bus_name: &str) {
+        let task = match self.db.get_task(task_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to get task {task_id} for assignment: {e}");
+                return;
+            }
+        };
+        let desc = task.description.as_deref().unwrap_or("");
+        let branch = format!("agent/{}", bus_name);
+        let content = format!(
+            "## Task {}\n\n{}\n\n{}\n\nCommit your changes on branch `{}`.",
+            task_id, task.title, desc, branch
+        );
+        let payload = serde_json::json!({"content": content, "task_id": task_id});
+        if let Err(e) = self.dispatcher.notify(bus_name, "task_assignment", payload) {
+            tracing::error!("Failed to dispatch task {} to {}: {}", task_id, bus_name, e);
+        } else {
+            tracing::info!("Dispatched task {} to {}", task_id, bus_name);
+        }
+    }
+
     /// Look up the task's assignee and send merge_request to the merger.
-    /// Refuses to merge if the task is `pending_delete`.
-    async fn merge_developer_branch(&mut self, task_id: &str) {
+    async fn merge_agent_branch(&mut self, task_id: &str) {
         let task = match self.db.get_task(task_id).await {
             Ok(t) => t,
             Err(e) => {
@@ -384,24 +381,24 @@ impl OrchestratorRuntime {
             return;
         }
         let assignee = task.assignee.unwrap_or_default();
-        if assignee.is_empty() || !assignee.starts_with("developer-") {
-            tracing::warn!("Task {task_id} has no developer assignee, skipping merge");
+        if assignee.is_empty() || !assignee.starts_with("task-") {
+            tracing::warn!("Task {task_id} has no task agent assignee, skipping merge");
             return;
         }
-        self.ensure_agent(AgentRole::Merger, 0);
+        self.ensure_merger();
         let branch = format!("agent/{}", assignee);
         let payload = serde_json::json!({
             "branch": branch,
             "description": format!("Merge reviewed task {task_id}"),
-            "from_developer": assignee,
+            "from_agent": assignee,
         });
         if let Err(e) = self.dispatcher.notify("merger", "merge_request", payload) {
             tracing::error!("Failed to send merge_request for {task_id}: {e}");
         }
     }
 
-    fn spawn_completion_review(&self, task_id: &str, dev_output: &str, dev_name: &str) {
-        let branch = format!("agent/{}", dev_name);
+    fn spawn_completion_review(&self, task_id: &str, dev_output: &str, agent_name: &str) {
+        let branch = format!("agent/{}", agent_name);
         architect_client::spawn_review(
             self.db.clone(), self.bus.clone(),
             self.project.clone(), self.working_dir.clone(),
@@ -409,30 +406,7 @@ impl OrchestratorRuntime {
         );
     }
 
-    async fn build_task_snapshot(&self) -> String {
-        let mut snap = String::from("## Task State Snapshot\n\n");
-        match self.db.list_tasks(None, None).await {
-            Ok(tasks) if tasks.is_empty() => {
-                snap.push_str("No tasks recorded yet.\n");
-            }
-            Ok(tasks) => {
-                for task in &tasks {
-                    let who = task.assignee.as_deref().unwrap_or("unassigned");
-                    snap.push_str(&format!(
-                        "- [{}] {} (assigned: {})\n",
-                        task.status, task.title, who
-                    ));
-                }
-                snap.push_str(&format!("\nTotal tasks: {}\n", tasks.len()));
-            }
-            Err(e) => {
-                snap.push_str(&format!("Error querying tasks: {}\n", e));
-            }
-        }
-        snap
-    }
-
-    /// Returns true if the orchestrator should shut down (goal_complete).
+    /// Returns true if the orchestrator should shut down.
     pub async fn handle_message(
         &mut self,
         kind: &str,
@@ -441,30 +415,8 @@ impl OrchestratorRuntime {
     ) -> bool {
         tracing::info!("Runtime received '{}' from {}", kind, from);
         match kind {
-            "goal_complete" => {
-                let summary = support::payload_str(payload, "summary");
-                let active = self.db.list_tasks(Some("in_progress"), None).await.unwrap_or_default();
-                if !active.is_empty() {
-                    let ids: Vec<&str> = active.iter().map(|t| t.id.as_str()).collect();
-                    tracing::warn!("GOAL_COMPLETE rejected: {} tasks still in_progress: {:?}", active.len(), ids);
-                    let _ = self.dispatcher.notify(from, "error", serde_json::json!({
-                        "content": format!("Cannot complete goal: {} tasks still in progress", active.len()),
-                    }));
-                } else {
-                    tracing::info!("GOAL COMPLETE: {}", summary);
-                    return true;
-                }
-            }
-            "set_crew" => {
-                let count = support::payload_u8(payload, "count", 1);
-                self.handle_crew_size(count);
-            }
-            "relieve_manager" => {
-                let reason = support::payload_str(payload, "reason");
-                self.handle_relieve_manager(&reason).await;
-            }
             "task_created" | "task_ready" | "task_done"
-            | "task_complete" | "task_blocked" | "dev_heartbeat" => {
+            | "task_complete" | "task_blocked" | "agent_heartbeat" => {
                 self.handle_task_event(kind, payload, from).await;
             }
             _ => tracing::debug!("Runtime ignoring unknown kind: {}", kind),
@@ -473,8 +425,6 @@ impl OrchestratorRuntime {
     }
 
     async fn shutdown(&mut self) {
-        // Keep in_progress tasks and their assignees so they can resume on restart.
-        // The worktrees preserve partial work; the DB preserves the assignment.
         let in_progress = self.db.list_tasks(Some("in_progress"), None).await.unwrap_or_default();
         for task in &in_progress {
             tracing::info!(
@@ -482,7 +432,6 @@ impl OrchestratorRuntime {
                 task.id, task.assignee
             );
         }
-        // Close any pending_delete tasks that survived the session
         if let Ok(tasks) = self.db.list_tasks(Some("pending_delete"), None).await {
             for task in &tasks {
                 tracing::info!("Closing pending_delete task {} on shutdown", task.id);
@@ -502,43 +451,24 @@ impl OrchestratorRuntime {
                 Err(_) => tracing::warn!("Merger timed out, aborting"),
             }
         }
-        // Only remove non-developer worktrees; developer worktrees are preserved for resume
         self.try_remove_worktree("merger");
     }
 
-    fn spawn_initial_agents(&mut self, manager_task: Option<String>) -> Result<()> {
-        self.spawn_agent(AgentRole::Manager, 0, manager_task)?;
-        Ok(())
-    }
-
-    fn ensure_agent(&mut self, role: AgentRole, index: u8) {
-        let id = match role {
-            AgentRole::Developer => AgentId::new_developer(index),
-            _ => AgentId::new_singleton(role),
-        };
-        let name = id.bus_name();
-        if self.agent_handles.get(&name).is_some_and(|h| !h.is_finished()) {
+    fn ensure_merger(&mut self) {
+        let name = "merger";
+        if self.agent_handles.get(name).is_some_and(|h| !h.is_finished()) {
             return;
         }
-        tracing::info!("Lazy-spawning {} (on demand)", name);
-        if let Err(e) = self.spawn_agent(role, index, None) {
-            tracing::error!("Failed to spawn {}: {}", name, e);
+        tracing::info!("Lazy-spawning merger (on demand)");
+        if let Err(e) = self.spawn_merger() {
+            tracing::error!("Failed to spawn merger: {}", e);
         }
     }
 
-    pub fn spawn_agent(
-        &mut self,
-        role: AgentRole,
-        index: u8,
-        initial_task: Option<String>,
-    ) -> Result<()> {
-        let agent_id = match role {
-            AgentRole::Developer => AgentId::new_developer(index),
-            _ => AgentId::new_singleton(role),
-        };
+    fn spawn_merger(&mut self) -> Result<()> {
+        let agent_id = AgentId::merger();
         let bus_name = agent_id.bus_name();
-        let (working_dir, sandbox_prefix) = self.working_dir_and_sandbox(role, &bus_name);
-        let fresh = role == AgentRole::Developer;
+        let (working_dir, sandbox_prefix) = self.working_dir_for_task(&bus_name);
         let bus = match self.backend {
             BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
@@ -546,10 +476,10 @@ impl OrchestratorRuntime {
         let config = AgentConfig {
             agent_id,
             working_dir,
-            system_prompt: role.system_prompt().to_string(),
-            initial_task,
+            system_prompt: AgentRole::Merger.system_prompt().to_string(),
+            initial_task: None,
             mcp_config: Some(support::build_mcp_config(&bus_name, &self.project)),
-            fresh_session_per_task: fresh,
+            fresh_session_per_task: false,
             backend: self.backend.clone(),
             session_store: self.session_store.clone(),
             bus,
@@ -558,30 +488,24 @@ impl OrchestratorRuntime {
         self.spawn_agent_with_config(config)
     }
 
-    fn working_dir_and_sandbox(&self, role: AgentRole, bus_name: &str) -> (String, Vec<String>) {
+    fn working_dir_for_task(&self, bus_name: &str) -> (String, Vec<String>) {
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
-        let worktree_result = if matches!(role, AgentRole::Developer) {
+        let worktree_result = if support::is_worktree_role(bus_name) || bus_name == "merger" {
             let cfg = WorktreeConfig {
                 project_dir: project_path.clone(),
                 agent_name: bus_name.to_string(),
             };
-            match worktree::create_worktree(&cfg) {
-                Ok(wt_path) => Ok(wt_path),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to create worktree for {}, using project dir: {}",
-                        bus_name, e
-                    );
-                    Err(e)
-                }
-            }
+            worktree::create_worktree(&cfg).map_err(|e| {
+                tracing::warn!("Failed to create worktree for {}, using project dir: {}", bus_name, e);
+                e
+            })
         } else {
-            Err(anyhow::anyhow!("not a developer role"))
+            Err(anyhow::anyhow!("not a worktree role"))
         };
 
-        support::resolve_sandbox(role, &project_path, worktree_result, use_sandbox)
+        support::resolve_sandbox(AgentRole::TaskAgent, &project_path, worktree_result, use_sandbox)
     }
 
     pub(crate) fn spawn_agent_with_config(&mut self, config: AgentConfig) -> Result<()> {
@@ -608,102 +532,19 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    pub fn handle_crew_size(&mut self, count: u8) {
-        let count = count.clamp(1, 6);
-        let current = self.state.developer_count;
-        if count == current {
-            return;
-        }
-        tracing::info!("CREW resize: {} -> {}", current, count);
-        if count > current {
-            for i in current..count {
-                if let Err(e) = self.spawn_agent(AgentRole::Developer, i, None) {
-                    tracing::error!("Failed to spawn developer-{}: {}", i, e);
-                }
-            }
-        } else {
-            for i in count..current {
-                self.abort_agent(&format!("developer-{}", i));
-            }
-        }
-        self.state.developer_count = count;
-    }
-
-    pub async fn handle_relieve_manager(&mut self, reason: &str) {
-        if !self.relieve_cooldown_elapsed(reason) {
-            return;
-        }
-        tracing::warn!(
-            "RELIEVE: firing manager gen {} — {}",
-            self.state.manager_generation, reason
-        );
-        self.abort_agent("manager");
-        self.session_store.remove("manager");
-        self.session_store.remove_message_log("manager");
-        self.state.manager_generation += 1;
-        self.state.last_relieve = Some(Instant::now());
-        let briefing = self.build_manager_briefing(reason).await;
-        self.spawn_replacement_manager(briefing);
-    }
-
-    fn relieve_cooldown_elapsed(&self, reason: &str) -> bool {
-        if let Some(last) = self.state.last_relieve
-            && last.elapsed() < RELIEVE_COOLDOWN
-        {
-            tracing::warn!(
-                "RELIEVE rejected ({}): cooldown ({:.0}s remaining)",
-                reason,
-                (RELIEVE_COOLDOWN - last.elapsed()).as_secs_f64()
-            );
-            return false;
-        }
-        true
-    }
-
-    fn spawn_replacement_manager(&mut self, briefing: String) {
-        let prompt = format!("{}\n\n{}", AgentRole::Manager.system_prompt(), briefing);
-        let bus = match self.backend {
-            BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
-            BackendKind::Claude => None,
-        };
-        let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
-        let project_path = PathBuf::from(&self.working_dir);
-        let (working_dir, sandbox_prefix) = if use_sandbox {
-            let prefix = llm_sdk::sandbox::readonly_prefix(&project_path);
-            (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix)
-        } else {
-            (self.working_dir.clone(), Vec::new())
-        };
-        let config = AgentConfig {
-            agent_id: AgentId::new_singleton(AgentRole::Manager),
-            working_dir,
-            system_prompt: prompt,
-            initial_task: None,
-            mcp_config: Some(support::build_mcp_config("manager", &self.project)),
-            fresh_session_per_task: false,
-            backend: self.backend.clone(),
-            session_store: self.session_store.clone(),
-            bus,
-            sandbox_prefix,
-        };
-        if let Err(e) = self.spawn_agent_with_config(config) {
-            tracing::error!("Failed to spawn replacement manager: {}", e);
-        }
-    }
-
     fn abort_agent(&mut self, name: &str) {
         if let Some(handle) = self.agent_handles.remove(name) {
             tracing::info!("Stopping {}", name);
             handle.abort();
-            // Clean up relay mailbox so the next spawn can register it
             let relay_name = format!("relay-{}", name);
             self.bus.deregister(&relay_name);
+            self.dispatcher.remove_task_by_agent(name);
             self.try_remove_worktree(name);
         }
     }
 
     fn try_remove_worktree(&self, bus_name: &str) {
-        if !support::is_worktree_role(bus_name) {
+        if !support::is_worktree_role(bus_name) && bus_name != "merger" {
             return;
         }
         let cfg = WorktreeConfig {
@@ -713,29 +554,5 @@ impl OrchestratorRuntime {
         if let Err(e) = worktree::remove_worktree(&cfg) {
             tracing::warn!("Failed to remove worktree for {}: {}", bus_name, e);
         }
-    }
-
-    async fn build_manager_briefing(&self, relieve_reason: &str) -> String {
-        let mut b = String::from("## State Briefing (you are replacing the previous manager)\n\n");
-        b.push_str(&format!("**Reason:** {}\n", relieve_reason));
-        b.push_str(&format!("**Generation:** {}\n", self.state.manager_generation));
-        b.push_str(&format!(
-            "**Active developers:** {}\n\n",
-            self.state.developer_count
-        ));
-
-        match self.db.list_tasks(None, None).await {
-            Ok(tasks) if tasks.is_empty() => b.push_str("No task history recorded.\n"),
-            Ok(tasks) => {
-                b.push_str("### Task History\n");
-                for task in &tasks {
-                    let who = task.assignee.as_deref().unwrap_or("unassigned");
-                    b.push_str(&format!("- [{}] {}: {}\n", who, task.status, task.title));
-                }
-            }
-            Err(e) => b.push_str(&format!("Failed to load task history: {}\n", e)),
-        }
-
-        b
     }
 }

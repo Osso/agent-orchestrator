@@ -75,10 +75,10 @@ fn test_session_store() -> SessionStore {
 }
 
 /// Build an AgentConfig for testing.
-pub fn test_config(role: AgentRole, index: u8, initial_task: Option<&str>) -> AgentConfig {
+pub fn test_config(role: AgentRole, _index: u8, initial_task: Option<&str>) -> AgentConfig {
     let agent_id = match role {
-        AgentRole::Developer => AgentId::new_developer(index),
-        _ => AgentId::new_singleton(role),
+        AgentRole::TaskAgent => AgentId::for_task(&format!("test-{}", uuid::Uuid::new_v4())),
+        AgentRole::Merger => AgentId::merger(),
     };
     AgentConfig {
         agent_id,
