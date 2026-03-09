@@ -26,6 +26,8 @@ struct AddTaskParams {
     description: Option<String>,
     /// Priority: 0=none, 1=low, 2=medium, 3=high
     priority: Option<u8>,
+    /// Target branch for worktrees (defaults to current branch)
+    target_branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -133,7 +135,8 @@ impl TasksMcp {
 
     #[tool(description = "Add a new task. Auto-dispatches to an idle developer if the orchestrator is running.")]
     async fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> String {
-        match self.db.create_task(&p.title, p.description.as_deref(), p.priority.unwrap_or(0), "user").await {
+        let branch = p.target_branch.unwrap_or_else(detect_current_branch);
+        match self.db.create_task_with_branch(&p.title, p.description.as_deref(), p.priority.unwrap_or(0), "user", Some(&branch)).await {
             Ok(task) => {
                 notify_runtime(&self.project, &task.id);
                 to_json(&task)
@@ -149,7 +152,7 @@ impl TasksMcp {
             title: p.title.as_deref(),
             description: p.description.as_deref(),
             priority: p.priority,
-            assignee: None,
+            ..Default::default()
         };
         match self.db.update_task(&p.id, updates, "user").await {
             Ok(()) => {
@@ -260,6 +263,20 @@ fn to_json<T: Serialize>(val: &T) -> String {
 
 fn err(e: impl std::fmt::Display) -> String {
     format!("Error: {e}")
+}
+
+/// Detect the current git branch. Falls back to "master".
+fn detect_current_branch() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() || s == "HEAD" { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| "master".to_string())
 }
 
 /// Notify the running orchestrator that a task was created.

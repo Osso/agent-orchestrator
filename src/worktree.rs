@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 pub struct WorktreeConfig {
     pub project_dir: PathBuf,
     pub agent_name: String,
+    pub target_branch: String,
 }
 
 impl WorktreeConfig {
@@ -56,7 +57,7 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf, resume: bool) -> Opt
     tracing::info!("Reusing existing worktree at {}", path.display());
     let branch = cfg.branch();
     let reset_ok = Command::new("git")
-        .args(["switch", "-C", &branch, "master"])
+        .args(["switch", "-C", &branch, &cfg.target_branch])
         .current_dir(path)
         .status()
         .is_ok_and(|s| s.success());
@@ -76,7 +77,7 @@ fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
     let branch = cfg.branch();
     let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
     let status = Command::new("git")
-        .args(["worktree", "add", "--force", "-B", &branch, path_str, "HEAD"])
+        .args(["worktree", "add", "--force", "-B", &branch, path_str, &cfg.target_branch])
         .current_dir(&cfg.project_dir)
         .status()
         .context("failed to run git worktree add")?;

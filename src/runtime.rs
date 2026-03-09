@@ -360,6 +360,10 @@ impl OrchestratorRuntime {
         }
         tracing::info!("Dispatching task {} (attempt {}/{})", task_id, attempts + 1, MAX_TASK_ATTEMPTS);
 
+        let task = self.db.get_task(task_id).await
+            .context("Failed to get task for dispatch")?;
+        let target_branch = task.target_branch.as_deref().unwrap_or("master");
+
         let agent_id = AgentId::for_task(task_id);
         let bus_name = agent_id.bus_name();
 
@@ -368,7 +372,7 @@ impl OrchestratorRuntime {
         }
 
         self.global_limits.active_agents.fetch_add(1, Ordering::Relaxed);
-        let config = self.build_task_agent_config(agent_id)?;
+        let config = self.build_task_agent_config(agent_id, target_branch)?;
         self.spawn_agent_with_config(config)?;
         self.send_task_assignment(task_id, &bus_name).await;
         Ok(())
@@ -387,9 +391,9 @@ impl OrchestratorRuntime {
         }
     }
 
-    fn build_task_agent_config(&self, agent_id: AgentId) -> Result<AgentConfig> {
+    fn build_task_agent_config(&self, agent_id: AgentId, target_branch: &str) -> Result<AgentConfig> {
         let bus_name = agent_id.bus_name();
-        let (working_dir, sandbox_prefix) = self.working_dir_for_task(&bus_name);
+        let (working_dir, sandbox_prefix) = self.working_dir_for_task(&bus_name, target_branch);
         let bus = match self.backend {
             BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
@@ -451,8 +455,10 @@ impl OrchestratorRuntime {
         }
         self.ensure_merger();
         let branch = format!("agent/{}", assignee);
+        let target = task.target_branch.as_deref().unwrap_or("master");
         let payload = serde_json::json!({
             "branch": branch,
+            "target_branch": target,
             "description": format!("Merge reviewed task {task_id}"),
             "from_agent": assignee,
         });
@@ -532,7 +538,7 @@ impl OrchestratorRuntime {
     fn spawn_merger(&mut self) -> Result<()> {
         let agent_id = AgentId::merger();
         let bus_name = agent_id.bus_name();
-        let (working_dir, sandbox_prefix) = self.working_dir_for_task(&bus_name);
+        let (working_dir, sandbox_prefix) = self.working_dir_for_task(&bus_name, "master");
         let bus = match self.backend {
             BackendKind::OpenRouter { .. } | BackendKind::Codex { .. } => Some(self.bus.clone()),
             BackendKind::Claude => None,
@@ -552,7 +558,7 @@ impl OrchestratorRuntime {
         self.spawn_agent_with_config(config)
     }
 
-    fn working_dir_for_task(&self, bus_name: &str) -> (String, Vec<String>) {
+    fn working_dir_for_task(&self, bus_name: &str, target_branch: &str) -> (String, Vec<String>) {
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let project_path = PathBuf::from(&self.working_dir);
 
@@ -560,6 +566,7 @@ impl OrchestratorRuntime {
             let cfg = WorktreeConfig {
                 project_dir: project_path.clone(),
                 agent_name: bus_name.to_string(),
+                target_branch: target_branch.to_string(),
             };
             worktree::create_worktree(&cfg).map_err(|e| {
                 tracing::warn!("Failed to create worktree for {}, using project dir: {}", bus_name, e);
@@ -623,6 +630,7 @@ impl OrchestratorRuntime {
         let cfg = WorktreeConfig {
             project_dir: PathBuf::from(&self.working_dir),
             agent_name: bus_name.to_string(),
+            target_branch: "master".to_string(), // unused for removal
         };
         if let Err(e) = worktree::remove_worktree(&cfg) {
             tracing::warn!("Failed to remove worktree for {}: {}", bus_name, e);

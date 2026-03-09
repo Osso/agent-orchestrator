@@ -60,7 +60,8 @@ impl OrchestratorRuntime {
     fn spawn_resuming_agent(&mut self, bus_name: &str, task: &llm_tasks::db::Task) -> Result<()> {
         let task_id = bus_name.strip_prefix("task-").unwrap_or(&task.id);
         let agent_id = AgentId::for_task(task_id);
-        let (working_dir, sandbox_prefix, diff) = self.resume_worktree(bus_name)?;
+        let target_branch = task.target_branch.as_deref().unwrap_or("master");
+        let (working_dir, sandbox_prefix, diff) = self.resume_worktree(bus_name, target_branch)?;
         let prompt = build_task_resume_prompt(task, bus_name, &diff);
         let config = self.resume_agent_config(agent_id, working_dir, sandbox_prefix);
 
@@ -75,14 +76,15 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    fn resume_worktree(&self, bus_name: &str) -> Result<(String, Vec<String>, String)> {
+    fn resume_worktree(&self, bus_name: &str, target_branch: &str) -> Result<(String, Vec<String>, String)> {
         let project_path = PathBuf::from(&self.working_dir);
         let wt_cfg = WorktreeConfig {
             project_dir: project_path.clone(),
             agent_name: bus_name.to_string(),
+            target_branch: target_branch.to_string(),
         };
         let wt_path = worktree::create_or_resume_worktree(&wt_cfg)?;
-        let diff = worktree_diff(&wt_path);
+        let diff = worktree_diff(&wt_path, target_branch);
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
         let (wd, sp) = support::resolve_sandbox(AgentRole::TaskAgent, &project_path, Ok(wt_path), use_sandbox);
         Ok((wd, sp, diff))
@@ -114,10 +116,10 @@ impl OrchestratorRuntime {
     }
 }
 
-/// Get the diff between master and the worktree's current state.
-fn worktree_diff(wt_path: &Path) -> String {
+/// Get the diff between the target branch and the worktree's current state.
+fn worktree_diff(wt_path: &Path, target_branch: &str) -> String {
     let output = Command::new("git")
-        .args(["diff", "master", "--stat"])
+        .args(["diff", target_branch, "--stat"])
         .current_dir(wt_path)
         .output();
     match output {
@@ -129,11 +131,12 @@ fn worktree_diff(wt_path: &Path) -> String {
 fn build_task_resume_prompt(task: &llm_tasks::db::Task, bus_name: &str, diff: &str) -> String {
     let desc = task.description.as_deref().unwrap_or("");
     let branch = format!("agent/{}", bus_name);
+    let target = task.target_branch.as_deref().unwrap_or("master");
     let diff_section = if diff.is_empty() {
         "No changes were committed yet on this branch.".to_string()
     } else {
         let d = if diff.len() > 4000 { &diff[..4000] } else { diff };
-        format!("## Work already done (git diff master --stat)\n\n```\n{}\n```", d)
+        format!("## Work already done (git diff {target} --stat)\n\n```\n{}\n```", d)
     };
     format!(
         "## RESUMING Task {id}\n\n{title}\n\n{desc}\n\n\
