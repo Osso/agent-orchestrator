@@ -11,7 +11,7 @@ use agent_bus::{Bus, Mailbox};
 use anyhow::Result;
 use async_trait::async_trait;
 use llm_sdk::claude::Claude;
-use llm_sdk::session::{Session, SessionStore};
+use llm_sdk::session::{append_log, now_utc, LogEntry, Session, SessionStore};
 
 use crate::types::{AgentId, AgentRole};
 
@@ -201,9 +201,19 @@ impl Agent {
             self.reset_completer_for_task();
             self.last_task = Some(extract_content(&msg.payload));
         }
+        if msg.kind == "external_message" {
+            self.log_external_message(&msg.payload);
+        }
         let content = format_prompt(&msg, is_task);
         tracing::info!("Agent {} processing '{}' ({} bytes)", self.config.agent_id, msg.kind, content.len());
         self.dispatch_completion(&content, is_task).await;
+    }
+
+    fn log_external_message(&self, payload: &serde_json::Value) {
+        let text = extract_content(payload);
+        let data_dir = self.config.session_store.data_dir();
+        let key = self.config.agent_id.bus_name();
+        append_log(&data_dir, &key, &LogEntry::User { text, timestamp: now_utc() });
     }
 
     async fn dispatch_completion(&mut self, content: &str, is_task: bool) {
