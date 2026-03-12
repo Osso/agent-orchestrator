@@ -35,7 +35,10 @@ pub struct RelayResponse {
 
 /// Returns the canonical path for the relay Unix socket.
 pub fn relay_socket_path(project: &str) -> PathBuf {
-    home_dir().join(".claude/orchestrator").join(project).join("relay.sock")
+    home_dir()
+        .join(".claude/orchestrator")
+        .join(project)
+        .join("relay.sock")
 }
 
 fn home_dir() -> PathBuf {
@@ -153,8 +156,16 @@ async fn handle_tool_call(
 
     let result = dispatch_tool(mailbox, db, agent_name, req).await;
     match result {
-        Ok(val) => RelayResponse { id: req.id.clone(), result: Some(val), error: None },
-        Err(msg) => RelayResponse { id: req.id.clone(), result: None, error: Some(msg) },
+        Ok(val) => RelayResponse {
+            id: req.id.clone(),
+            result: Some(val),
+            error: None,
+        },
+        Err(msg) => RelayResponse {
+            id: req.id.clone(),
+            result: None,
+            error: Some(msg),
+        },
     }
 }
 
@@ -249,7 +260,10 @@ mod tests {
     #[test]
     fn role_from_agent_name_known_names() {
         assert_eq!(role_from_agent_name("merger"), Some(AgentRole::Merger));
-        assert_eq!(role_from_agent_name("task-lt-abc"), Some(AgentRole::TaskAgent));
+        assert_eq!(
+            role_from_agent_name("task-lt-abc"),
+            Some(AgentRole::TaskAgent)
+        );
         assert_eq!(role_from_agent_name("task-123"), Some(AgentRole::TaskAgent));
     }
 
@@ -312,7 +326,9 @@ mod tests {
             server.run(&path_clone).await.ok()
         });
         for _ in 0..20 {
-            if socket_path.exists() { break; }
+            if socket_path.exists() {
+                break;
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
@@ -322,16 +338,18 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixStream;
 
-        let socket_path = std::path::PathBuf::from(
-            format!("/tmp/test-relay-{}.sock", uuid::Uuid::new_v4()),
-        );
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/test-relay-{}.sock", uuid::Uuid::new_v4()));
         spawn_relay_server(&socket_path).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
-        writer.write_all(b"{\"agent\": \"task-lt-test\"}\n").await.unwrap();
+        writer
+            .write_all(b"{\"agent\": \"task-lt-test\"}\n")
+            .await
+            .unwrap();
 
         let req = serde_json::json!({
             "id": "t1", "from": "task-lt-test",

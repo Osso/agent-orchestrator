@@ -28,7 +28,11 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(db: Arc<Database>, mailbox: Mailbox) -> Self {
-        Self { db, mailbox, active_tasks: HashMap::new() }
+        Self {
+            db,
+            mailbox,
+            active_tasks: HashMap::new(),
+        }
     }
 
     /// Agent signals task complete → set in_review. Returns task_id for review.
@@ -43,7 +47,11 @@ impl Dispatcher {
             return false;
         }
         // Add agent output as comment
-        let short = if content.len() > 2000 { &content[..2000] } else { content };
+        let short = if content.len() > 2000 {
+            &content[..2000]
+        } else {
+            content
+        };
         let _ = self.db.add_comment(task_id, "agent", short).await;
         self.transition_to_review(task_id).await;
         true
@@ -83,9 +91,17 @@ impl Dispatcher {
                 task_id,
                 self.active_tasks[&task_id].last_activity.elapsed(),
             );
-            let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
+            let updates = TaskUpdates {
+                status: Some("ready"),
+                ..Default::default()
+            };
             if let Err(e) = self.db.update_task(&task_id, updates, "runtime").await {
-                tracing::error!("Failed to reclaim task {} from {}: {}", task_id, agent_name, e);
+                tracing::error!(
+                    "Failed to reclaim task {} from {}: {}",
+                    task_id,
+                    agent_name,
+                    e
+                );
             }
             let _ = self.db.clear_assignee(&task_id, "runtime").await;
             self.active_tasks.remove(&task_id);
@@ -128,19 +144,25 @@ impl Dispatcher {
             tracing::warn!("Failed to claim task {} for {}: {}", task_id, agent_name, e);
             return false;
         }
-        self.active_tasks.insert(task_id.to_string(), TaskAssignment {
-            agent_name: agent_name.to_string(),
-            last_activity: Instant::now(),
-        });
+        self.active_tasks.insert(
+            task_id.to_string(),
+            TaskAssignment {
+                agent_name: agent_name.to_string(),
+                last_activity: Instant::now(),
+            },
+        );
         true
     }
 
     /// Register a resumed task agent (from a previous session).
     pub fn register_active(&mut self, task_id: String, agent_name: String) {
-        self.active_tasks.insert(task_id, TaskAssignment {
-            agent_name,
-            last_activity: Instant::now(),
-        });
+        self.active_tasks.insert(
+            task_id,
+            TaskAssignment {
+                agent_name,
+                last_activity: Instant::now(),
+            },
+        );
     }
 
     /// Remove a task from tracking (e.g. when agent is aborted).
@@ -152,7 +174,10 @@ impl Dispatcher {
 
     /// Send a message via the dispatcher's mailbox.
     pub fn notify(&self, to: &str, kind: &str, payload: serde_json::Value) -> Result<(), String> {
-        self.mailbox.send(to, kind, payload).map(|_| ()).map_err(|e| e.to_string())
+        self.mailbox
+            .send(to, kind, payload)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Look up task_id from agent bus name.
@@ -181,8 +206,15 @@ impl Dispatcher {
             if self.active_tasks.contains_key(&task.id) {
                 continue;
             }
-            tracing::warn!("Reclaiming orphaned task {} (assignee: {:?})", task.id, task.assignee);
-            let updates = TaskUpdates { status: Some("ready"), ..Default::default() };
+            tracing::warn!(
+                "Reclaiming orphaned task {} (assignee: {:?})",
+                task.id,
+                task.assignee
+            );
+            let updates = TaskUpdates {
+                status: Some("ready"),
+                ..Default::default()
+            };
             if let Err(e) = self.db.update_task(&task.id, updates, "runtime").await {
                 tracing::error!("Failed to reclaim task {}: {}", task.id, e);
                 continue;
@@ -214,7 +246,12 @@ impl Dispatcher {
             if task.assignee.is_none() {
                 continue;
             }
-            tracing::warn!("Clearing stale assignee on {} task {} ({:?})", status, task.id, task.assignee);
+            tracing::warn!(
+                "Clearing stale assignee on {} task {} ({:?})",
+                status,
+                task.id,
+                task.assignee
+            );
             if let Err(e) = self.db.clear_assignee(&task.id, "runtime").await {
                 tracing::error!("Failed to clear assignee on task {}: {}", task.id, e);
             } else {
@@ -252,14 +289,20 @@ impl Dispatcher {
     }
 
     async fn transition_to_review(&self, task_id: &str) {
-        let updates = TaskUpdates { status: Some("in_review"), ..Default::default() };
+        let updates = TaskUpdates {
+            status: Some("in_review"),
+            ..Default::default()
+        };
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {
             tracing::error!("Failed to set task {} in_review: {}", task_id, e);
         }
     }
 
     async fn transition_to_needs_info(&self, task_id: &str, question: &str) {
-        let updates = TaskUpdates { status: Some("needs_info"), ..Default::default() };
+        let updates = TaskUpdates {
+            status: Some("needs_info"),
+            ..Default::default()
+        };
         if let Err(e) = self.db.update_task(task_id, updates, "runtime").await {
             tracing::error!("Failed to set task {} needs_info: {}", task_id, e);
         }

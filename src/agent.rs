@@ -11,14 +11,12 @@ use agent_bus::{Bus, Mailbox};
 use anyhow::Result;
 use async_trait::async_trait;
 use llm_sdk::claude::Claude;
-use llm_sdk::session::{append_log, now_utc, LogEntry, Session, SessionStore};
+use llm_sdk::session::{LogEntry, Session, SessionStore, append_log, now_utc};
 
 use crate::types::{AgentId, AgentRole};
 
 /// Tools blocked for non-task agents (currently unused, all agents get full tools).
-const DISALLOWED_TOOLS: &[&str] = &[
-    "Bash", "Write", "Edit", "NotebookEdit", "Agent",
-];
+const DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit", "Agent"];
 
 /// Which backend to use for completions.
 #[derive(Clone, Debug)]
@@ -99,7 +97,9 @@ impl Completer for CodexCompleter {
                 timestamp: llm_sdk::session::now_utc(),
             });
         }
-        let observer = LogTurnObserver { log: self.log.clone() };
+        let observer = LogTurnObserver {
+            log: self.log.clone(),
+        };
         self.codex.complete_observed(prompt, observer).await
     }
 }
@@ -195,7 +195,12 @@ impl Agent {
     }
 
     async fn handle_bus_message(&mut self, msg: agent_bus::BusMessage) {
-        tracing::info!("Agent {} received '{}' from {}", self.config.agent_id, msg.kind, msg.from);
+        tracing::info!(
+            "Agent {} received '{}' from {}",
+            self.config.agent_id,
+            msg.kind,
+            msg.from
+        );
         let is_task = msg.kind == "task_assignment";
         if is_task {
             self.reset_completer_for_task();
@@ -205,7 +210,12 @@ impl Agent {
             self.log_external_message(&msg.payload);
         }
         let content = format_prompt(&msg, is_task);
-        tracing::info!("Agent {} processing '{}' ({} bytes)", self.config.agent_id, msg.kind, content.len());
+        tracing::info!(
+            "Agent {} processing '{}' ({} bytes)",
+            self.config.agent_id,
+            msg.kind,
+            content.len()
+        );
         self.dispatch_completion(&content, is_task).await;
     }
 
@@ -213,7 +223,14 @@ impl Agent {
         let text = extract_content(payload);
         let data_dir = self.config.session_store.data_dir();
         let key = self.config.agent_id.bus_name();
-        append_log(&data_dir, &key, &LogEntry::User { text, timestamp: now_utc() });
+        append_log(
+            &data_dir,
+            &key,
+            &LogEntry::User {
+                text,
+                timestamp: now_utc(),
+            },
+        );
     }
 
     async fn dispatch_completion(&mut self, content: &str, is_task: bool) {
@@ -222,7 +239,11 @@ impl Agent {
                 self.auto_report_completion(&output.text);
             }
             Ok(output) => {
-                tracing::info!("Agent {} responded ({} bytes)", self.config.agent_id, output.text.len());
+                tracing::info!(
+                    "Agent {} responded ({} bytes)",
+                    self.config.agent_id,
+                    output.text.len()
+                );
             }
             Err(e) if is_task => {
                 tracing::error!("Agent {} completion failed: {}", self.config.agent_id, e);
@@ -252,7 +273,12 @@ impl Agent {
             return;
         };
         match ctx {
-            FreshCtx::Claude { store, key, system_prompt, base_claude } => {
+            FreshCtx::Claude {
+                store,
+                key,
+                system_prompt,
+                base_claude,
+            } => {
                 store.remove(key);
                 let session = store.session(key).system_prompt(system_prompt);
                 self.completer = Box::new(SessionCompleter {
@@ -260,7 +286,11 @@ impl Agent {
                     claude: *base_claude.clone(),
                 });
             }
-            FreshCtx::OpenRouter { store, key, openrouter } => {
+            FreshCtx::OpenRouter {
+                store,
+                key,
+                openrouter,
+            } => {
                 store.remove_message_log(key);
                 let log = store.message_log(key);
                 self.completer = Box::new(OpenRouterCompleter {
@@ -313,9 +343,7 @@ fn build_completer(
         BackendKind::OpenRouter { model, api_key } => {
             build_openrouter_completer(config, bus_name, model, api_key)
         }
-        BackendKind::Codex { model } => {
-            build_codex_completer(config, bus_name, model)
-        }
+        BackendKind::Codex { model } => build_codex_completer(config, bus_name, model),
     }
 }
 
@@ -331,8 +359,8 @@ fn build_claude_completer(
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .command_prefix(config.sandbox_prefix.clone());
     if !role_has_tools(config.agent_id.role) {
-        base_claude = base_claude
-            .disallowed_tools(DISALLOWED_TOOLS.iter().map(|s| s.to_string()).collect());
+        base_claude =
+            base_claude.disallowed_tools(DISALLOWED_TOOLS.iter().map(|s| s.to_string()).collect());
     }
     if let Some(ref cfg) = config.mcp_config {
         base_claude = base_claude.mcp_config(cfg);
@@ -402,8 +430,7 @@ fn build_codex_completer(
     bus_name: &str,
     model: &str,
 ) -> Result<(Box<dyn Completer>, Option<FreshCtx>)> {
-    let mut builder = llm_sdk::codex::Codex::new(model)
-        .system_prompt(&config.system_prompt);
+    let mut builder = llm_sdk::codex::Codex::new(model).system_prompt(&config.system_prompt);
     let tools = build_openrouter_tools(config, bus_name);
     let tool_names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
     tracing::info!("Codex tools for {}: {:?}", bus_name, tool_names);

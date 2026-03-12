@@ -12,7 +12,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -37,7 +37,6 @@ struct ListTasksParams {
     /// Filter by assignee
     assignee: Option<String>,
 }
-
 
 struct BufStream {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -98,7 +97,9 @@ struct OrchestratorMcp {
 
 #[tool_router]
 impl OrchestratorMcp {
-    #[tool(description = "Send a message to the runtime or another agent. Use kind 'task_complete'/'task_blocked' for status updates.")]
+    #[tool(
+        description = "Send a message to the runtime or another agent. Use kind 'task_complete'/'task_blocked' for status updates."
+    )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> String {
         relay_call(&self.client, "send_message", &params, "Message sent").await
     }
@@ -124,7 +125,12 @@ impl ServerHandler for OrchestratorMcp {
     }
 }
 
-async fn relay_call<T: Serialize>(client: &RelayClient, tool: &str, params: &T, ok_msg: &str) -> String {
+async fn relay_call<T: Serialize>(
+    client: &RelayClient,
+    tool: &str,
+    params: &T,
+    ok_msg: &str,
+) -> String {
     match serde_json::to_value(params) {
         Ok(args) => match client.call(tool, args).await {
             Ok(_) => ok_msg.to_string(),

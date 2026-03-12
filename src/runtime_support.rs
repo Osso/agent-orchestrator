@@ -21,8 +21,14 @@ impl CommandTimers {
         let now = tokio::time::Instant::now();
         Ok(Self {
             poll: tokio::time::interval_at(now + Duration::from_secs(10), Duration::from_secs(10)),
-            timeout: tokio::time::interval_at(now + Duration::from_secs(60), Duration::from_secs(60)),
-            watchdog: tokio::time::interval_at(now + Duration::from_secs(30), Duration::from_secs(600)),
+            timeout: tokio::time::interval_at(
+                now + Duration::from_secs(60),
+                Duration::from_secs(60),
+            ),
+            watchdog: tokio::time::interval_at(
+                now + Duration::from_secs(30),
+                Duration::from_secs(600),
+            ),
             sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
             sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
         })
@@ -93,7 +99,11 @@ fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
                 let p = Path::new(gitdir.trim());
                 if let Some(parent) = p.parent().and_then(|p| p.parent()) {
                     if parent.is_dir() {
-                        return Some(parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()));
+                        return Some(
+                            parent
+                                .canonicalize()
+                                .unwrap_or_else(|_| parent.to_path_buf()),
+                        );
                     }
                 }
             }

@@ -8,6 +8,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+const SHARED_DEPENDENCY_DIRS: &[&str] = &["vendor", "node_modules"];
+
 pub struct WorktreeConfig {
     pub project_dir: PathBuf,
     pub agent_name: String,
@@ -51,7 +53,10 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf, resume: bool) -> Opt
         return None;
     }
     if resume {
-        tracing::info!("Resuming worktree at {} (preserving branch state)", path.display());
+        tracing::info!(
+            "Resuming worktree at {} (preserving branch state)",
+            path.display()
+        );
         return Some(path.clone());
     }
     tracing::info!("Reusing existing worktree at {}", path.display());
@@ -70,6 +75,7 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf, resume: bool) -> Opt
         .args(["reset", "--hard", "HEAD"])
         .current_dir(path)
         .status();
+    link_shared_dependency_dirs(&cfg.project_dir, path);
     Some(path.clone())
 }
 
@@ -77,14 +83,51 @@ fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
     let branch = cfg.branch();
     let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
     let status = Command::new("git")
-        .args(["worktree", "add", "--force", "-B", &branch, path_str, &cfg.target_branch])
+        .args([
+            "worktree",
+            "add",
+            "--force",
+            "-B",
+            &branch,
+            path_str,
+            &cfg.target_branch,
+        ])
         .current_dir(&cfg.project_dir)
         .status()
         .context("failed to run git worktree add")?;
     if !status.success() {
         anyhow::bail!("git worktree add failed with status {}", status);
     }
+    link_shared_dependency_dirs(&cfg.project_dir, path);
     Ok(path.clone())
+}
+
+pub fn link_shared_dependency_dirs(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
+    for name in SHARED_DEPENDENCY_DIRS {
+        let source = project_dir.join(name);
+        if !source.exists() {
+            continue;
+        }
+
+        let dest = worktree_path.join(name);
+        match std::fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.file_type().is_symlink() => continue,
+            Ok(_) => continue,
+            Err(_) => {}
+        }
+
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::os::unix::fs::symlink(&source, &dest) {
+                tracing::warn!(
+                    "Failed to link shared dependency dir {} into {}: {}",
+                    source.display(),
+                    worktree_path.display(),
+                    e
+                );
+            }
+        }
+    }
 }
 
 fn prune_stale_worktrees(project_dir: &std::path::Path) {

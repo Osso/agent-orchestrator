@@ -1,7 +1,7 @@
 use agent_orchestrator::agent::BackendKind;
 use agent_orchestrator::control;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -65,18 +65,35 @@ fn load_backend_config() -> BackendKind {
             return BackendKind::Claude;
         }
     };
-    let backend = table.get("backend").and_then(|v| v.as_str()).unwrap_or("claude");
+    let backend = table
+        .get("backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude");
     match backend {
         "codex" => {
-            let model = table.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-5.4");
-            BackendKind::Codex { model: model.to_string() }
+            let model = table
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gpt-5.4");
+            BackendKind::Codex {
+                model: model.to_string(),
+            }
         }
         "openrouter" => {
-            let model = table.get("model").and_then(|v| v.as_str()).unwrap_or("anthropic/claude-sonnet-4");
-            let api_key = table.get("api_key").and_then(|v| v.as_str()).map(String::from)
+            let model = table
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("anthropic/claude-sonnet-4");
+            let api_key = table
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .map(String::from)
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .unwrap_or_default();
-            BackendKind::OpenRouter { model: model.to_string(), api_key }
+            BackendKind::OpenRouter {
+                model: model.to_string(),
+                api_key,
+            }
         }
         _ => BackendKind::Claude,
     }
@@ -86,7 +103,8 @@ fn cmd_send(args: &[String]) -> Result<()> {
     let project = extract_named_arg(args, "--project")
         .ok_or_else(|| anyhow::anyhow!("--project required for send"))?;
     // Remaining positional args after removing binary, subcommand, --project, and its value
-    let positional: Vec<&String> = args.iter()
+    let positional: Vec<&String> = args
+        .iter()
         .enumerate()
         .filter(|(i, a)| {
             *i > 1 && *a != "--project" && {
@@ -100,7 +118,11 @@ fn cmd_send(args: &[String]) -> Result<()> {
         bail!("Usage: agent-orchestrator send --project <name> <to> <message>");
     }
     let to = positional[0];
-    let message: String = positional[1..].iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+    let message: String = positional[1..]
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     send_message(&project, to, &message)
 }
 
@@ -175,11 +197,17 @@ fn extract_named_arg(args: &[String], flag: &str) -> Option<String> {
 fn cmd_notify(args: &[String]) -> Result<()> {
     let project = extract_named_arg(args, "--project")
         .ok_or_else(|| anyhow::anyhow!("--project required for notify"))?;
-    let task_id = args.iter()
+    let task_id = args
+        .iter()
         .find(|a| *a != "--project" && *a != &project && *a != "notify" && *a != &args[0])
-        .ok_or_else(|| anyhow::anyhow!("Usage: agent-orchestrator notify --project <name> <task-id>"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("Usage: agent-orchestrator notify --project <name> <task-id>")
+        })?;
     let socket = control::control_socket_path();
-    let request = control::ControlRequest::NotifyTaskCreated { project, task_id: task_id.clone() };
+    let request = control::ControlRequest::NotifyTaskCreated {
+        project,
+        task_id: task_id.clone(),
+    };
     let response: control::ControlResponse = peercred_ipc::Client::call(&socket, &request)?;
     match response {
         control::ControlResponse::Ok => println!("Notified runtime about {}", task_id),
@@ -204,7 +232,10 @@ fn cmd_status(args: &[String]) -> Result<()> {
                     serde_json::json!({ "name": a.name, "role": a.role, "task_id": task_id })
                 })
                 .collect();
-            println!("{}", serde_json::json!({ "project": project, "agents": out }));
+            println!(
+                "{}",
+                serde_json::json!({ "project": project, "agents": out })
+            );
         }
         control::ControlResponse::Error { message } => bail!("Error: {message}"),
         _ => {}
@@ -213,7 +244,8 @@ fn cmd_status(args: &[String]) -> Result<()> {
 }
 
 fn cmd_scale(args: &[String]) -> Result<()> {
-    let max: u8 = args.iter()
+    let max: u8 = args
+        .iter()
         .nth(2)
         .ok_or_else(|| anyhow::anyhow!("Usage: agent-orchestrator scale <max>"))?
         .parse()

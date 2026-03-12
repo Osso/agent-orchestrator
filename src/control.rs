@@ -28,18 +28,36 @@ pub fn new_registry() -> ProjectRegistry {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ControlRequest {
-    SendMessage { project: String, to: String, content: String },
-    NotifyTaskCreated { project: String, task_id: String },
-    SetConcurrency { max: u8 },
-    Abort { project: String },
-    Status { project: String },
+    SendMessage {
+        project: String,
+        to: String,
+        content: String,
+    },
+    NotifyTaskCreated {
+        project: String,
+        task_id: String,
+    },
+    SetConcurrency {
+        max: u8,
+    },
+    Abort {
+        project: String,
+    },
+    Status {
+        project: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ControlResponse {
     Ok,
-    Error { message: String },
-    Status { agents: Vec<AgentStatus>, project: String },
+    Error {
+        message: String,
+    },
+    Status {
+        agents: Vec<AgentStatus>,
+        project: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -113,9 +131,11 @@ fn handle_request(
     shutdown_tx: &watch::Sender<bool>,
 ) -> ControlResponse {
     match request {
-        ControlRequest::SendMessage { project, to, content } => {
-            with_bus(registry, &project, |bus| send_to_agent(bus, &to, &content))
-        }
+        ControlRequest::SendMessage {
+            project,
+            to,
+            content,
+        } => with_bus(registry, &project, |bus| send_to_agent(bus, &to, &content)),
         ControlRequest::SetConcurrency { max } => {
             let max = (max as usize).clamp(1, 20);
             let prev = global_limits.max_concurrent.swap(max, Ordering::Relaxed);
@@ -124,15 +144,18 @@ fn handle_request(
         }
         ControlRequest::NotifyTaskCreated { project, task_id } => {
             with_bus(registry, &project, |bus| {
-                send_bus_message(bus, "runtime", "task_created", serde_json::json!({ "task_id": task_id }))
+                send_bus_message(
+                    bus,
+                    "runtime",
+                    "task_created",
+                    serde_json::json!({ "task_id": task_id }),
+                )
             })
         }
-        ControlRequest::Abort { project } => {
-            with_bus(registry, &project, |_bus| {
-                let _ = shutdown_tx.send(true);
-                ControlResponse::Ok
-            })
-        }
+        ControlRequest::Abort { project } => with_bus(registry, &project, |_bus| {
+            let _ = shutdown_tx.send(true);
+            ControlResponse::Ok
+        }),
         ControlRequest::Status { project } => {
             let guard = registry.read().unwrap();
             let agents = match guard.get(&project) {
@@ -167,10 +190,20 @@ fn with_bus(
 }
 
 fn send_to_agent(bus: &Bus, to: &str, content: &str) -> ControlResponse {
-    send_bus_message(bus, to, "external_message", serde_json::json!({ "content": content }))
+    send_bus_message(
+        bus,
+        to,
+        "external_message",
+        serde_json::json!({ "content": content }),
+    )
 }
 
-fn send_bus_message(bus: &Bus, to: &str, kind: &str, payload: serde_json::Value) -> ControlResponse {
+fn send_bus_message(
+    bus: &Bus,
+    to: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) -> ControlResponse {
     let name = format!("control-{}", std::process::id());
     let mailbox = match bus.register(&name) {
         Ok(m) => m,
@@ -178,13 +211,19 @@ fn send_bus_message(bus: &Bus, to: &str, kind: &str, payload: serde_json::Value)
             let name = format!("control-{}-{}", std::process::id(), timestamp_suffix());
             match bus.register(&name) {
                 Ok(m) => m,
-                Err(e) => return ControlResponse::Error { message: format!("Bus register: {e}") },
+                Err(e) => {
+                    return ControlResponse::Error {
+                        message: format!("Bus register: {e}"),
+                    };
+                }
             }
         }
     };
     match mailbox.send(to, kind, payload) {
         Ok(_) => ControlResponse::Ok,
-        Err(e) => ControlResponse::Error { message: format!("Send failed: {e}") },
+        Err(e) => ControlResponse::Error {
+            message: format!("Send failed: {e}"),
+        },
     }
 }
 

@@ -2,13 +2,15 @@
 
 mod support;
 
-use std::time::Duration;
 use agent_bus::Bus;
 use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools};
 use agent_orchestrator::bus_tools::bus_tools_for_role;
+use agent_orchestrator::config;
 use agent_orchestrator::runtime_support::resolve_sandbox;
 use agent_orchestrator::types::{AgentId, AgentRole};
-use support::{test_config, TestAgentBuilder, TestBench, assert_agent_registered};
+use agent_orchestrator::worktree::link_shared_dependency_dirs;
+use std::time::Duration;
+use support::{TestAgentBuilder, TestBench, assert_agent_registered, test_config};
 
 // ---------------------------------------------------------------------------
 // Agent ID and Role Tests
@@ -58,6 +60,30 @@ fn agent_config_sandbox_prefix() {
     assert_eq!(config.working_dir, "/tmp");
 }
 
+#[test]
+fn ensure_project_registered_persists_new_project() {
+    let temp = std::env::temp_dir().join(format!("orch-config-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let old = std::env::var_os("XDG_CONFIG_HOME");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &temp);
+    }
+
+    config::ensure_project_registered("gc-phpstan-fixes", "/tmp/gc-phpstan-fixes").unwrap();
+    let projects = config::load_config().unwrap();
+
+    assert_eq!(
+        projects.get("gc-phpstan-fixes").map(|p| p.dir.as_str()),
+        Some("/tmp/gc-phpstan-fixes")
+    );
+
+    match old {
+        Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
 // ---------------------------------------------------------------------------
 // Tool System Tests
 // ---------------------------------------------------------------------------
@@ -81,13 +107,21 @@ fn bus_tools_match_role_responsibilities() {
 
     let task_mailbox = std::sync::Arc::new(bus.register("test-task").unwrap());
     let task_tools = bus_tools_for_role(AgentRole::TaskAgent, task_mailbox);
-    let task_names: Vec<String> = task_tools.definitions().iter().map(|d| d.name.clone()).collect();
+    let task_names: Vec<String> = task_tools
+        .definitions()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
     assert!(task_names.contains(&"send_message".to_string()));
     assert_eq!(task_names.len(), 1);
 
     let merger_mailbox = std::sync::Arc::new(bus.register("test-merger").unwrap());
     let merger_tools = bus_tools_for_role(AgentRole::Merger, merger_mailbox);
-    let merger_names: Vec<String> = merger_tools.definitions().iter().map(|d| d.name.clone()).collect();
+    let merger_names: Vec<String> = merger_tools
+        .definitions()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
     assert!(merger_names.contains(&"send_message".to_string()));
     assert_eq!(merger_names.len(), 1);
 }
@@ -116,7 +150,10 @@ fn test_agent_builder_failure_modes() {
         .should_fail(true)
         .build(&bus);
 
-    assert!(agent.is_ok(), "Agent creation should succeed even with failure simulation");
+    assert!(
+        agent.is_ok(),
+        "Agent creation should succeed even with failure simulation"
+    );
     assert_agent_registered(&bus, "merger");
 }
 
@@ -199,7 +236,11 @@ async fn bash_tool_uses_worktree_cwd_without_sandbox() {
         arguments: r#"{"command": "cat cwd-marker.txt"}"#.into(),
     };
     let result = tool_set.execute(&call).await;
-    assert_eq!(result.trim(), "found", "Bash should run in the worktree dir, got: {result}");
+    assert_eq!(
+        result.trim(),
+        "found",
+        "Bash should run in the worktree dir, got: {result}"
+    );
 
     let _ = std::fs::remove_dir_all(&worktree);
 }
@@ -277,8 +318,7 @@ fn task_agent_gets_worktree_sandbox_when_worktree_succeeds() {
         .map(|(i, _)| i)
         .collect();
     let worktree_bound = bind_positions.iter().any(|&i| {
-        prefix.get(i + 1).map(|s| s.as_str())
-            == Some("/tmp/test-project/.worktrees/task-lt-abc")
+        prefix.get(i + 1).map(|s| s.as_str()) == Some("/tmp/test-project/.worktrees/task-lt-abc")
     });
     assert!(
         worktree_bound,
@@ -316,4 +356,28 @@ fn task_agent_no_sandbox_worktree_fails_uses_project_dir() {
 
     assert_eq!(working_dir, "/tmp/test-project");
     assert!(prefix.is_empty(), "No sandbox prefix without sandbox");
+}
+
+#[cfg(unix)]
+#[test]
+fn resumed_worktree_links_shared_vendor_dir() {
+    let root = std::env::temp_dir().join(format!("orch-worktree-test-{}", uuid::Uuid::new_v4()));
+    let project = root.join("project");
+    let worktree = project.join(".worktrees").join("task-test");
+    let vendor_bin = project.join("vendor").join("bin");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&vendor_bin).unwrap();
+    std::fs::write(vendor_bin.join("phpstan"), "#!/bin/sh\n").unwrap();
+
+    link_shared_dependency_dirs(&project, &worktree);
+    let linked = worktree.join("vendor");
+    let meta = std::fs::symlink_metadata(&linked).unwrap();
+
+    assert!(
+        meta.file_type().is_symlink(),
+        "vendor should be symlinked into resumed worktree"
+    );
+    assert_eq!(std::fs::read_link(&linked).unwrap(), project.join("vendor"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }

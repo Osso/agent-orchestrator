@@ -24,6 +24,8 @@ pub enum ReviewResult {
     Incomplete(String),
 }
 
+const REVIEW_COMMENT_MAX_CHARS: usize = 2000;
+
 /// Validate a pending task via the external architect daemon.
 pub async fn validate_task(
     project: &str,
@@ -65,7 +67,13 @@ pub async fn review_completion(
 }
 
 /// Run validation in background, update DB and notify via bus when done.
-pub fn spawn_validation(db: Arc<Database>, bus: Bus, project: String, cwd: String, task: llm_tasks::db::Task) {
+pub fn spawn_validation(
+    db: Arc<Database>,
+    bus: Bus,
+    project: String,
+    cwd: String,
+    task: llm_tasks::db::Task,
+) {
     let task_id = task.id.clone();
     tokio::spawn(async move {
         let desc = task.description.as_deref().unwrap_or("");
@@ -75,7 +83,15 @@ pub fn spawn_validation(db: Arc<Database>, bus: Bus, project: String, cwd: Strin
 }
 
 /// Run completion review in background, update DB and notify via bus.
-pub fn spawn_review(db: Arc<Database>, bus: Bus, project: String, cwd: String, task_id: String, dev_output: String, branch: String) {
+pub fn spawn_review(
+    db: Arc<Database>,
+    bus: Bus,
+    project: String,
+    cwd: String,
+    task_id: String,
+    dev_output: String,
+    branch: String,
+) {
     tokio::spawn(async move {
         let title = match db.get_task(&task_id).await {
             Ok(t) => t.title,
@@ -119,11 +135,30 @@ fn dispatch_validate(request: Request) -> Result<ValidateResult, String> {
     }
 }
 
-async fn apply_validation_result(db: &Database, bus: &Bus, task_id: &str, result: Result<ValidateResult, String>) {
-    // Never override pending_delete — close the task immediately
-    if matches!(db.get_task(task_id).await, Ok(t) if t.status == "pending_delete") {
+async fn apply_validation_result(
+    db: &Database,
+    bus: &Bus,
+    task_id: &str,
+    result: Result<ValidateResult, String>,
+) {
+    let task = match db.get_task(task_id).await {
+        Ok(task) => task,
+        Err(e) => {
+            tracing::error!("Failed to load task {task_id} before applying validation: {e}");
+            return;
+        }
+    };
+
+    if task.status == "pending_delete" {
         tracing::info!("Task {task_id} is pending_delete, closing instead of applying validation");
         let _ = db.close_task(task_id, "runtime").await;
+        return;
+    }
+    if task.status != "pending" {
+        tracing::info!(
+            "Task {task_id} is {}, ignoring stale validation result",
+            task.status
+        );
         return;
     }
     match result {
@@ -171,29 +206,41 @@ async fn apply_review_result(
 }
 
 async fn approve_task(db: &Database, task_id: &str, verdict: &str) {
-    let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+    let updates = llm_tasks::db::TaskUpdates {
+        status: Some("ready"),
+        ..Default::default()
+    };
     let _ = db.update_task(task_id, updates, "architect").await;
-    let short = truncate(verdict, 200);
-    let _ = db.add_comment(task_id, "architect", &format!("Approved: {short}")).await;
+    let short = truncate(verdict, REVIEW_COMMENT_MAX_CHARS);
+    let _ = db
+        .add_comment(task_id, "architect", &format!("Approved: {short}"))
+        .await;
     tracing::info!("Task {task_id} approved by external architect");
 }
 
 async fn approve_task_fallback(db: &Database, task_id: &str) {
-    let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+    let updates = llm_tasks::db::TaskUpdates {
+        status: Some("ready"),
+        ..Default::default()
+    };
     let _ = db.update_task(task_id, updates, "runtime").await;
     tracing::warn!("Auto-approved task {task_id} due to architect error");
 }
 
 async fn reject_task(db: &Database, task_id: &str, verdict: &str) {
-    let short = truncate(verdict, 200);
-    let _ = db.add_comment(task_id, "architect", &format!("Rejected: {short}")).await;
+    let short = truncate(verdict, REVIEW_COMMENT_MAX_CHARS);
+    let _ = db
+        .add_comment(task_id, "architect", &format!("Rejected: {short}"))
+        .await;
     tracing::warn!("Task {task_id} rejected by external architect");
 }
 
 async fn complete_task(db: &Database, bus: &Bus, task_id: &str, _title: &str, assessment: &str) {
     let _ = db.close_task(task_id, "reviewer").await;
-    let short = truncate(assessment, 200);
-    let _ = db.add_comment(task_id, "reviewer", &format!("Completed: {short}")).await;
+    let short = truncate(assessment, REVIEW_COMMENT_MAX_CHARS);
+    let _ = db
+        .add_comment(task_id, "reviewer", &format!("Completed: {short}"))
+        .await;
     tracing::info!("Task {task_id} completed (review passed)");
     notify_bus(bus, task_id, "runtime", "task_done");
 }
@@ -205,11 +252,16 @@ async fn complete_task_fallback(db: &Database, bus: &Bus, task_id: &str, _title:
 }
 
 async fn reject_completion(db: &Database, bus: &Bus, task_id: &str, assessment: &str) {
-    let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+    let updates = llm_tasks::db::TaskUpdates {
+        status: Some("ready"),
+        ..Default::default()
+    };
     let _ = db.update_task(task_id, updates, "reviewer").await;
     let _ = db.clear_assignee(task_id, "reviewer").await;
-    let short = truncate(assessment, 200);
-    let _ = db.add_comment(task_id, "reviewer", &format!("Rejected: {short}")).await;
+    let short = truncate(assessment, REVIEW_COMMENT_MAX_CHARS);
+    let _ = db
+        .add_comment(task_id, "reviewer", &format!("Rejected: {short}"))
+        .await;
     tracing::warn!("Task {task_id} completion rejected");
     notify_bus(bus, task_id, "runtime", "task_ready");
 }
@@ -246,9 +298,7 @@ async fn get_branch_diff(cwd: &str, branch: &str) -> String {
         .output()
         .await;
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         Ok(o) => {
             tracing::warn!("git diff failed: {}", String::from_utf8_lossy(&o.stderr));
             String::new()
@@ -340,7 +390,12 @@ mod tests {
     fn build_validate_request_with_description() {
         let req = build_validate_request("proj", "Fix bug", "null pointer in parser", "/tmp");
         match req {
-            Request::Validate { project, goal, tasks, cwd } => {
+            Request::Validate {
+                project,
+                goal,
+                tasks,
+                cwd,
+            } => {
                 assert_eq!(project, "proj");
                 assert_eq!(goal, "Fix bug");
                 assert_eq!(tasks, vec!["Fix bug: null pointer in parser"]);

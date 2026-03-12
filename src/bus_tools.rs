@@ -60,7 +60,12 @@ impl ToolDef for SendMessageTool {
                 "Message sent".into()
             }
             Err(e) => {
-                tracing::warn!("bus_tool send_message failed: -> {} kind={}: {}", to, kind, e);
+                tracing::warn!(
+                    "bus_tool send_message failed: -> {} kind={}: {}",
+                    to,
+                    kind,
+                    e
+                );
                 format!("Send failed: {e}")
             }
         }

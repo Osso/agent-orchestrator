@@ -3,10 +3,10 @@
 
 mod support;
 
-use std::time::Duration;
 use agent_bus::Bus;
 use agent_orchestrator::types::AgentRole;
-use support::{test_runtime, TestScenario};
+use std::time::Duration;
+use support::{TestScenario, test_runtime};
 
 #[tokio::test]
 async fn test_task_agent_workflow() {
@@ -59,9 +59,7 @@ async fn test_concurrent_task_agents() {
         status: Some("ready"),
         ..Default::default()
     };
-    db.update_task(&task1.id, updates1, "test")
-        .await
-        .unwrap();
+    db.update_task(&task1.id, updates1, "test").await.unwrap();
     let updates2 = llm_tasks::db::TaskUpdates {
         status: Some("ready"),
         ..Default::default()

@@ -11,9 +11,10 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
+use crate::config;
 use crate::control;
 
 // --- Param types ---
@@ -108,7 +109,11 @@ struct TasksMcp {
 impl TasksMcp {
     #[tool(description = "List tasks. Optionally filter by status or assignee.")]
     async fn list_tasks(&self, Parameters(p): Parameters<ListTasksParams>) -> String {
-        match self.db.list_tasks(p.status.as_deref(), p.assignee.as_deref()).await {
+        match self
+            .db
+            .list_tasks(p.status.as_deref(), p.assignee.as_deref())
+            .await
+        {
             Ok(tasks) => to_json(&tasks),
             Err(e) => err(e),
         }
@@ -123,7 +128,11 @@ impl TasksMcp {
         let events = self.db.get_events(&p.id).await.unwrap_or_default();
         let comments = self.db.get_comments(&p.id).await.unwrap_or_default();
         let deps = self.db.get_dependencies(&p.id).await.unwrap_or_default();
-        let blocked_by = self.db.get_reverse_dependencies(&p.id).await.unwrap_or_default();
+        let blocked_by = self
+            .db
+            .get_reverse_dependencies(&p.id)
+            .await
+            .unwrap_or_default();
         to_json(&serde_json::json!({
             "task": task,
             "events": events,
@@ -133,10 +142,22 @@ impl TasksMcp {
         }))
     }
 
-    #[tool(description = "Add a new task. Auto-dispatches to an idle developer if the orchestrator is running.")]
+    #[tool(
+        description = "Add a new task. Auto-dispatches to an idle developer if the orchestrator is running."
+    )]
     async fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> String {
         let branch = p.target_branch.unwrap_or_else(detect_current_branch);
-        match self.db.create_task_with_branch(&p.title, p.description.as_deref(), p.priority.unwrap_or(0), "user", Some(&branch)).await {
+        match self
+            .db
+            .create_task_with_branch(
+                &p.title,
+                p.description.as_deref(),
+                p.priority.unwrap_or(0),
+                "user",
+                Some(&branch),
+            )
+            .await
+        {
             Ok(task) => {
                 notify_runtime(&self.project, &task.id);
                 to_json(&task)
@@ -145,7 +166,9 @@ impl TasksMcp {
         }
     }
 
-    #[tool(description = "Update a task's status, title, description, or priority. Use status 'pending_delete' to mark for safe deletion by the orchestrator.")]
+    #[tool(
+        description = "Update a task's status, title, description, or priority. Use status 'pending_delete' to mark for safe deletion by the orchestrator."
+    )]
     async fn update_task(&self, Parameters(p): Parameters<UpdateTaskParams>) -> String {
         let updates = TaskUpdates {
             status: p.status.as_deref(),
@@ -169,7 +192,9 @@ impl TasksMcp {
         }
     }
 
-    #[tool(description = "Delete a task. Immediate if pending/done/pending_delete, otherwise sets to 'pending_delete' for the orchestrator to clean up.")]
+    #[tool(
+        description = "Delete a task. Immediate if pending/done/pending_delete, otherwise sets to 'pending_delete' for the orchestrator to clean up."
+    )]
     async fn delete_task(&self, Parameters(p): Parameters<DeleteTaskParams>) -> String {
         let task = match self.db.get_task(&p.id).await {
             Ok(t) => t,
@@ -181,7 +206,10 @@ impl TasksMcp {
                 Err(e) => err(e),
             }
         } else {
-            let updates = TaskUpdates { status: Some("pending_delete"), ..Default::default() };
+            let updates = TaskUpdates {
+                status: Some("pending_delete"),
+                ..Default::default()
+            };
             match self.db.update_task(&p.id, updates, "user").await {
                 Ok(()) => format!("Marked as pending_delete (currently {})", task.status),
                 Err(e) => err(e),
@@ -192,7 +220,11 @@ impl TasksMcp {
     #[tool(description = "Add a dependency: task_id is blocked by depends_on.")]
     async fn add_dependency(&self, Parameters(p): Parameters<DependencyParams>) -> String {
         let dep_type = p.dep_type.as_deref().unwrap_or("blocks");
-        match self.db.add_dependency(&p.task_id, &p.depends_on, dep_type).await {
+        match self
+            .db
+            .add_dependency(&p.task_id, &p.depends_on, dep_type)
+            .await
+        {
             Ok(()) => "Dependency added".to_string(),
             Err(e) => err(e),
         }
@@ -214,14 +246,17 @@ impl TasksMcp {
         }
     }
 
-    #[tool(description = "Scale the global maximum number of parallel task agents (1-20) across all projects. Requires a running orchestrator.")]
+    #[tool(
+        description = "Scale the global maximum number of parallel task agents (1-20) across all projects. Requires a running orchestrator."
+    )]
     async fn set_concurrency(&self, Parameters(p): Parameters<SetConcurrencyParams>) -> String {
         let max = p.max.clamp(1, 20);
         let socket_path = control::control_socket_path();
         let req = control::ControlRequest::SetConcurrency { max };
         match tokio::task::spawn_blocking(move || {
             peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
-                &socket_path, &req,
+                &socket_path,
+                &req,
             )
         })
         .await
@@ -274,7 +309,11 @@ fn detect_current_branch() -> String {
         .filter(|o| o.status.success())
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() || s == "HEAD" { None } else { Some(s) }
+            if s.is_empty() || s == "HEAD" {
+                None
+            } else {
+                Some(s)
+            }
         })
         .unwrap_or_else(|| "master".to_string())
 }
@@ -283,13 +322,26 @@ fn detect_current_branch() -> String {
 /// Silently fails if no orchestrator is running.
 fn notify_runtime(project: &str, task_id: &str) {
     let socket_path = control::control_socket_path();
-    let req = control::ControlRequest::NotifyTaskCreated { project: project.to_string(), task_id: task_id.to_string() };
+    let req = control::ControlRequest::NotifyTaskCreated {
+        project: project.to_string(),
+        task_id: task_id.to_string(),
+    };
     let _ = peercred_ipc::Client::call::<_, control::ControlRequest, control::ControlResponse>(
-        &socket_path, &req,
+        &socket_path,
+        &req,
     );
 }
 
 pub async fn run(db_path: &std::path::Path, project: &str) -> Result<()> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.to_string_lossy().into_owned();
+        match config::ensure_project_registered(project, &cwd) {
+            Ok(true) => tracing::info!("Registered project '{}' at {}", project, cwd),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Failed to register project '{}': {}", project, e),
+        }
+    }
+
     let db = Database::open(db_path).await?;
     let service = TasksMcp {
         db: Arc::new(db),

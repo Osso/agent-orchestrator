@@ -28,7 +28,10 @@ impl OrchestratorRuntime {
                 return;
             }
         };
-        tracing::info!("Resuming {} in_progress tasks from previous session", tasks.len());
+        tracing::info!(
+            "Resuming {} in_progress tasks from previous session",
+            tasks.len()
+        );
         for task in &tasks {
             self.resume_one_task(task).await;
         }
@@ -52,7 +55,10 @@ impl OrchestratorRuntime {
     }
 
     async fn reset_task_to_ready(&self, task_id: &str) {
-        let updates = llm_tasks::db::TaskUpdates { status: Some("ready"), ..Default::default() };
+        let updates = llm_tasks::db::TaskUpdates {
+            status: Some("ready"),
+            ..Default::default()
+        };
         let _ = self.db.update_task(task_id, updates, "runtime").await;
         let _ = self.db.clear_assignee(task_id, "runtime").await;
     }
@@ -66,17 +72,29 @@ impl OrchestratorRuntime {
         let config = self.resume_agent_config(agent_id, working_dir, sandbox_prefix);
 
         self.spawn_agent_with_config(config)?;
-        self.global_limits.active_agents.fetch_add(1, Ordering::Relaxed);
-        self.dispatcher.register_active(task.id.clone(), bus_name.to_string());
+        self.global_limits
+            .active_agents
+            .fetch_add(1, Ordering::Relaxed);
+        self.dispatcher
+            .register_active(task.id.clone(), bus_name.to_string());
         let payload = serde_json::json!({"content": prompt, "task_id": task.id});
         if let Err(e) = self.dispatcher.notify(bus_name, "task_assignment", payload) {
             tracing::error!("Failed to send resume assignment to {}: {}", bus_name, e);
         }
-        tracing::info!("Resumed {} on task {} (diff: {} bytes)", bus_name, task.id, diff.len());
+        tracing::info!(
+            "Resumed {} on task {} (diff: {} bytes)",
+            bus_name,
+            task.id,
+            diff.len()
+        );
         Ok(())
     }
 
-    fn resume_worktree(&self, bus_name: &str, target_branch: &str) -> Result<(String, Vec<String>, String)> {
+    fn resume_worktree(
+        &self,
+        bus_name: &str,
+        target_branch: &str,
+    ) -> Result<(String, Vec<String>, String)> {
         let project_path = PathBuf::from(&self.working_dir);
         let wt_cfg = WorktreeConfig {
             project_dir: project_path.clone(),
@@ -86,7 +104,12 @@ impl OrchestratorRuntime {
         let wt_path = worktree::create_or_resume_worktree(&wt_cfg)?;
         let diff = worktree_diff(&wt_path, target_branch);
         let use_sandbox = !self.no_sandbox && llm_sdk::sandbox::is_available();
-        let (wd, sp) = support::resolve_sandbox(AgentRole::TaskAgent, &project_path, Ok(wt_path), use_sandbox);
+        let (wd, sp) = support::resolve_sandbox(
+            AgentRole::TaskAgent,
+            &project_path,
+            Ok(wt_path),
+            use_sandbox,
+        );
         Ok((wd, sp, diff))
     }
 
@@ -135,8 +158,15 @@ fn build_task_resume_prompt(task: &llm_tasks::db::Task, bus_name: &str, diff: &s
     let diff_section = if diff.is_empty() {
         "No changes were committed yet on this branch.".to_string()
     } else {
-        let d = if diff.len() > 4000 { &diff[..4000] } else { diff };
-        format!("## Work already done (git diff {target} --stat)\n\n```\n{}\n```", d)
+        let d = if diff.len() > 4000 {
+            &diff[..4000]
+        } else {
+            diff
+        };
+        format!(
+            "## Work already done (git diff {target} --stat)\n\n```\n{}\n```",
+            d
+        )
     };
     format!(
         "## RESUMING Task {id}\n\n{title}\n\n{desc}\n\n\
@@ -145,6 +175,7 @@ fn build_task_resume_prompt(task: &llm_tasks::db::Task, bus_name: &str, diff: &s
          {diff_section}\n\n\
          Review the existing changes, then continue where the previous session left off. \
          Commit your changes on branch `{branch}`.",
-        id = task.id, title = task.title,
+        id = task.id,
+        title = task.title,
     )
 }

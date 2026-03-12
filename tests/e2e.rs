@@ -4,10 +4,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use agent_bus::Bus;
-use agent_orchestrator::agent::{permission_mode_for_role, role_has_tools, Agent};
+use agent_orchestrator::agent::{Agent, permission_mode_for_role, role_has_tools};
 use agent_orchestrator::bus_tools::bus_tools_for_role;
 use agent_orchestrator::types::AgentRole;
-use support::{test_config, test_runtime, FakeCompleter};
+use support::{FakeCompleter, test_config, test_runtime};
 
 // ---------------------------------------------------------------------------
 // Agent-level tests
@@ -31,10 +31,18 @@ async fn agent_processes_bus_messages() {
     let handle = tokio::spawn(agent.run());
 
     sender
-        .send(&bus_name_clone, "task", serde_json::json!({"content": "first task"}))
+        .send(
+            &bus_name_clone,
+            "task",
+            serde_json::json!({"content": "first task"}),
+        )
         .unwrap();
     sender
-        .send(&bus_name_clone, "task", serde_json::json!({"content": "second task"}))
+        .send(
+            &bus_name_clone,
+            "task",
+            serde_json::json!({"content": "second task"}),
+        )
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -63,8 +71,14 @@ fn role_has_tools_for_task_agent_and_merger() {
 
 #[test]
 fn permission_modes_match_roles() {
-    assert_eq!(permission_mode_for_role(AgentRole::TaskAgent), "bypassPermissions");
-    assert_eq!(permission_mode_for_role(AgentRole::Merger), "bypassPermissions");
+    assert_eq!(
+        permission_mode_for_role(AgentRole::TaskAgent),
+        "bypassPermissions"
+    );
+    assert_eq!(
+        permission_mode_for_role(AgentRole::Merger),
+        "bypassPermissions"
+    );
 }
 
 #[test]
@@ -95,16 +109,23 @@ async fn task_created_spawns_validation() {
     let (mut rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
 
     let db = rt.db();
-    let task = db.create_task("test task", Some("description"), 1, "test").await.unwrap();
+    let task = db
+        .create_task("test task", Some("description"), 1, "test")
+        .await
+        .unwrap();
 
     let payload = serde_json::json!({"task_id": task.id});
-    rt.handle_message("task_created", &payload, "external").await;
+    rt.handle_message("task_created", &payload, "external")
+        .await;
 
     // Give the background validation task time to run and auto-approve
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let t = db.get_task(&task.id).await.unwrap();
-    assert_eq!(t.status, "ready", "task should be auto-approved when daemon is unavailable");
+    assert_eq!(
+        t.status, "ready",
+        "task should be auto-approved when daemon is unavailable"
+    );
 }
 
 #[tokio::test]
@@ -113,7 +134,10 @@ async fn ready_task_dispatches_after_watchdog_clears_stale_assignee() {
     let (mut rt, _) = test_runtime(bus.clone(), vec!["ok"]).await.unwrap();
 
     let db = rt.db();
-    let task = db.create_task("test task", Some("do something"), 1, "test").await.unwrap();
+    let task = db
+        .create_task("test task", Some("do something"), 1, "test")
+        .await
+        .unwrap();
     let updates = llm_tasks::db::TaskUpdates {
         status: Some("ready"),
         assignee: Some("ghost-agent"),
@@ -125,7 +149,57 @@ async fn ready_task_dispatches_after_watchdog_clears_stale_assignee() {
     rt.run_watchdog_and_dispatch().await;
 
     let t = db.get_task(&task.id).await.unwrap();
-    assert!(t.assignee.as_deref() != Some("ghost-agent"), "watchdog must clear stale assignee");
+    assert!(
+        t.assignee.as_deref() != Some("ghost-agent"),
+        "watchdog must clear stale assignee"
+    );
+}
+
+#[tokio::test]
+async fn runtime_startup_validates_pending_tasks() {
+    let bus = Bus::new();
+    let (mut rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
+
+    let db = rt.db();
+    let task = db
+        .create_task("test task", Some("needs validation"), 1, "test")
+        .await
+        .unwrap();
+
+    rt.bootstrap_pending_tasks().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let t = db.get_task(&task.id).await.unwrap();
+    assert_eq!(
+        t.status, "ready",
+        "startup should validate pending backlog tasks"
+    );
+}
+
+#[tokio::test]
+async fn startup_validation_does_not_override_in_progress_task() {
+    let bus = Bus::new();
+    let (rt, _) = test_runtime(bus, vec!["ok"]).await.unwrap();
+
+    let db = rt.db();
+    let task = db
+        .create_task("test task", Some("needs validation"), 1, "test")
+        .await
+        .unwrap();
+
+    rt.bootstrap_pending_tasks().await;
+    let updates = llm_tasks::db::TaskUpdates {
+        status: Some("in_progress"),
+        assignee: Some("task-test"),
+        ..Default::default()
+    };
+    db.update_task(&task.id, updates, "test").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let t = db.get_task(&task.id).await.unwrap();
+    assert_eq!(t.status, "in_progress");
+    assert_eq!(t.assignee.as_deref(), Some("task-test"));
 }
 
 #[tokio::test]

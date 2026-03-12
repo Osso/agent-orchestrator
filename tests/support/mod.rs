@@ -12,7 +12,7 @@ use llm_sdk::session::SessionStore;
 
 // Re-export test utilities
 mod test_scenario;
-pub use test_scenario::{TestScenario, TestOutcome, AuditFinding, PerformanceMetrics};
+pub use test_scenario::{AuditFinding, PerformanceMetrics, TestOutcome, TestScenario};
 
 /// Test completer that returns pre-configured responses.
 pub struct FakeCompleter {
@@ -39,10 +39,13 @@ impl FakeCompleter {
     }
 
     pub fn with_mixed_responses(responses: Vec<Result<&str, &str>>) -> Self {
-        let results = responses.into_iter().map(|r| match r {
-            Ok(text) => Ok(fake_output(text)),
-            Err(msg) => Err(llm_sdk::Error::Parse(msg.to_string())),
-        }).collect();
+        let results = responses
+            .into_iter()
+            .map(|r| match r {
+                Ok(text) => Ok(fake_output(text)),
+                Err(msg) => Err(llm_sdk::Error::Parse(msg.to_string())),
+            })
+            .collect();
         Self::new(results)
     }
 }
@@ -204,12 +207,9 @@ impl TestAgentBuilder {
     pub fn build(self, bus: &Bus) -> Result<Agent> {
         let config = test_config(self.role, self.index, self.initial_task.as_deref());
         let mailbox = bus.register(&config.agent_id.bus_name()).unwrap();
-        
+
         let completer = if self.should_fail {
-            FakeCompleter::with_mixed_responses(vec![
-                Err("simulated failure"),
-                Ok("recovered"),
-            ])
+            FakeCompleter::with_mixed_responses(vec![Err("simulated failure"), Ok("recovered")])
         } else {
             FakeCompleter::with_texts(self.responses.iter().map(|s| s.as_str()).collect())
         };
