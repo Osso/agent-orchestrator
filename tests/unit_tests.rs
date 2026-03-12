@@ -8,7 +8,7 @@ use agent_orchestrator::bus_tools::bus_tools_for_role;
 use agent_orchestrator::config;
 use agent_orchestrator::runtime_support::resolve_sandbox;
 use agent_orchestrator::types::{AgentId, AgentRole};
-use agent_orchestrator::worktree::link_shared_dependency_dirs;
+use agent_orchestrator::worktree::{link_project_root_alias, link_shared_dependency_dirs};
 use std::time::Duration;
 use support::{TestAgentBuilder, TestBench, assert_agent_registered, test_config};
 
@@ -378,6 +378,28 @@ fn resumed_worktree_links_shared_vendor_dir() {
         "vendor should be symlinked into resumed worktree"
     );
     assert_eq!(std::fs::read_link(&linked).unwrap(), project.join("vendor"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_root_alias_points_back_to_project_root() {
+    let root =
+        std::env::temp_dir().join(format!("orch-worktree-alias-test-{}", uuid::Uuid::new_v4()));
+    let project = root.join("gc");
+    std::fs::create_dir_all(project.join(".worktrees")).unwrap();
+
+    link_project_root_alias(&project);
+
+    let alias = project.join(".worktrees").join("gc");
+    let meta = std::fs::symlink_metadata(&alias).unwrap();
+
+    assert!(
+        meta.file_type().is_symlink(),
+        "project root alias should be a symlink"
+    );
+    assert_eq!(std::fs::read_link(&alias).unwrap(), project);
 
     let _ = std::fs::remove_dir_all(&root);
 }

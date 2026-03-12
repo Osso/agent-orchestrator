@@ -75,7 +75,7 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf, resume: bool) -> Opt
         .args(["reset", "--hard", "HEAD"])
         .current_dir(path)
         .status();
-    link_shared_dependency_dirs(&cfg.project_dir, path);
+    prepare_worktree_support_links(&cfg.project_dir, path);
     Some(path.clone())
 }
 
@@ -98,8 +98,13 @@ fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
     if !status.success() {
         anyhow::bail!("git worktree add failed with status {}", status);
     }
-    link_shared_dependency_dirs(&cfg.project_dir, path);
+    prepare_worktree_support_links(&cfg.project_dir, path);
     Ok(path.clone())
+}
+
+fn prepare_worktree_support_links(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
+    link_shared_dependency_dirs(project_dir, worktree_path);
+    link_project_root_alias(project_dir);
 }
 
 pub fn link_shared_dependency_dirs(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
@@ -123,6 +128,36 @@ pub fn link_shared_dependency_dirs(project_dir: &std::path::Path, worktree_path:
                     "Failed to link shared dependency dir {} into {}: {}",
                     source.display(),
                     worktree_path.display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
+pub fn link_project_root_alias(project_dir: &std::path::Path) {
+    let Some(project_name) = project_dir.file_name() else {
+        return;
+    };
+    let worktrees_dir = project_dir.join(".worktrees");
+    if std::fs::create_dir_all(&worktrees_dir).is_err() {
+        return;
+    }
+    let alias = worktrees_dir.join(project_name);
+    match std::fs::symlink_metadata(&alias) {
+        Ok(meta) if meta.file_type().is_symlink() => return,
+        Ok(_) => return,
+        Err(_) => {}
+    }
+
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::os::unix::fs::symlink(project_dir, &alias) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                tracing::warn!(
+                    "Failed to link project root alias {} -> {}: {}",
+                    alias.display(),
+                    project_dir.display(),
                     e
                 );
             }
