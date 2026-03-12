@@ -37,6 +37,7 @@ async fn dispatch(args: &[String]) -> Result<()> {
 
 fn init_tracing() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::from_default_env().add_directive("agent_orchestrator=info".parse()?),
         )
@@ -136,12 +137,18 @@ async fn cmd_mcp_serve(args: &[String]) -> Result<()> {
 }
 
 async fn cmd_mcp_tasks(args: &[String]) -> Result<()> {
-    let project = extract_named_arg(args, "--project")
-        .or_else(|| std::env::var("CLAUDE_CODE_TASK_LIST_ID").ok())
-        .or_else(|| project_from_cwd())
+    let explicit_project = extract_named_arg(args, "--project");
+    let env_project = std::env::var("CLAUDE_CODE_TASK_LIST_ID").ok();
+    let derived_project = project_from_cwd();
+    let project = explicit_project
+        .clone()
+        .or_else(|| env_project.clone())
+        .or_else(|| derived_project.clone())
         .ok_or_else(|| anyhow::anyhow!("--project or CLAUDE_CODE_TASK_LIST_ID required"))?;
     let db_path = db_path_for_project(&project);
-    agent_orchestrator::mcp_tasks::run(&db_path, &project).await
+    let should_register_cwd =
+        explicit_project.is_none() && env_project.is_none() && derived_project.is_some();
+    agent_orchestrator::mcp_tasks::run(&db_path, &project, should_register_cwd).await
 }
 
 fn print_usage() {
