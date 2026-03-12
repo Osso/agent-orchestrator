@@ -90,6 +90,7 @@ pub fn spawn_review(
     cwd: String,
     task_id: String,
     dev_output: String,
+    target_branch: String,
     branch: String,
 ) {
     tokio::spawn(async move {
@@ -100,7 +101,7 @@ pub fn spawn_review(
                 return;
             }
         };
-        let diff = get_branch_diff(&cwd, &branch).await;
+        let diff = get_branch_diff(&cwd, &target_branch, &branch).await;
         let result = review_completion(&project, &title, &dev_output, &diff, &cwd).await;
         apply_review_result(&db, &bus, &task_id, &title, result).await;
     });
@@ -291,9 +292,13 @@ fn report_to_daemon(project: &str, task_title: &str, assessment: &str, cwd: &str
     });
 }
 
-async fn get_branch_diff(cwd: &str, branch: &str) -> String {
+fn diff_range(target_branch: &str, branch: &str) -> String {
+    format!("{target_branch}..{branch}")
+}
+
+async fn get_branch_diff(cwd: &str, target_branch: &str, branch: &str) -> String {
     let output = tokio::process::Command::new("git")
-        .args(["diff", &format!("master..{branch}"), "--stat", "-p"])
+        .args(["diff", &diff_range(target_branch, branch), "--stat", "-p"])
         .current_dir(cwd)
         .output()
         .await;
@@ -414,5 +419,13 @@ mod tests {
             }
             _ => panic!("expected Validate"),
         }
+    }
+
+    #[test]
+    fn diff_range_uses_target_branch() {
+        assert_eq!(
+            diff_range("ad-phpstan-fixes", "agent/task-lt-253f"),
+            "ad-phpstan-fixes..agent/task-lt-253f"
+        );
     }
 }

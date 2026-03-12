@@ -302,7 +302,8 @@ impl OrchestratorRuntime {
             .handle_agent_complete(&task_id, &content)
             .await
         {
-            self.spawn_completion_review(&task_id, &content, &agent_name);
+            self.spawn_completion_review(&task_id, &content, &agent_name)
+                .await;
         }
     }
 
@@ -526,7 +527,14 @@ impl OrchestratorRuntime {
         }
     }
 
-    fn spawn_completion_review(&self, task_id: &str, dev_output: &str, agent_name: &str) {
+    async fn spawn_completion_review(&self, task_id: &str, dev_output: &str, agent_name: &str) {
+        let target_branch = self
+            .db
+            .get_task(task_id)
+            .await
+            .ok()
+            .and_then(|t| t.target_branch)
+            .unwrap_or_else(|| "master".to_string());
         let branch = format!("agent/{}", agent_name);
         architect_client::spawn_review(
             self.db.clone(),
@@ -535,6 +543,7 @@ impl OrchestratorRuntime {
             self.working_dir.clone(),
             task_id.to_string(),
             dev_output.to_string(),
+            target_branch,
             branch,
         );
     }
