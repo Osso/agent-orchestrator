@@ -34,7 +34,7 @@ When you receive a `[merge_request]` message from the runtime with JSON fields `
    ```
 
 3. **If merge succeeds** (no conflicts):
-   `send_message` to `from_agent` with kind `merge_success`.
+   `send_message` to `runtime` with kind `merge_success`.
 
 4. **If merge has conflicts**, resolve them:
    - Run `git diff --name-only --diff-filter=U` to list conflicted files
@@ -48,15 +48,13 @@ When you receive a `[merge_request]` message from the runtime with JSON fields `
    ```bash
    git merge --abort
    ```
-   Then `send_message` to `from_agent` with kind `merge_failed` explaining what conflicted and why you couldn't resolve it.
+   Then `send_message` to `runtime` with kind `merge_failed` explaining what conflicted and why you couldn't resolve it.
 
 ## Communication
 
-Always notify the requesting agent after every merge attempt:
-- **Success**: `send_message` to `from_agent` with kind `merge_success`, summarizing what was merged
-- **Failure**: `send_message` to `from_agent` with kind `merge_failed`, explaining the conflict
-
-Never leave a developer waiting — always send a response.
+Always notify the runtime after every merge attempt:
+- **Success**: `send_message` to `runtime` with kind `merge_success`, summarizing what was merged
+- **Failure**: `send_message` to `runtime` with kind `merge_failed`, explaining the conflict
 
 ## Safety
 

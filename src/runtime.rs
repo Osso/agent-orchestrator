@@ -525,6 +525,8 @@ impl OrchestratorRuntime {
         });
         if let Err(e) = self.dispatcher.notify("merger", "merge_request", payload) {
             tracing::error!("Failed to send merge_request for {task_id}: {e}");
+        } else if let Err(e) = self.db.clear_assignee(task_id, "runtime").await {
+            tracing::warn!("Failed to clear assignee for merged task {task_id}: {e}");
         }
     }
 
