@@ -8,7 +8,9 @@ use agent_orchestrator::bus_tools::bus_tools_for_role;
 use agent_orchestrator::config;
 use agent_orchestrator::runtime_support::resolve_sandbox;
 use agent_orchestrator::types::{AgentId, AgentRole};
-use agent_orchestrator::worktree::{link_project_root_alias, link_shared_dependency_dirs};
+use agent_orchestrator::worktree::{
+    link_project_root_alias, link_shared_dependency_dirs, link_worktree_aliases,
+};
 use std::time::Duration;
 use support::{TestAgentBuilder, TestBench, assert_agent_registered, test_config};
 
@@ -400,6 +402,58 @@ fn worktree_root_alias_points_back_to_project_root() {
         "project root alias should be a symlink"
     );
     assert_eq!(std::fs::read_link(&alias).unwrap(), project);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_phpstan_fixes_worktree_alias_points_to_current_worktree() {
+    let root = std::env::temp_dir().join(format!(
+        "orch-worktree-gc-alias-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let project = root.join("gc-phpstan-fixes");
+    let first = project.join(".worktrees").join("task-first");
+    let second = project.join(".worktrees").join("task-second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+
+    link_worktree_aliases(&project, &first);
+    link_worktree_aliases(&project, &second);
+
+    let alias = project.join(".worktrees").join("gc");
+    let meta = std::fs::symlink_metadata(&alias).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "gc alias should be a symlink"
+    );
+    assert_eq!(std::fs::read_link(&alias).unwrap(), second);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn task_agent_sandbox_binds_gc_alias_to_current_worktree() {
+    let root = std::env::temp_dir().join(format!(
+        "orch-sandbox-gc-alias-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let project = root.join("gc-phpstan-fixes");
+    let worktree = project.join(".worktrees").join("task-lt-abc");
+    std::fs::create_dir_all(&worktree).unwrap();
+    link_worktree_aliases(&project, &worktree);
+
+    let (_, prefix) = resolve_sandbox(AgentRole::TaskAgent, &project, Ok(worktree.clone()), true);
+
+    let has_gc_mount = prefix
+        .windows(3)
+        .any(|w| w[0] == "--bind" && w[1] == worktree.to_string_lossy() && w[2] == "/tmp/gc");
+    assert!(
+        has_gc_mount,
+        "expected sandbox to mount current worktree at /tmp/gc, got: {:?}",
+        prefix
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

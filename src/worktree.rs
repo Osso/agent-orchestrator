@@ -105,6 +105,7 @@ fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
 fn prepare_worktree_support_links(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
     link_shared_dependency_dirs(project_dir, worktree_path);
     link_project_root_alias(project_dir);
+    link_worktree_aliases(project_dir, worktree_path);
 }
 
 pub fn link_shared_dependency_dirs(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
@@ -144,20 +145,52 @@ pub fn link_project_root_alias(project_dir: &std::path::Path) {
         return;
     }
     let alias = worktrees_dir.join(project_name);
+    ensure_symlink(&alias, project_dir);
+}
+
+pub fn link_worktree_aliases(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
+    let Some(project_name) = project_dir.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Some(alias_name) = project_name.strip_suffix("-phpstan-fixes") else {
+        return;
+    };
+    let worktrees_dir = project_dir.join(".worktrees");
+    if std::fs::create_dir_all(&worktrees_dir).is_err() {
+        return;
+    }
+    let alias = worktrees_dir.join(alias_name);
+    ensure_symlink(&alias, worktree_path);
+}
+
+fn ensure_symlink(alias: &std::path::Path, target: &std::path::Path) {
     match std::fs::symlink_metadata(&alias) {
-        Ok(meta) if meta.file_type().is_symlink() => return,
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if std::fs::read_link(alias).ok().as_deref() == Some(target) {
+                return;
+            }
+            if let Err(e) = std::fs::remove_file(alias) {
+                tracing::warn!(
+                    "Failed to refresh symlink {} -> {}: {}",
+                    alias.display(),
+                    target.display(),
+                    e
+                );
+                return;
+            }
+        }
         Ok(_) => return,
         Err(_) => {}
     }
 
     #[cfg(unix)]
     {
-        if let Err(e) = std::os::unix::fs::symlink(project_dir, &alias) {
+        if let Err(e) = std::os::unix::fs::symlink(target, &alias) {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 tracing::warn!(
-                    "Failed to link project root alias {} -> {}: {}",
+                    "Failed to link worktree alias {} -> {}: {}",
                     alias.display(),
-                    project_dir.display(),
+                    target.display(),
                     e
                 );
             }

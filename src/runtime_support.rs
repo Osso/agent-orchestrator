@@ -73,7 +73,8 @@ pub fn resolve_sandbox(
         let dev_path = worktree_result.unwrap_or_else(|_| project_path.to_path_buf());
         if use_sandbox {
             let git_dir = find_git_dir(project_path);
-            let prefix = llm_sdk::sandbox::developer_prefix(&dev_path, git_dir.as_deref());
+            let mut prefix = llm_sdk::sandbox::developer_prefix(&dev_path, git_dir.as_deref());
+            add_support_mounts(&mut prefix, project_path, &dev_path);
             return (llm_sdk::sandbox::REPO_MOUNT.to_string(), prefix);
         }
         return (dev_path.to_string_lossy().into_owned(), Vec::new());
@@ -127,4 +128,45 @@ pub fn build_mcp_config(agent_name: &str, project: &str) -> String {
         }
     })
     .to_string()
+}
+
+fn add_support_mounts(prefix: &mut Vec<String>, project_path: &Path, dev_path: &Path) {
+    for (host_path, mount_path) in support_mounts(project_path, dev_path) {
+        insert_rw_bind(prefix, &host_path, &mount_path);
+    }
+}
+
+fn support_mounts(project_path: &Path, dev_path: &Path) -> Vec<(String, String)> {
+    let mut mounts = Vec::new();
+    let Some(project_name) = project_path.file_name().and_then(|n| n.to_str()) else {
+        return mounts;
+    };
+    let Some(alias_name) = project_name.strip_suffix("-phpstan-fixes") else {
+        return mounts;
+    };
+    if !project_path.join(".worktrees").join(alias_name).exists() {
+        return mounts;
+    }
+    let host = dev_path
+        .canonicalize()
+        .unwrap_or_else(|_| dev_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    mounts.push((host, format!("/tmp/{alias_name}")));
+    mounts
+}
+
+fn insert_rw_bind(prefix: &mut Vec<String>, host_path: &str, mount_path: &str) {
+    let insert_at = prefix
+        .iter()
+        .position(|arg| arg == "--chdir")
+        .unwrap_or(prefix.len().saturating_sub(1));
+    prefix.splice(
+        insert_at..insert_at,
+        [
+            "--bind".to_string(),
+            host_path.to_string(),
+            mount_path.to_string(),
+        ],
+    );
 }
