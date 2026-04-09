@@ -24,6 +24,17 @@ pub enum ReviewResult {
     Incomplete(String),
 }
 
+pub struct ReviewJob {
+    pub db: Arc<Database>,
+    pub bus: Bus,
+    pub project: String,
+    pub cwd: String,
+    pub task_id: String,
+    pub dev_output: String,
+    pub target_branch: String,
+    pub branch: String,
+}
+
 const REVIEW_COMMENT_MAX_CHARS: usize = 2000;
 
 /// Validate a pending task via the external architect daemon.
@@ -83,16 +94,17 @@ pub fn spawn_validation(
 }
 
 /// Run completion review in background, update DB and notify via bus.
-pub fn spawn_review(
-    db: Arc<Database>,
-    bus: Bus,
-    project: String,
-    cwd: String,
-    task_id: String,
-    dev_output: String,
-    target_branch: String,
-    branch: String,
-) {
+pub fn spawn_review(job: ReviewJob) {
+    let ReviewJob {
+        db,
+        bus,
+        project,
+        cwd,
+        task_id,
+        dev_output,
+        target_branch,
+        branch,
+    } = job;
     tokio::spawn(async move {
         let title = match db.get_task(&task_id).await {
             Ok(t) => t.title,

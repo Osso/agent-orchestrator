@@ -66,6 +66,42 @@ warning() {
     echo -e "${YELLOW}⚠${NC} $*"
 }
 
+run_cargo_test_target() {
+    local target="$1"
+    shift
+
+    local cargo_args=("$@")
+    local test_args=()
+
+    if [ "$PARALLEL" = false ]; then
+        test_args+=(--test-threads=1)
+    fi
+
+    if [ ${#test_args[@]} -gt 0 ]; then
+        cargo test --test "$target" "${cargo_args[@]}" -- "${test_args[@]}"
+    else
+        cargo test --test "$target" "${cargo_args[@]}"
+    fi
+}
+
+run_cargo_test_filter() {
+    local filter="$1"
+    shift
+
+    local cargo_args=("$@")
+    local test_args=()
+
+    if [ "$PARALLEL" = false ]; then
+        test_args+=(--test-threads=1)
+    fi
+
+    if [ ${#test_args[@]} -gt 0 ]; then
+        cargo test "$filter" "${cargo_args[@]}" -- "${test_args[@]}"
+    else
+        cargo test "$filter" "${cargo_args[@]}"
+    fi
+}
+
 setup_reports_dir() {
     mkdir -p "$REPORTS_DIR"
 }
@@ -101,18 +137,18 @@ run_lints() {
 run_unit_tests() {
     log "Running unit tests..."
     
-    local args=()
-    [ "$VERBOSE" = true ] && args+=(--verbose)
-    [ "$PARALLEL" = true ] && args+=(--jobs $(nproc))
+    local cargo_args=()
+    [ "$VERBOSE" = true ] && cargo_args+=(--verbose)
+    [ "$PARALLEL" = true ] && cargo_args+=(--jobs "$(nproc)")
     
     if [ "$COVERAGE" = true ]; then
         cargo tarpaulin \
             --out Html --output-dir "$REPORTS_DIR" \
             --include-tests \
             --test unit_tests \
-            "${args[@]}"
+            "${cargo_args[@]}"
     else
-        cargo test unit_tests "${args[@]}"
+        run_cargo_test_target unit_tests "${cargo_args[@]}"
     fi
     
     success "Unit tests completed"
@@ -121,15 +157,14 @@ run_unit_tests() {
 run_integration_tests() {
     log "Running integration tests..."
     
-    local args=()
-    [ "$VERBOSE" = true ] && args+=(--verbose)
-    [ "$PARALLEL" = false ] && args+=(--test-threads=1)
+    local cargo_args=()
+    [ "$VERBOSE" = true ] && cargo_args+=(--verbose)
     
     # Set environment variables for integration tests
     export TEST_ENV="$ENVIRONMENT"
     export RUST_LOG="${RUST_LOG:-info}"
     
-    cargo test integration_tests "${args[@]}"
+    run_cargo_test_target integration_tests "${cargo_args[@]}"
     
     success "Integration tests completed"
 }
@@ -137,15 +172,14 @@ run_integration_tests() {
 run_e2e_tests() {
     log "Running end-to-end tests..."
     
-    local args=()
-    [ "$VERBOSE" = true ] && args+=(--verbose)
-    [ "$PARALLEL" = false ] && args+=(--test-threads=1)
+    local cargo_args=()
+    [ "$VERBOSE" = true ] && cargo_args+=(--verbose)
     
     # E2E tests need single-threaded execution to avoid conflicts
     export TEST_ENV="$ENVIRONMENT"
     export RUST_LOG="${RUST_LOG:-warn}"
     
-    cargo test e2e "${args[@]}"
+    run_cargo_test_target e2e "${cargo_args[@]}"
     
     success "E2E tests completed"
 }
@@ -157,7 +191,7 @@ run_performance_tests() {
     export TEST_ENV="$ENVIRONMENT"
     export RUST_LOG="${RUST_LOG:-error}"
     
-    cargo test --release performance --test-threads=1
+    PARALLEL=false run_cargo_test_filter performance --release
     
     success "Performance tests completed"
 }
@@ -169,7 +203,7 @@ run_chaos_tests() {
     export RUST_LOG="${RUST_LOG:-warn}"
     export CHAOS_TESTING=true
     
-    cargo test chaos --test-threads=1
+    PARALLEL=false run_cargo_test_filter chaos
     
     success "Chaos tests completed"
 }
@@ -181,7 +215,7 @@ run_regression_tests() {
     export RUST_LOG="${RUST_LOG:-info}"
     export REGRESSION_MODE=true
     
-    cargo test regression
+    run_cargo_test_filter regression
     
     success "Regression tests completed"
 }
@@ -205,7 +239,7 @@ watch_tests() {
         cargo install cargo-watch
     fi
     
-    cargo watch -x "test --lib --bins" -x "test unit_tests"
+    cargo watch -x "test --lib --bins" -x "test --test unit_tests"
 }
 
 clean_test_artifacts() {

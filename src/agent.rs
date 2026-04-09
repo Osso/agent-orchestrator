@@ -239,41 +239,7 @@ impl Agent {
         let Some(ctx) = &self.fresh_ctx else {
             return;
         };
-        match ctx {
-            FreshCtx::Claude {
-                store,
-                key,
-                system_prompt,
-                base_claude,
-            } => {
-                store.remove(key);
-                let session = store.session(key).system_prompt(system_prompt);
-                self.completer = Box::new(SessionCompleter {
-                    session,
-                    claude: *base_claude.clone(),
-                });
-            }
-            FreshCtx::OpenRouter {
-                store,
-                key,
-                openrouter,
-            } => {
-                store.remove_message_log(key);
-                let log = store.message_log(key);
-                self.completer = Box::new(OpenRouterCompleter {
-                    openrouter: openrouter.clone(),
-                    log,
-                });
-            }
-            FreshCtx::Codex { store, key, codex } => {
-                store.remove_message_log(key);
-                let log = Arc::new(Mutex::new(store.message_log(key)));
-                self.completer = Box::new(CodexCompleter {
-                    codex: codex.clone(),
-                    log,
-                });
-            }
-        }
+        self.completer = fresh_completer(ctx);
         tracing::info!("Agent {} fresh completer for task", self.config.agent_id);
     }
 
@@ -312,6 +278,63 @@ fn build_completer(
         }
         BackendKind::Codex { model } => build_codex_completer(config, bus_name, model),
     }
+}
+
+fn fresh_completer(ctx: &FreshCtx) -> Box<dyn Completer> {
+    match ctx {
+        FreshCtx::Claude {
+            store,
+            key,
+            system_prompt,
+            base_claude,
+        } => fresh_claude_completer(store, key, system_prompt, base_claude),
+        FreshCtx::OpenRouter {
+            store,
+            key,
+            openrouter,
+        } => fresh_openrouter_completer(store, key, openrouter),
+        FreshCtx::Codex { store, key, codex } => fresh_codex_completer(store, key, codex),
+    }
+}
+
+fn fresh_claude_completer(
+    store: &SessionStore,
+    key: &str,
+    system_prompt: &str,
+    base_claude: &Claude,
+) -> Box<dyn Completer> {
+    store.remove(key);
+    let session = store.session(key).system_prompt(system_prompt);
+    Box::new(SessionCompleter {
+        session,
+        claude: base_claude.clone(),
+    })
+}
+
+fn fresh_openrouter_completer(
+    store: &SessionStore,
+    key: &str,
+    openrouter: &Arc<llm_sdk::openrouter::OpenRouter>,
+) -> Box<dyn Completer> {
+    store.remove_message_log(key);
+    let log = store.message_log(key);
+    Box::new(OpenRouterCompleter {
+        openrouter: openrouter.clone(),
+        log,
+    })
+}
+
+fn fresh_codex_completer(
+    store: &SessionStore,
+    key: &str,
+    codex: &Arc<llm_sdk::codex::Codex>,
+) -> Box<dyn Completer> {
+    store.remove_message_log(key);
+    let log = Arc::new(Mutex::new(store.message_log(key)));
+    Box::new(CodexCompleter {
+        codex: codex.clone(),
+        log,
+    })
 }
 
 fn build_claude_completer(
@@ -449,10 +472,10 @@ fn format_prompt(msg: &agent_bus::BusMessage, is_task: bool) -> String {
 
 fn extract_content(payload: &serde_json::Value) -> String {
     // Prefer "content" field, fall back to full JSON (for merge_request etc.)
-    if let Some(content) = payload.get("content").and_then(|c| c.as_str()) {
-        if !content.is_empty() {
-            return content.to_string();
-        }
+    if let Some(content) = payload.get("content").and_then(|c| c.as_str())
+        && !content.is_empty()
+    {
+        return content.to_string();
     }
     serde_json::to_string_pretty(payload).unwrap_or_default()
 }

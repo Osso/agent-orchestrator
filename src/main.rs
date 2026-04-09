@@ -51,53 +51,60 @@ async fn cmd_daemon() -> Result<()> {
 }
 
 fn load_backend_config() -> BackendKind {
-    let path = dirs::config_dir()
+    let path = backend_config_path();
+    let Some(table) = read_backend_table(&path) else {
+        return BackendKind::Claude;
+    };
+    parse_backend_kind(&table)
+}
+
+fn backend_config_path() -> PathBuf {
+    dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("agent-orchestrator")
-        .join("config.toml");
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return BackendKind::Claude,
-    };
-    let table: toml::Table = match contents.parse() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("Bad config {}: {e}", path.display());
-            return BackendKind::Claude;
+        .join("config.toml")
+}
+
+fn read_backend_table(path: &std::path::Path) -> Option<toml::Table> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    match contents.parse() {
+        Ok(table) => Some(table),
+        Err(error) => {
+            tracing::warn!("Bad config {}: {error}", path.display());
+            None
         }
-    };
-    let backend = table
-        .get("backend")
-        .and_then(|v| v.as_str())
-        .unwrap_or("claude");
-    match backend {
-        "codex" => {
-            let model = table
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("gpt-5.4");
-            BackendKind::Codex {
-                model: model.to_string(),
-            }
-        }
-        "openrouter" => {
-            let model = table
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("anthropic/claude-sonnet-4");
-            let api_key = table
-                .get("api_key")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .unwrap_or_default();
-            BackendKind::OpenRouter {
-                model: model.to_string(),
-                api_key,
-            }
-        }
+    }
+}
+
+fn parse_backend_kind(table: &toml::Table) -> BackendKind {
+    match table_str(table, "backend").unwrap_or("claude") {
+        "codex" => codex_backend(table),
+        "openrouter" => openrouter_backend(table),
         _ => BackendKind::Claude,
     }
+}
+
+fn codex_backend(table: &toml::Table) -> BackendKind {
+    let model = table_str(table, "model").unwrap_or("gpt-5.4");
+    BackendKind::Codex {
+        model: model.to_string(),
+    }
+}
+
+fn openrouter_backend(table: &toml::Table) -> BackendKind {
+    let model = table_str(table, "model").unwrap_or("anthropic/claude-sonnet-4");
+    let api_key = table_str(table, "api_key")
+        .map(str::to_string)
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .unwrap_or_default();
+    BackendKind::OpenRouter {
+        model: model.to_string(),
+        api_key,
+    }
+}
+
+fn table_str<'a>(table: &'a toml::Table, key: &str) -> Option<&'a str> {
+    table.get(key).and_then(|value| value.as_str())
 }
 
 fn cmd_send(args: &[String]) -> Result<()> {
@@ -252,8 +259,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
 
 fn cmd_scale(args: &[String]) -> Result<()> {
     let max: u8 = args
-        .iter()
-        .nth(2)
+        .get(2)
         .ok_or_else(|| anyhow::anyhow!("Usage: agent-orchestrator scale <max>"))?
         .parse()
         .map_err(|_| anyhow::anyhow!("max must be a number 1-20"))?;

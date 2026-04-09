@@ -21,16 +21,18 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentConfig, BackendKind};
 use crate::architect_client;
-
-/// Maximum times a task can be dispatched before it's marked as failed.
-const MAX_TASK_ATTEMPTS: u32 = 3;
-const INTERNAL_RETRY_RESET_ACTORS: &[&str] = &["runtime", "architect", "reviewer", "merger"];
 use crate::control;
 use crate::dispatch::Dispatcher;
 use crate::relay::{self, RelayServer};
 use crate::runtime_support::{self as support, CommandTimers};
 use crate::types::{AgentId, AgentRole};
 use crate::worktree::{self, WorktreeConfig};
+
+/// Maximum times a task can be dispatched before it's marked as failed.
+const MAX_TASK_ATTEMPTS: u32 = 3;
+mod retry_budget;
+
+use retry_budget::count_attempts_since_manual_reset;
 
 /// Global concurrency limits shared across all project runtimes.
 pub struct GlobalLimits {
@@ -268,27 +270,38 @@ impl OrchestratorRuntime {
     }
 
     async fn handle_task_event(&mut self, kind: &str, payload: &serde_json::Value, from: &str) {
-        match kind {
+        let should_poll = match kind {
             "task_created" => {
                 let task_id = support::payload_str(payload, "task_id");
                 self.spawn_architect_validation(&task_id).await;
+                false
             }
-            "task_complete" => self.handle_agent_done(payload, from).await,
+            "task_complete" => {
+                self.handle_agent_done(payload, from).await;
+                true
+            }
             "task_done" => {
                 let task_id = support::payload_str(payload, "task_id");
                 self.merge_agent_branch(&task_id).await;
+                true
             }
-            "task_blocked" => self.handle_agent_blocked_event(payload, from).await,
+            "task_blocked" => {
+                self.handle_agent_blocked_event(payload, from).await;
+                true
+            }
             "agent_heartbeat" => {
                 let agent = support::payload_str(payload, "agent");
                 if !agent.is_empty() {
                     self.dispatcher.record_activity(&agent);
                 }
-                return;
+                false
             }
-            _ => {}
+            "task_ready" => true,
+            _ => false,
+        };
+        if should_poll {
+            self.poll_dispatch().await;
         }
-        self.poll_dispatch().await;
     }
 
     async fn handle_agent_done(&mut self, payload: &serde_json::Value, from: &str) {
@@ -539,16 +552,16 @@ impl OrchestratorRuntime {
             .and_then(|t| t.target_branch)
             .unwrap_or_else(|| "master".to_string());
         let branch = format!("agent/{}", agent_name);
-        architect_client::spawn_review(
-            self.db.clone(),
-            self.bus.clone(),
-            self.project.clone(),
-            self.working_dir.clone(),
-            task_id.to_string(),
-            dev_output.to_string(),
+        architect_client::spawn_review(architect_client::ReviewJob {
+            db: self.db.clone(),
+            bus: self.bus.clone(),
+            project: self.project.clone(),
+            cwd: self.working_dir.clone(),
+            task_id: task_id.to_string(),
+            dev_output: dev_output.to_string(),
             target_branch,
             branch,
-        );
+        });
     }
 
     /// Returns true if the orchestrator should shut down.
@@ -678,19 +691,8 @@ impl OrchestratorRuntime {
             .bus
             .register(&bus_name)
             .map_err(|e| anyhow::anyhow!("Failed to register {}: {}", bus_name, e))?;
-
-        let agent_id = config.agent_id.clone();
         let factory = self.agent_factory.clone();
-        let handle = tokio::spawn(async move {
-            match factory(config, mailbox) {
-                Ok(agent) => {
-                    if let Err(e) = agent.run().await {
-                        tracing::error!("Agent {} error: {}", agent_id, e);
-                    }
-                }
-                Err(e) => tracing::error!("Agent {} init failed: {}", agent_id, e),
-            }
-        });
+        let handle = tokio::spawn(run_agent(factory, config, mailbox));
 
         self.agent_handles.insert(bus_name, handle);
         Ok(())
@@ -733,137 +735,16 @@ impl OrchestratorRuntime {
     }
 }
 
-fn count_attempts_since_manual_reset(events: &[llm_tasks::db::Event]) -> u32 {
-    let reset_idx = events.iter().rposition(is_manual_retry_reset);
-    events
-        .iter()
-        .skip(reset_idx.map_or(0, |idx| idx + 1))
-        .filter(|event| event.action == "claimed")
-        .count() as u32
-}
-
-fn is_manual_retry_reset(event: &llm_tasks::db::Event) -> bool {
-    event.action == "updated"
-        && event.field.as_deref() == Some("status")
-        && matches!(event.new_value.as_deref(), Some("pending" | "ready"))
-        && !is_internal_retry_reset_actor(&event.actor)
-}
-
-fn is_internal_retry_reset_actor(actor: &str) -> bool {
-    INTERNAL_RETRY_RESET_ACTORS.contains(&actor) || actor.starts_with("task-")
-}
-
-#[cfg(test)]
-mod tests {
-    use llm_tasks::db::Event;
-
-    use super::count_attempts_since_manual_reset;
-
-    fn event(
-        id: i64,
-        actor: &str,
-        action: &str,
-        field: Option<&str>,
-        old_value: Option<&str>,
-        new_value: Option<&str>,
-    ) -> Event {
-        Event {
-            id,
-            task_id: "lt-test".to_string(),
-            actor: actor.to_string(),
-            action: action.to_string(),
-            field: field.map(str::to_string),
-            old_value: old_value.map(str::to_string),
-            new_value: new_value.map(str::to_string),
-            timestamp: "2026-03-12T00:00:00Z".to_string(),
+async fn run_agent(factory: AgentFactory, config: AgentConfig, mailbox: agent_bus::Mailbox) {
+    let agent_id = config.agent_id.clone();
+    let agent = match factory(config, mailbox) {
+        Ok(agent) => agent,
+        Err(error) => {
+            tracing::error!("Agent {} init failed: {}", agent_id, error);
+            return;
         }
-    }
-
-    #[test]
-    fn manual_rerun_resets_attempt_budget() {
-        let events = vec![
-            event(
-                1,
-                "task-lt-test",
-                "claimed",
-                Some("assignee"),
-                None,
-                Some("task-lt-test"),
-            ),
-            event(
-                2,
-                "task-lt-test",
-                "claimed",
-                Some("assignee"),
-                None,
-                Some("task-lt-test"),
-            ),
-            event(
-                3,
-                "reviewer",
-                "updated",
-                Some("status"),
-                Some("in_review"),
-                Some("ready"),
-            ),
-            event(
-                4,
-                "task-lt-test",
-                "claimed",
-                Some("assignee"),
-                None,
-                Some("task-lt-test"),
-            ),
-            event(
-                5,
-                "viewer",
-                "updated",
-                Some("status"),
-                Some("failed"),
-                Some("pending"),
-            ),
-            event(
-                6,
-                "task-lt-test",
-                "claimed",
-                Some("assignee"),
-                None,
-                Some("task-lt-test"),
-            ),
-        ];
-
-        assert_eq!(count_attempts_since_manual_reset(&events), 1);
-    }
-
-    #[test]
-    fn reviewer_ready_transition_does_not_reset_attempt_budget() {
-        let events = vec![
-            event(
-                1,
-                "task-lt-test",
-                "claimed",
-                Some("assignee"),
-                None,
-                Some("task-lt-test"),
-            ),
-            event(
-                2,
-                "reviewer",
-                "updated",
-                Some("status"),
-                Some("in_review"),
-                Some("ready"),
-            ),
-            event(
-                3,
-                "task-lt-test",
-                "claimed",
-                Some("assignee"),
-                None,
-                Some("task-lt-test"),
-            ),
-        ];
-
-        assert_eq!(count_attempts_since_manual_reset(&events), 2);
+    };
+    if let Err(error) = agent.run().await {
+        tracing::error!("Agent {} error: {}", agent_id, error);
     }
 }

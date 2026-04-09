@@ -67,10 +67,10 @@ impl Dispatcher {
 
     /// Record activity from a task agent (called on every relay tool call).
     pub fn record_activity(&mut self, agent_name: &str) {
-        if let Some(task_id) = self.task_id_for_agent(agent_name) {
-            if let Some(assignment) = self.active_tasks.get_mut(&task_id) {
-                assignment.last_activity = Instant::now();
-            }
+        if let Some(task_id) = self.task_id_for_agent(agent_name)
+            && let Some(assignment) = self.active_tasks.get_mut(&task_id)
+        {
+            assignment.last_activity = Instant::now();
         }
     }
 

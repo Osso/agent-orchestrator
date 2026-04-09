@@ -92,25 +92,26 @@ pub fn resolve_sandbox(
 fn find_git_dir(project_path: &Path) -> Option<PathBuf> {
     let git_path = project_path.join(".git");
     if git_path.is_dir() {
-        return Some(git_path.canonicalize().unwrap_or(git_path));
+        return Some(canonical_path(git_path));
     }
-    if git_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&git_path) {
-            if let Some(gitdir) = content.strip_prefix("gitdir: ") {
-                let p = Path::new(gitdir.trim());
-                if let Some(parent) = p.parent().and_then(|p| p.parent()) {
-                    if parent.is_dir() {
-                        return Some(
-                            parent
-                                .canonicalize()
-                                .unwrap_or_else(|_| parent.to_path_buf()),
-                        );
-                    }
-                }
-            }
-        }
+    if !git_path.is_file() {
+        return None;
     }
-    None
+
+    let content = std::fs::read_to_string(&git_path).ok()?;
+    let gitdir = content.strip_prefix("gitdir: ")?;
+    resolve_worktree_git_dir(gitdir.trim())
+}
+
+fn resolve_worktree_git_dir(gitdir: &str) -> Option<PathBuf> {
+    let parent = Path::new(gitdir).parent()?.parent()?;
+    parent
+        .is_dir()
+        .then(|| canonical_path(parent.to_path_buf()))
+}
+
+fn canonical_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 pub fn build_mcp_config(agent_name: &str, project: &str) -> String {

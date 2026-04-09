@@ -124,22 +124,36 @@ async fn process_requests(
         if line.is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<RelayRequest>(&line) {
-            Ok(request) => handle_tool_call(mailbox, db, agent_name, &request).await,
-            Err(e) => {
-                tracing::error!("Relay: bad request from {}: {}", agent_name, e);
-                RelayResponse {
-                    id: "parse_error".to_string(),
-                    result: None,
-                    error: Some(format!("parse error: {}", e)),
-                }
-            }
-        };
+        let response = response_for_line(mailbox, db, agent_name, &line).await;
         let mut resp_line = serde_json::to_string(&response)?;
         resp_line.push('\n');
         writer.write_all(resp_line.as_bytes()).await?;
     }
     Ok(())
+}
+
+async fn response_for_line(
+    mailbox: &Mailbox,
+    db: &Database,
+    agent_name: &str,
+    line: &str,
+) -> RelayResponse {
+    let request = match parse_relay_request(agent_name, line) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    handle_tool_call(mailbox, db, agent_name, &request).await
+}
+
+fn parse_relay_request(agent_name: &str, line: &str) -> Result<RelayRequest, RelayResponse> {
+    serde_json::from_str(line).map_err(|error| {
+        tracing::error!("Relay: bad request from {}: {}", agent_name, error);
+        RelayResponse {
+            id: "parse_error".to_string(),
+            result: None,
+            error: Some(format!("parse error: {}", error)),
+        }
+    })
 }
 
 async fn handle_tool_call(

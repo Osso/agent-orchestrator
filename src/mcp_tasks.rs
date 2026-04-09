@@ -333,14 +333,12 @@ fn notify_runtime(project: &str, task_id: &str) {
 }
 
 pub async fn run(db_path: &std::path::Path, project: &str, register_cwd: bool) -> Result<()> {
-    if register_cwd {
-        if let Ok(cwd) = std::env::current_dir() {
-            let cwd = cwd.to_string_lossy().into_owned();
-            match config::ensure_project_registered(project, &cwd) {
-                Ok(true) => tracing::info!("Registered project '{}' at {}", project, cwd),
-                Ok(false) => {}
-                Err(e) => tracing::warn!("Failed to register project '{}': {}", project, e),
-            }
+    if register_cwd && let Ok(cwd) = std::env::current_dir() {
+        let cwd = cwd.to_string_lossy().into_owned();
+        match config::ensure_project_registered(project, &cwd) {
+            Ok(true) => tracing::info!("Registered project '{}' at {}", project, cwd),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Failed to register project '{}': {}", project, e),
         }
     }
 

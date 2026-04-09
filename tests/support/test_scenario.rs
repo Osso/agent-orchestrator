@@ -146,41 +146,29 @@ impl TestScenario {
         let mut handles = vec![];
 
         for burst_id in 0..5 {
-            let bus_clone = bus.clone();
-            let counter_clone = counter.clone();
-            let agents_clone = self.agents.clone();
             let burst_size = self.message_burst / 5;
-
-            let handle = tokio::spawn(async move {
-                let sender = bus_clone
-                    .register(&format!("burst-sender-{}", burst_id))
-                    .unwrap();
-
-                for i in 0..burst_size {
-                    for (role, _) in &agents_clone {
-                        let agent_name = match role {
-                            AgentRole::TaskAgent => "task-test-0",
-                            AgentRole::Merger => "merger",
-                        };
-
-                        let payload = serde_json::json!({
-                            "content": format!("Burst {} task {}", burst_id, i)
-                        });
-
-                        if sender.send(agent_name, "task_assignment", payload).is_ok() {
-                            counter_clone.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_micros(100)).await;
-                }
-            });
-
-            handles.push(handle);
+            handles.push(self.spawn_burst_sender(bus, counter, burst_id, burst_size));
         }
 
         for handle in handles {
             let _ = handle.await;
         }
+    }
+
+    fn spawn_burst_sender(
+        &self,
+        bus: &Bus,
+        counter: &Arc<AtomicUsize>,
+        burst_id: usize,
+        burst_size: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let bus = bus.clone();
+        let counter = counter.clone();
+        let agents = self.agents.clone();
+        tokio::spawn(async move {
+            let sender = bus.register(&format!("burst-sender-{}", burst_id)).unwrap();
+            send_burst_messages(&sender, &agents, &counter, burst_id, burst_size).await;
+        })
     }
 
     fn calculate_avg_response_time(
@@ -192,6 +180,30 @@ impl TestScenario {
         }
         let total: Duration = times.iter().sum();
         total / times.len() as u32
+    }
+}
+
+async fn send_burst_messages(
+    sender: &agent_bus::Mailbox,
+    agents: &[(AgentRole, &'static str)],
+    counter: &Arc<AtomicUsize>,
+    burst_id: usize,
+    burst_size: usize,
+) {
+    for task_index in 0..burst_size {
+        for (role, _) in agents {
+            let agent_name = match role {
+                AgentRole::TaskAgent => "task-test-0",
+                AgentRole::Merger => "merger",
+            };
+            let payload = serde_json::json!({
+                "content": format!("Burst {} task {}", burst_id, task_index)
+            });
+            if sender.send(agent_name, "task_assignment", payload).is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        tokio::time::sleep(Duration::from_micros(100)).await;
     }
 }
 

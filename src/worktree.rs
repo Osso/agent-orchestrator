@@ -79,7 +79,7 @@ fn try_reuse_worktree(cfg: &WorktreeConfig, path: &PathBuf, resume: bool) -> Opt
     Some(path.clone())
 }
 
-fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
+fn add_fresh_worktree(cfg: &WorktreeConfig, path: &std::path::Path) -> Result<PathBuf> {
     let branch = cfg.branch();
     let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
     let status = Command::new("git")
@@ -99,7 +99,7 @@ fn add_fresh_worktree(cfg: &WorktreeConfig, path: &PathBuf) -> Result<PathBuf> {
         anyhow::bail!("git worktree add failed with status {}", status);
     }
     prepare_worktree_support_links(&cfg.project_dir, path);
-    Ok(path.clone())
+    Ok(path.to_path_buf())
 }
 
 fn prepare_worktree_support_links(project_dir: &std::path::Path, worktree_path: &std::path::Path) {
@@ -164,7 +164,7 @@ pub fn link_worktree_aliases(project_dir: &std::path::Path, worktree_path: &std:
 }
 
 fn ensure_symlink(alias: &std::path::Path, target: &std::path::Path) {
-    match std::fs::symlink_metadata(&alias) {
+    match std::fs::symlink_metadata(alias) {
         Ok(meta) if meta.file_type().is_symlink() => {
             if std::fs::read_link(alias).ok().as_deref() == Some(target) {
                 return;
@@ -185,15 +185,15 @@ fn ensure_symlink(alias: &std::path::Path, target: &std::path::Path) {
 
     #[cfg(unix)]
     {
-        if let Err(e) = std::os::unix::fs::symlink(target, &alias) {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                tracing::warn!(
-                    "Failed to link worktree alias {} -> {}: {}",
-                    alias.display(),
-                    target.display(),
-                    e
-                );
-            }
+        if let Err(e) = std::os::unix::fs::symlink(target, alias)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            tracing::warn!(
+                "Failed to link worktree alias {} -> {}: {}",
+                alias.display(),
+                target.display(),
+                e
+            );
         }
     }
 }
