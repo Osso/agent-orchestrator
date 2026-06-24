@@ -6,6 +6,9 @@ license = "MIT"
 description = "Multi-agent orchestration system for AI coding assistants"
 repository = "https://github.com/Osso/agent-orchestrator"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [dependencies]
 tokio = { version = "1", features = ["full", "net"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,3 +1,6 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(coverage_nightly, coverage(off))]
+
 use agent_orchestrator::agent::BackendKind;
 use agent_orchestrator::control;
 
