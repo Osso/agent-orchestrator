@@ -66,3 +66,33 @@ impl std::fmt::Display for AgentId {
         write!(f, "{}", self.bus_name())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roles_expose_names_prompts_and_display_values() {
+        assert_eq!(AgentRole::TaskAgent.as_str(), "task_agent");
+        assert_eq!(AgentRole::Merger.as_str(), "merger");
+        assert_eq!(AgentRole::TaskAgent.to_string(), "task_agent");
+        assert_eq!(AgentRole::Merger.to_string(), "merger");
+        assert!(AgentRole::TaskAgent.system_prompt().contains("Task agent"));
+        assert!(AgentRole::Merger.system_prompt().contains("Merger agent"));
+    }
+
+    #[test]
+    fn agent_ids_build_expected_bus_names() {
+        let task = AgentId::for_task("abc123");
+        let merger = AgentId::merger();
+
+        assert_eq!(task.role, AgentRole::TaskAgent);
+        assert_eq!(task.name, "abc123");
+        assert_eq!(task.bus_name(), "task-abc123");
+        assert_eq!(task.to_string(), "task-abc123");
+        assert_eq!(merger.role, AgentRole::Merger);
+        assert_eq!(merger.name, "merger");
+        assert_eq!(merger.bus_name(), "merger");
+        assert_eq!(merger.to_string(), "merger");
+    }
+}

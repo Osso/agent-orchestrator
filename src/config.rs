@@ -62,3 +62,68 @@ fn write_config(path: &PathBuf, projects: &HashMap<String, ProjectConfig>) -> Re
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn temp_config_home(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agent_orchestrator_config_{name}_{}",
+            std::process::id()
+        ))
+    }
+
+    fn with_config_home<T>(name: &str, test: impl FnOnce(&PathBuf) -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config_home = temp_config_home(name);
+        let old_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+
+        let result = test(&config_home);
+
+        match old_config_home {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            },
+        }
+        std::fs::remove_dir_all(config_home).ok();
+        result
+    }
+
+    #[test]
+    fn ensure_project_registered_writes_sorted_projects() {
+        with_config_home("write", |config_home| {
+            assert!(ensure_project_registered("zeta", "/repo/zeta").expect("register zeta"));
+            assert!(ensure_project_registered("alpha", "/repo/alpha").expect("register alpha"));
+
+            let config_file = config_home.join("agent-orchestrator/projects.toml");
+            let contents = std::fs::read_to_string(config_file).expect("read config");
+
+            assert!(
+                contents.find("[alpha]").expect("alpha") < contents.find("[zeta]").expect("zeta")
+            );
+            assert!(contents.contains("dir = \"/repo/alpha\""));
+            assert!(contents.contains("dir = \"/repo/zeta\""));
+        });
+    }
+
+    #[test]
+    fn ensure_project_registered_returns_false_when_unchanged() {
+        with_config_home("unchanged", |_| {
+            assert!(ensure_project_registered("alpha", "/repo/alpha").expect("first register"));
+            assert!(!ensure_project_registered("alpha", "/repo/alpha").expect("second register"));
+            let projects = load_config().expect("load config");
+
+            assert_eq!(projects["alpha"].dir, "/repo/alpha");
+        });
+    }
+}

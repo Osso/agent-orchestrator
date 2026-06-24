@@ -171,3 +171,108 @@ fn insert_rw_bind(prefix: &mut Vec<String>, host_path: &str, mount_path: &str) {
         ],
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agent_orchestrator_runtime_{name}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn payload_str_returns_string_fields_or_empty() {
+        let payload = serde_json::json!({
+            "name": "task-agent",
+            "count": 3,
+        });
+
+        assert_eq!(payload_str(&payload, "name"), "task-agent");
+        assert_eq!(payload_str(&payload, "count"), "");
+        assert_eq!(payload_str(&payload, "missing"), "");
+    }
+
+    #[test]
+    fn worktree_role_detection_uses_task_prefix() {
+        assert!(is_worktree_role("task-123"));
+        assert!(!is_worktree_role("manager"));
+        assert!(!is_worktree_role("merger"));
+    }
+
+    #[test]
+    fn resolve_sandbox_uses_worktree_when_unsandboxed() {
+        let project = temp_dir("project");
+        let worktree = temp_dir("worktree");
+
+        let (cwd, prefix) =
+            resolve_sandbox(AgentRole::TaskAgent, &project, Ok(worktree.clone()), false);
+
+        assert_eq!(cwd, worktree.to_string_lossy());
+        assert!(prefix.is_empty());
+
+        std::fs::remove_dir_all(project).ok();
+        std::fs::remove_dir_all(worktree).ok();
+    }
+
+    #[test]
+    fn resolve_sandbox_falls_back_to_project_when_worktree_fails() {
+        let project = temp_dir("fallback");
+
+        let (cwd, prefix) = resolve_sandbox(
+            AgentRole::Merger,
+            &project,
+            Err(anyhow!("missing worktree")),
+            false,
+        );
+
+        assert_eq!(cwd, project.to_string_lossy());
+        assert!(prefix.is_empty());
+
+        std::fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn sandboxed_developer_mounts_repo_and_git_dir() {
+        let project = temp_dir("sandbox_project");
+        let worktree = temp_dir("sandbox_worktree");
+        std::fs::create_dir_all(project.join(".git")).expect("create git dir");
+
+        let (cwd, prefix) =
+            resolve_sandbox(AgentRole::TaskAgent, &project, Ok(worktree.clone()), true);
+
+        assert_eq!(cwd, llm_sdk::sandbox::REPO_MOUNT);
+        assert!(prefix.iter().any(|arg| arg == "--bind"));
+        assert!(
+            prefix
+                .windows(2)
+                .any(|pair| pair[0] == "--chdir" && pair[1] == llm_sdk::sandbox::REPO_MOUNT)
+        );
+
+        std::fs::remove_dir_all(project).ok();
+        std::fs::remove_dir_all(worktree).ok();
+    }
+
+    #[test]
+    fn build_mcp_config_contains_socket_and_agent() {
+        let config: serde_json::Value =
+            serde_json::from_str(&build_mcp_config("task-1", "demo")).expect("valid json");
+        let server = &config["mcpServers"]["orchestrator"];
+
+        assert!(
+            server["command"]
+                .as_str()
+                .expect("command")
+                .contains("agent")
+        );
+        assert_eq!(server["args"][0], "mcp-serve");
+        assert_eq!(server["args"][3], "--agent");
+        assert_eq!(server["args"][4], "task-1");
+        assert!(server["args"][2].as_str().expect("socket").contains("demo"));
+    }
+}
